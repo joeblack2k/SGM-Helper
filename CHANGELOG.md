@@ -25,6 +25,22 @@ All notable changes to this project are documented in this file.
   - `docs/gamecube/backend-worker-notes.md`
 - Host-side unit tests for secure store and JSON/grouping logic in `helpers/gamecube/tests/host`.
 
+## [0.3.1] - 2026-04-21
+
+### Added
+
+- Extension preference policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
+- MiSTer sources prefer `.sav`
+- RetroArch/SteamDeck/Windows/Custom sources prefer `.srm`
+- Duplicate save variants with the same ROM stem are now de-duplicated per source by preferred extension before sync.
+- Download restore path update in sync flow:
+- when cloud data is applied to an existing local save path, non-PSX native saves are written using the preferred extension for the source kind.
+
+### Fixed
+
+- Prevented duplicate stem variants (for example `.sav` + `.srm`) from racing each other during a single sync cycle.
+- Added syncer tests for extension-preference and target-path selection behavior.
+
 ## [0.3.0] - 2026-04-21
 
 ### Added

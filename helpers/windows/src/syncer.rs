@@ -36,6 +36,11 @@ pub struct SyncReport {
     pub errors: usize,
 }
 
+struct ProcessedEntry {
+    state_key: String,
+    entry: SyncedEntry,
+}
+
 struct SyncLock {
     path: PathBuf,
 }
@@ -114,6 +119,8 @@ pub fn run_sync(
         }
 
         let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
+        let preferred_save_by_stem =
+            select_preferred_save_per_stem(&source.kind, &save_files, &rom_index);
         report.scanned += save_files.len();
 
         let fingerprint = hostname::get()
@@ -122,6 +129,21 @@ pub fn run_sync(
             .unwrap_or_else(|| source.kind.as_str().to_string());
 
         for save_path in save_files {
+            let stem_key = filename_stem(&save_path).to_ascii_lowercase();
+            if let Some(preferred_path) = preferred_save_by_stem.get(&stem_key)
+                && preferred_path != &save_path
+            {
+                report.skipped += 1;
+                if verbose {
+                    eprintln!(
+                        "Skipping duplicate save variant {} in favor of preferred {}",
+                        save_path.display(),
+                        preferred_path.display()
+                    );
+                }
+                continue;
+            }
+
             let save_key = save_path.to_string_lossy().to_string();
             let process_result = process_single_save(
                 &api,
@@ -138,9 +160,14 @@ pub fn run_sync(
             );
 
             match process_result {
-                Ok(entry) => {
-                    if let Some(entry) = entry {
-                        sync_state.entries.insert(save_key, entry);
+                Ok(processed) => {
+                    if let Some(processed) = processed {
+                        if processed.state_key != save_key {
+                            sync_state.entries.remove(&save_key);
+                        }
+                        sync_state
+                            .entries
+                            .insert(processed.state_key, processed.entry);
                     }
                 }
                 Err(err) => {
@@ -190,9 +217,14 @@ pub fn run_sync(
             );
 
             match restore {
-                Ok(entry) => {
-                    if let Some(entry) = entry {
-                        sync_state.entries.insert(save_key, entry);
+                Ok(processed) => {
+                    if let Some(processed) = processed {
+                        if processed.state_key != save_key {
+                            sync_state.entries.remove(&save_key);
+                        }
+                        sync_state
+                            .entries
+                            .insert(processed.state_key, processed.entry);
                     }
                 }
                 Err(err) => {
@@ -229,10 +261,11 @@ fn process_single_save(
     options: &SyncOptions,
     report: &mut SyncReport,
     verbose: bool,
-) -> Result<Option<SyncedEntry>> {
+) -> Result<Option<ProcessedEntry>> {
     let stem = filename_stem(save_path);
     let stem_key = stem.to_ascii_lowercase();
     let rom_entry = rom_index.get(&stem_key);
+    let mut state_key = save_key.to_string();
     let Some(classification) =
         classify_supported_save(save_path, rom_entry.map(|entry| entry.path.as_path()))
     else {
@@ -314,15 +347,18 @@ fn process_single_save(
     if !latest.exists {
         if options.dry_run {
             report.uploaded += 1;
-            return Ok(Some(synced_entry(
-                local_sha,
-                Some(rom_sha1),
-                None,
-                Some(&system_slug),
-                Some(normalized_save.local_container),
-                Some(normalized_save.adapter_profile),
-                Some(source_kind),
-                Some(source_name),
+            return Ok(Some(processed_entry(
+                state_key.clone(),
+                synced_entry(
+                    local_sha,
+                    Some(rom_sha1),
+                    None,
+                    Some(&system_slug),
+                    Some(normalized_save.local_container),
+                    Some(normalized_save.adapter_profile),
+                    Some(source_kind),
+                    Some(source_name),
+                ),
             )));
         }
 
@@ -342,36 +378,9 @@ fn process_single_save(
         )?;
 
         report.uploaded += 1;
-        return Ok(Some(synced_entry(
-            local_sha,
-            Some(rom_sha1),
-            latest.version,
-            Some(&system_slug),
-            Some(normalized_save.local_container),
-            Some(normalized_save.adapter_profile),
-            Some(source_kind),
-            Some(source_name),
-        )));
-    }
-
-    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
-        report.in_sync += 1;
-        return Ok(Some(synced_entry(
-            local_sha,
-            Some(rom_sha1),
-            latest.version,
-            Some(&system_slug),
-            Some(normalized_save.local_container),
-            Some(normalized_save.adapter_profile),
-            Some(source_kind),
-            Some(source_name),
-        )));
-    }
-
-    if options.force_upload {
-        if options.dry_run {
-            report.uploaded += 1;
-            return Ok(Some(synced_entry(
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
                 local_sha,
                 Some(rom_sha1),
                 latest.version,
@@ -380,6 +389,42 @@ fn process_single_save(
                 Some(normalized_save.adapter_profile),
                 Some(source_kind),
                 Some(source_name),
+            ),
+        )));
+    }
+
+    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
+        report.in_sync += 1;
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(rom_sha1),
+                latest.version,
+                Some(&system_slug),
+                Some(normalized_save.local_container),
+                Some(normalized_save.adapter_profile),
+                Some(source_kind),
+                Some(source_name),
+            ),
+        )));
+    }
+
+    if options.force_upload {
+        if options.dry_run {
+            report.uploaded += 1;
+            return Ok(Some(processed_entry(
+                state_key.clone(),
+                synced_entry(
+                    local_sha,
+                    Some(rom_sha1),
+                    latest.version,
+                    Some(&system_slug),
+                    Some(normalized_save.local_container),
+                    Some(normalized_save.adapter_profile),
+                    Some(source_kind),
+                    Some(source_name),
+                ),
             )));
         }
 
@@ -398,15 +443,18 @@ fn process_single_save(
             Some(&system_slug),
         )?;
         report.uploaded += 1;
-        return Ok(Some(synced_entry(
-            local_sha,
-            Some(rom_sha1),
-            latest.version,
-            Some(&system_slug),
-            Some(normalized_save.local_container),
-            Some(normalized_save.adapter_profile),
-            Some(source_kind),
-            Some(source_name),
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(rom_sha1),
+                latest.version,
+                Some(&system_slug),
+                Some(normalized_save.local_container),
+                Some(normalized_save.adapter_profile),
+                Some(source_kind),
+                Some(source_name),
+            ),
         )));
     }
 
@@ -424,22 +472,9 @@ fn process_single_save(
             source_kind,
         )?;
         report.conflicts += 1;
-        return Ok(Some(synced_entry(
-            local_sha,
-            Some(rom_sha1),
-            latest.version,
-            Some(&system_slug),
-            Some(normalized_save.local_container),
-            Some(normalized_save.adapter_profile),
-            Some(source_kind),
-            Some(source_name),
-        )));
-    }
-
-    if let Some(save_id) = latest.id {
-        if options.dry_run {
-            report.downloaded += 1;
-            return Ok(Some(synced_entry(
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
                 local_sha,
                 Some(rom_sha1),
                 latest.version,
@@ -448,40 +483,84 @@ fn process_single_save(
                 Some(normalized_save.adapter_profile),
                 Some(source_kind),
                 Some(source_name),
+            ),
+        )));
+    }
+
+    if let Some(save_id) = latest.id {
+        if options.dry_run {
+            report.downloaded += 1;
+            let target_save_path = preferred_save_path(
+                save_path,
+                source_kind,
+                Some(&system_slug),
+                normalized_save.local_container,
+            );
+            state_key = target_save_path.to_string_lossy().to_string();
+            return Ok(Some(processed_entry(
+                state_key.clone(),
+                synced_entry(
+                    local_sha,
+                    Some(rom_sha1),
+                    latest.version,
+                    Some(&system_slug),
+                    Some(normalized_save.local_container),
+                    Some(normalized_save.adapter_profile),
+                    Some(source_kind),
+                    Some(source_name),
+                ),
             )));
         }
 
         let canonical_bytes = api.download_save(&save_id)?;
         let local_bytes =
             encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
-        if let Some(parent) = save_path.parent() {
+        let target_save_path = preferred_save_path(
+            save_path,
+            source_kind,
+            Some(&system_slug),
+            normalized_save.local_container,
+        );
+        if let Some(parent) = target_save_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("kan map niet maken: {}", parent.display()))?;
         }
-        fs::write(save_path, &local_bytes).with_context(|| {
+        fs::write(&target_save_path, &local_bytes).with_context(|| {
             format!(
                 "kan save bestand niet overschrijven: {}",
-                save_path.display()
+                target_save_path.display()
             )
         })?;
+        if target_save_path != save_path && save_path.exists() {
+            fs::remove_file(save_path).with_context(|| {
+                format!(
+                    "kan oude savevariant niet verwijderen: {}",
+                    save_path.display()
+                )
+            })?;
+        }
+        state_key = target_save_path.to_string_lossy().to_string();
         report.downloaded += 1;
         if verbose {
             eprintln!(
                 "Downloaded canonical save for {} and wrote local container {}",
-                save_path.display(),
+                target_save_path.display(),
                 normalized_save.local_container.as_str()
             );
         }
 
-        return Ok(Some(synced_entry(
-            sha256_bytes(&canonical_bytes),
-            Some(rom_sha1),
-            latest.version,
-            Some(&system_slug),
-            Some(normalized_save.local_container),
-            Some(normalized_save.adapter_profile),
-            Some(source_kind),
-            Some(source_name),
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                sha256_bytes(&canonical_bytes),
+                Some(rom_sha1),
+                latest.version,
+                Some(&system_slug),
+                Some(normalized_save.local_container),
+                Some(normalized_save.adapter_profile),
+                Some(source_kind),
+                Some(source_name),
+            ),
         )));
     }
 
@@ -502,7 +581,7 @@ fn process_missing_save(
     options: &SyncOptions,
     report: &mut SyncReport,
     verbose: bool,
-) -> Result<Option<SyncedEntry>> {
+) -> Result<Option<ProcessedEntry>> {
     let Some(rom_sha1) = existing_entry.rom_sha1.as_deref() else {
         report.skipped += 1;
         if verbose {
@@ -544,18 +623,22 @@ fn process_missing_save(
         .adapter_profile
         .unwrap_or_else(|| default_adapter_profile_for_container(local_container));
     let system_slug = existing_entry.system_slug.as_deref();
+    let state_key = save_path.to_string_lossy().to_string();
 
     if options.dry_run {
         report.downloaded += 1;
-        return Ok(Some(synced_entry(
-            existing_entry.sha256.clone(),
-            Some(rom_sha1.to_string()),
-            latest.version,
-            system_slug,
-            Some(local_container),
-            Some(adapter_profile),
-            Some(source_kind),
-            Some(source_name),
+        return Ok(Some(processed_entry(
+            state_key,
+            synced_entry(
+                existing_entry.sha256.clone(),
+                Some(rom_sha1.to_string()),
+                latest.version,
+                system_slug,
+                Some(local_container),
+                Some(adapter_profile),
+                Some(source_kind),
+                Some(source_name),
+            ),
         )));
     }
 
@@ -581,16 +664,115 @@ fn process_missing_save(
         );
     }
 
-    Ok(Some(synced_entry(
-        sha256_bytes(&canonical_bytes),
-        Some(rom_sha1.to_string()),
-        latest.version,
-        system_slug,
-        Some(local_container),
-        Some(adapter_profile),
-        Some(source_kind),
-        Some(source_name),
+    Ok(Some(processed_entry(
+        state_key,
+        synced_entry(
+            sha256_bytes(&canonical_bytes),
+            Some(rom_sha1.to_string()),
+            latest.version,
+            system_slug,
+            Some(local_container),
+            Some(adapter_profile),
+            Some(source_kind),
+            Some(source_name),
+        ),
     )))
+}
+
+fn processed_entry(state_key: String, entry: SyncedEntry) -> ProcessedEntry {
+    ProcessedEntry { state_key, entry }
+}
+
+fn select_preferred_save_per_stem(
+    source_kind: &SourceKind,
+    save_files: &[PathBuf],
+    rom_index: &HashMap<String, RomIndexEntry>,
+) -> HashMap<String, PathBuf> {
+    let mut selected: HashMap<String, (PathBuf, u8)> = HashMap::new();
+
+    for save_path in save_files {
+        let stem_key = filename_stem(save_path).to_ascii_lowercase();
+        let rom_path = rom_index.get(&stem_key).map(|entry| entry.path.as_path());
+        let Some(classification) = classify_supported_save(save_path, rom_path) else {
+            continue;
+        };
+
+        let extension = save_extension(save_path);
+        let score = preferred_extension_for_system(source_kind, &classification.system_slug)
+            .map(|preferred| {
+                if extension.as_deref() == Some(preferred) {
+                    2
+                } else {
+                    1
+                }
+            })
+            .unwrap_or(1);
+
+        match selected.get_mut(&stem_key) {
+            Some((existing_path, existing_score)) => {
+                if score > *existing_score {
+                    *existing_path = save_path.clone();
+                    *existing_score = score;
+                }
+            }
+            None => {
+                selected.insert(stem_key, (save_path.clone(), score));
+            }
+        }
+    }
+
+    selected
+        .into_iter()
+        .map(|(stem, (path, _))| (stem, path))
+        .collect()
+}
+
+fn preferred_save_path(
+    save_path: &Path,
+    source_kind: &SourceKind,
+    system_slug: Option<&str>,
+    local_container: SaveContainerFormat,
+) -> PathBuf {
+    if local_container != SaveContainerFormat::Native {
+        return save_path.to_path_buf();
+    }
+    let Some(system_slug) = system_slug else {
+        return save_path.to_path_buf();
+    };
+    let Some(preferred_extension) = preferred_extension_for_system(source_kind, system_slug) else {
+        return save_path.to_path_buf();
+    };
+    if save_extension(save_path).as_deref() == Some(preferred_extension) {
+        return save_path.to_path_buf();
+    }
+    let mut target = save_path.to_path_buf();
+    target.set_extension(preferred_extension);
+    target
+}
+
+fn preferred_extension_for_system(
+    source_kind: &SourceKind,
+    system_slug: &str,
+) -> Option<&'static str> {
+    match system_slug {
+        "nes" | "snes" | "gameboy" | "gba" | "genesis" | "master-system" | "game-gear"
+        | "neogeo" => {
+            if matches!(source_kind, SourceKind::MisterFpga) {
+                Some("sav")
+            } else {
+                Some("srm")
+            }
+        }
+        "n64" | "nds" | "psp" | "psvita" | "ps3" | "ps4" | "ps5" => Some("sav"),
+        "ps2" => Some("ps2"),
+        _ => None,
+    }
+}
+
+fn save_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -663,5 +845,46 @@ fn synced_entry(
         source_kind: source_kind.map(|kind| kind.as_str().to_string()),
         source_name: source_name.map(ToString::to_string),
         updated_at: now_rfc3339(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_sav_for_mister_snes() {
+        let ext = preferred_extension_for_system(&SourceKind::MisterFpga, "snes");
+        assert_eq!(ext, Some("sav"));
+    }
+
+    #[test]
+    fn prefers_srm_for_retroarch_snes() {
+        let ext = preferred_extension_for_system(&SourceKind::RetroArch, "snes");
+        assert_eq!(ext, Some("srm"));
+    }
+
+    #[test]
+    fn rewrites_native_save_to_preferred_extension() {
+        let path = PathBuf::from("/userdata/saves/snes/zelda.srm");
+        let target = preferred_save_path(
+            &path,
+            &SourceKind::MisterFpga,
+            Some("snes"),
+            SaveContainerFormat::Native,
+        );
+        assert_eq!(target.to_string_lossy(), "/userdata/saves/snes/zelda.sav");
+    }
+
+    #[test]
+    fn does_not_rewrite_non_native_container() {
+        let path = PathBuf::from("/userdata/saves/psx/card.srm");
+        let target = preferred_save_path(
+            &path,
+            &SourceKind::MisterFpga,
+            Some("psx"),
+            SaveContainerFormat::Ps1Raw,
+        );
+        assert_eq!(target, path);
     }
 }

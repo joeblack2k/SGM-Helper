@@ -43,6 +43,12 @@ Validation is strict. Files are not accepted by extension alone. Scanner checks 
 - PS1 container validation and conversion (`raw`, `.gme`, `.vmp`)
 - PS2 memory card header validation
 
+Extension policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
+
+- MiSTer sources prefer `.sav`
+- RetroArch/SteamDeck/Windows/Custom sources prefer `.srm`
+- If both variants exist for the same ROM stem, sync prioritizes the preferred extension per source
+
 Supported console families in strict classification:
 
 - Nintendo
