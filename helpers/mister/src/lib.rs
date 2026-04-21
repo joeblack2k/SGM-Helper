@@ -2,6 +2,7 @@ pub mod api;
 pub mod cli;
 pub mod config;
 pub mod scanner;
+pub mod scheduler;
 pub mod sources;
 pub mod state;
 pub mod syncer;
@@ -16,13 +17,17 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::api::{ApiClient, DeviceTokenPoll};
-use crate::cli::{Cli, Commands, ConfigCommand, SourceAddCommand, SourceCommand, StateCommand};
+use crate::cli::{
+    Cli, Commands, ConfigCommand, ScheduleCommand, SourceAddCommand, SourceCommand, StateCommand,
+};
 use crate::config::{AppConfig, ConfigOverrides, LoadedConfig};
 use crate::scanner::{
     SaveContainerFormat, encode_download_for_local_container, normalize_save_bytes_for_sync,
 };
+use crate::scheduler::{SchedulerBackend, install_schedule, scheduler_status, uninstall_schedule};
 use crate::sources::{
-    Source, SourceKind, load_source_store, remove_source, save_source_store, upsert_source,
+    Source, SourceKind, load_source_store, migrate_legacy_sources_if_needed, remove_source,
+    save_source_store, upsert_source,
 };
 use crate::state::{
     AuthState, clear_auth_state_for_base_url, load_auth_state, load_auth_state_for_base_url,
@@ -196,6 +201,9 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
         Commands::Sync {
             force_upload,
             dry_run,
+            scan,
+            deep_scan,
+            apply_scan,
             slot_name,
         } => {
             let mut cfg = loaded.config.clone();
@@ -217,6 +225,9 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 &SyncOptions {
                     force_upload: cfg.force_upload,
                     dry_run: cfg.dry_run,
+                    scan,
+                    deep_scan,
+                    apply_scan,
                     slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
                     default_source_kind: SourceKind::MisterFpga,
                 },
@@ -271,6 +282,9 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
             watch_interval,
             force_upload,
             dry_run,
+            scan,
+            deep_scan,
+            apply_scan,
             slot_name,
             max_cycles,
         } => {
@@ -297,6 +311,9 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     interval_secs: cfg.watch_interval,
                     force_upload: cfg.force_upload,
                     dry_run: cfg.dry_run,
+                    scan,
+                    deep_scan,
+                    apply_scan,
                     slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
                     default_source_kind: SourceKind::MisterFpga,
                     max_cycles,
@@ -306,8 +323,8 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
             )?;
         }
         Commands::Source { command } => {
-            let state_dir = loaded.config.resolved_state_dir()?;
-            let mut store = load_source_store(&state_dir)?;
+            migrate_legacy_sources_if_needed(&loaded.config, cli.verbose)?;
+            let mut store = load_source_store(&loaded.config.config_path)?;
 
             match command {
                 SourceCommand::List => {
@@ -393,12 +410,12 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     };
 
                     upsert_source(&mut store, source.clone());
-                    save_source_store(&state_dir, &store)?;
+                    save_source_store(&loaded.config.config_path, &store)?;
                     println!("Source '{}' opgeslagen.", source.name);
                 }
                 SourceCommand::Remove { name } => {
                     if remove_source(&mut store, &name) {
-                        save_source_store(&state_dir, &store)?;
+                        save_source_store(&loaded.config.config_path, &store)?;
                         println!("Source '{}' verwijderd.", name);
                     } else {
                         println!("Source '{}' niet gevonden.", name);
@@ -491,6 +508,44 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             }
         },
+        Commands::Schedule { command } => {
+            let task_name = "SGM MiSTer Helper Sync";
+            let binary_path =
+                std::env::current_exe().context("kan executable pad niet bepalen voor schedule")?;
+            let config_path = loaded.config.config_path.clone();
+            let backend = SchedulerBackend::LinuxCron;
+
+            match command {
+                ScheduleCommand::Install { every_minutes } => {
+                    let result = install_schedule(
+                        backend,
+                        task_name,
+                        &binary_path,
+                        &config_path,
+                        every_minutes,
+                    )?;
+                    if !cli.quiet {
+                        println!("{}", result);
+                    }
+                }
+                ScheduleCommand::Status => {
+                    let status = scheduler_status(backend, task_name, &binary_path, &config_path)?;
+                    if !cli.quiet {
+                        println!(
+                            "Installed: {}\nDetails: {}",
+                            if status.installed { "yes" } else { "no" },
+                            status.details.trim()
+                        );
+                    }
+                }
+                ScheduleCommand::Uninstall => {
+                    let result = uninstall_schedule(backend, task_name)?;
+                    if !cli.quiet {
+                        println!("{}", result);
+                    }
+                }
+            }
+        }
         Commands::DeviceAuth { poll_interval } => {
             let cfg = loaded.config.clone();
             run_device_auth(&cfg, poll_interval, cli.quiet)?;

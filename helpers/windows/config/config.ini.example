@@ -9,3 +9,12 @@ WATCH_INTERVAL="30"
 FORCE_UPLOAD="false"
 DRY_RUN="false"
 ROUTE_PREFIX=""
+
+[source.retroarch]
+LABEL="RetroArch Windows"
+KIND="retroarch"
+SAVE_PATH="C:\\RetroArch\\saves"
+ROM_PATH="C:\\RetroArch\\roms"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"

@@ -22,12 +22,28 @@ Phase 1 implements MiSTer, Windows, and Steam Deck helpers with:
 - `config.ini` driven backend endpoint settings
 - canonical backend sync model (`local emulator format -> canonical raw -> local emulator format`)
 - adapter metadata persistence for deterministic restore/conversion behavior
+- config-first source storage in `config.ini` (`[source.<id>]` blocks)
+- first-run autoscan + `--scan` + `--deep-scan` (`--apply-scan` to apply deep results)
+- built-in scheduler commands (`schedule install|status|uninstall`)
 
 Minimum `config.ini`:
 
 ```ini
 URL="192.168.1.1"
 PORT="9096"
+```
+
+Optional source example:
+
+```ini
+[source.super_nintendo]
+LABEL="Super Nintendo"
+KIND="retroarch"
+SAVE_PATH="/home/snes9x/save"
+ROM_PATH="/home/roms/snes"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"
 ```
 
 See `helpers/mister/config/config.ini.example` and `docs/mister/install.md` for full setup.

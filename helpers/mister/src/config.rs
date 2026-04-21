@@ -35,6 +35,7 @@ pub struct AppConfig {
     pub dry_run: bool,
     pub route_prefix: String,
     pub binary_dir: PathBuf,
+    pub config_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +54,13 @@ impl LoadedConfig {
         let ini_values = parse_ini_file_if_exists(&config_path)?;
         let env_values = collect_env_values();
 
-        let config = AppConfig::from_sources(overrides, &env_values, &ini_values, binary_dir)?;
+        let config = AppConfig::from_sources(
+            overrides,
+            &env_values,
+            &ini_values,
+            binary_dir,
+            &config_path,
+        )?;
         Ok(Self {
             config,
             config_path,
@@ -79,6 +86,7 @@ impl AppConfig {
         env_values: &HashMap<String, String>,
         ini_values: &HashMap<String, String>,
         binary_dir: PathBuf,
+        config_path: &Path,
     ) -> Result<Self> {
         if let Some(api_url) = overrides
             .api_url
@@ -92,7 +100,13 @@ impl AppConfig {
             merged_overrides.url = Some(url);
             merged_overrides.port = Some(port);
             merged_overrides.api_url = None;
-            return AppConfig::from_sources(&merged_overrides, env_values, ini_values, binary_dir);
+            return AppConfig::from_sources(
+                &merged_overrides,
+                env_values,
+                ini_values,
+                binary_dir,
+                config_path,
+            );
         }
 
         let url = choose_string(
@@ -168,6 +182,7 @@ impl AppConfig {
             dry_run,
             route_prefix,
             binary_dir,
+            config_path: config_path.to_path_buf(),
         })
     }
 }
@@ -199,9 +214,23 @@ fn parse_ini_file_if_exists(path: &Path) -> Result<HashMap<String, String>> {
 
 fn parse_ini_content(content: &str) -> Result<HashMap<String, String>> {
     let mut values = HashMap::new();
+    let mut in_section = false;
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = true;
+            continue;
+        }
+
+        if in_section {
+            if trimmed.find('=').is_none() {
+                continue;
+            }
+            // Source sections are parsed by sources.rs; global config intentionally
+            // ignores values inside INI sections.
             continue;
         }
 
@@ -426,7 +455,13 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        AppConfig::from_sources(&cli, &env_map, &ini_map, PathBuf::from("/tmp/bin"))
+        AppConfig::from_sources(
+            &cli,
+            &env_map,
+            &ini_map,
+            PathBuf::from("/tmp/bin"),
+            Path::new("/tmp/bin/config.ini"),
+        )
     }
 
     #[test]
@@ -434,6 +469,22 @@ mod tests {
         let parsed = parse_ini_content("URL=\"192.168.1.1\"\nPORT=\"9096\"\n").unwrap();
         assert_eq!(parsed.get("URL").unwrap(), "192.168.1.1");
         assert_eq!(parsed.get("PORT").unwrap(), "9096");
+    }
+
+    #[test]
+    fn ini_parser_ignores_source_sections_for_global_values() {
+        let parsed = parse_ini_content(
+            r#"URL="192.168.1.1"
+PORT="9096"
+[source.snes]
+LABEL="SNES"
+SAVE_PATH="/home/snes9x/save"
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.get("URL").unwrap(), "192.168.1.1");
+        assert_eq!(parsed.get("PORT").unwrap(), "9096");
+        assert!(!parsed.contains_key("SAVE_PATH"));
     }
 
     #[test]

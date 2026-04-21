@@ -9,3 +9,12 @@ WATCH_INTERVAL="30"
 FORCE_UPLOAD="false"
 DRY_RUN="false"
 ROUTE_PREFIX=""
+
+[source.mister_default]
+LABEL="MiSTer Default"
+KIND="mister-fpga"
+SAVE_PATH="/media/fat/saves"
+ROM_PATH="/media/fat/games"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"

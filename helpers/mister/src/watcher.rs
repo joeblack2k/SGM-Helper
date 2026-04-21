@@ -17,6 +17,9 @@ pub struct WatchOptions {
     pub interval_secs: u64,
     pub force_upload: bool,
     pub dry_run: bool,
+    pub scan: bool,
+    pub deep_scan: bool,
+    pub apply_scan: bool,
     pub slot_name: String,
     pub default_source_kind: SourceKind,
     pub max_cycles: Option<u32>,
@@ -35,6 +38,9 @@ pub fn run_watch(
     quiet: bool,
 ) -> Result<()> {
     let interval_secs = options.interval_secs.max(1);
+    let mut scan_once = options.scan;
+    let mut deep_scan_once = options.deep_scan;
+    let mut apply_scan_once = options.apply_scan;
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     {
@@ -62,11 +68,18 @@ pub fn run_watch(
             &SyncOptions {
                 force_upload: options.force_upload,
                 dry_run: options.dry_run,
+                scan: scan_once,
+                deep_scan: deep_scan_once,
+                apply_scan: apply_scan_once,
                 slot_name: options.slot_name.clone(),
                 default_source_kind: options.default_source_kind.clone(),
             },
             verbose,
         )?;
+
+        scan_once = false;
+        deep_scan_once = false;
+        apply_scan_once = false;
 
         cycles += 1;
         if !quiet {

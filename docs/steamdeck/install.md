@@ -30,6 +30,15 @@ WATCH="false"
 WATCH_INTERVAL="30"
 FORCE_UPLOAD="false"
 DRY_RUN="false"
+
+[source.steamdeck_emudeck]
+LABEL="SteamDeck EmuDeck"
+KIND="steamdeck"
+SAVE_PATH="/home/deck/Emulation/saves"
+ROM_PATH="/home/deck/Emulation/roms"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"
 ```
 
 ## 4. Login and sync
@@ -37,6 +46,24 @@ DRY_RUN="false"
 ```bash
 ./sgm-steamdeck-helper login --email you@example.com --app-password your-app-password
 ./sgm-steamdeck-helper sync
+```
+
+Known-path rescan:
+
+```bash
+./sgm-steamdeck-helper sync --scan
+```
+
+Deep scan (review only):
+
+```bash
+./sgm-steamdeck-helper sync --deep-scan
+```
+
+Deep scan and apply:
+
+```bash
+./sgm-steamdeck-helper sync --deep-scan --apply-scan
 ```
 
 Supported family filter in sync:
@@ -57,6 +84,13 @@ Watch mode:
 
 ```bash
 ./sgm-steamdeck-helper watch --watch-interval 30
+```
+
+Scheduler install (every 30 min):
+
+```bash
+./sgm-steamdeck-helper schedule install --every-minutes 30
+./sgm-steamdeck-helper schedule status
 ```
 
 Manual PS1 container conversion:

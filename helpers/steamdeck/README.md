@@ -12,15 +12,18 @@ Steam Deck helper CLI for SGM self-hosted save sync.
 - `resend-verification --email <email>`
 - `logout`
 - `token`
-- `sync`
+- `sync [--scan] [--deep-scan] [--apply-scan]`
 - `convert --input <path> --output <path> --from auto|raw|gme|vmp --to raw|gme|vmp`
-- `watch`
+- `watch [--scan] [--deep-scan] [--apply-scan]`
 - `source list`
 - `source add ...`
 - `source remove --name <name>`
 - `state list`
 - `state clean`
 - `config show`
+- `schedule install --every-minutes 30`
+- `schedule status`
+- `schedule uninstall`
 
 ## Config
 
@@ -40,6 +43,26 @@ Default `ROOT` for SteamOS is set to:
 - `/home/deck/.steam/steam/steamapps/compatdata`
 
 When no custom `source` config exists, the helper auto-detects EmuDeck and uses `.../Emulation/saves`.
+
+`config.ini` source records live in `[source.<id>]` blocks:
+
+```ini
+[source.super_nintendo]
+LABEL="Super Nintendo"
+KIND="retroarch"
+SAVE_PATH="/home/snes9x/save"
+ROM_PATH="/home/roms/snes"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"
+```
+
+Autoscan behavior:
+
+- first `sync`/`watch` run writes managed source blocks when none exist
+- `--scan` refreshes known emulator paths and replaces only `MANAGED=true` entries
+- `--deep-scan` scans the full disk and writes `state/scan_report.json` (review mode)
+- `--deep-scan --apply-scan` applies deep-scan candidates into managed source blocks
 
 Steam Deck scanning only syncs saves that can be classified as supported console families:
 

@@ -11,13 +11,16 @@ use crate::scanner::{
     discover_rom_index, discover_save_files, encode_download_for_local_container, filename_stem,
     md5_file, normalize_save_for_sync, sha1_file, sha256_bytes,
 };
-use crate::sources::{SourceKind, load_source_store, resolved_sources_or_default};
+use crate::sources::{SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
 
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
     pub force_upload: bool,
     pub dry_run: bool,
+    pub scan: bool,
+    pub deep_scan: bool,
+    pub apply_scan: bool,
     pub slot_name: String,
     pub default_source_kind: SourceKind,
 }
@@ -33,6 +36,44 @@ pub struct SyncReport {
     pub errors: usize,
 }
 
+struct SyncLock {
+    path: PathBuf,
+}
+
+impl SyncLock {
+    fn acquire(state_dir: &Path) -> Result<Self> {
+        let path = state_dir.join("sync.lock");
+        let lock_content = format!(
+            "pid={}\\nstarted_at={}\\n",
+            std::process::id(),
+            now_rfc3339()
+        );
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(lock_content.as_bytes())
+                    .with_context(|| format!("kan lockfile niet schrijven: {}", path.display()))?;
+                Ok(Self { path })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display());
+            }
+            Err(err) => Err(err)
+                .with_context(|| format!("kan sync lockfile niet maken: {}", path.display())),
+        }
+    }
+}
+
+impl Drop for SyncLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub fn run_sync(
     config: &AppConfig,
     auth: Option<&AuthState>,
@@ -40,14 +81,23 @@ pub fn run_sync(
     verbose: bool,
 ) -> Result<SyncReport> {
     let state_dir = config.resolved_state_dir()?;
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("kan state map niet maken: {}", state_dir.display()))?;
+    let _lock = SyncLock::acquire(&state_dir)?;
+
     let mut sync_state = load_sync_state(&state_dir)?;
 
     let token = auth.map(|value| value.token.clone());
     let api = ApiClient::new(config.base_url(), config.route_prefix.clone(), token)?;
 
-    let source_store = load_source_store(&state_dir)?;
-    let sources =
-        resolved_sources_or_default(&source_store, config, options.default_source_kind.clone())?;
+    let sources = prepare_sources_for_sync(
+        config,
+        options.default_source_kind.clone(),
+        options.scan,
+        options.deep_scan,
+        options.apply_scan,
+        verbose,
+    )?;
 
     let mut report = SyncReport::default();
     let mut rom_hash_cache: HashMap<String, (String, String)> = HashMap::new();
@@ -107,7 +157,19 @@ pub fn run_sync(
             .iter()
             .filter_map(|(path, entry)| {
                 let candidate = PathBuf::from(path);
-                if candidate.exists() || !path_is_under_roots(&candidate, &source.save_roots) {
+                let linked_to_source = entry
+                    .source_kind
+                    .as_deref()
+                    .map(|kind| kind == source.kind.as_str())
+                    .unwrap_or(false)
+                    && entry
+                        .source_name
+                        .as_deref()
+                        .map(|name| name == source.name)
+                        .unwrap_or(false);
+                if candidate.exists()
+                    || !(path_is_under_roots(&candidate, &source.save_roots) || linked_to_source)
+                {
                     return None;
                 }
                 Some((path.clone(), entry.clone()))

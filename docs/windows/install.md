@@ -28,6 +28,15 @@ WATCH="false"
 WATCH_INTERVAL="30"
 FORCE_UPLOAD="false"
 DRY_RUN="false"
+
+[source.retroarch]
+LABEL="RetroArch Windows"
+KIND="retroarch"
+SAVE_PATH="C:\\RetroArch\\saves"
+ROM_PATH="C:\\RetroArch\\roms"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"
 ```
 
 ## 4. Login and sync
@@ -37,10 +46,35 @@ DRY_RUN="false"
 .\sgm-windows-helper.exe sync
 ```
 
+Known-path rescan:
+
+```powershell
+.\sgm-windows-helper.exe sync --scan
+```
+
+Deep scan (review only):
+
+```powershell
+.\sgm-windows-helper.exe sync --deep-scan
+```
+
+Deep scan and apply:
+
+```powershell
+.\sgm-windows-helper.exe sync --deep-scan --apply-scan
+```
+
 Watch mode:
 
 ```powershell
 .\sgm-windows-helper.exe watch --watch-interval 30
+```
+
+Scheduler install (every 30 min):
+
+```powershell
+.\sgm-windows-helper.exe schedule install --every-minutes 30
+.\sgm-windows-helper.exe schedule status
 ```
 
 Manual PS1 container conversion:

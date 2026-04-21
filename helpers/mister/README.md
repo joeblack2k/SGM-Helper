@@ -12,15 +12,18 @@ MiSTer FPGA helper CLI for SGM self-hosted save sync.
 - `resend-verification --email <email>`
 - `logout`
 - `token`
-- `sync`
+- `sync [--scan] [--deep-scan] [--apply-scan]`
 - `convert --input <path> --output <path> --from auto|raw|gme|vmp --to raw|gme|vmp`
-- `watch`
+- `watch [--scan] [--deep-scan] [--apply-scan]`
 - `source list`
 - `source add ...`
 - `source remove --name <name>`
 - `state list`
 - `state clean`
 - `config show`
+- `schedule install --every-minutes 30`
+- `schedule status`
+- `schedule uninstall`
 
 ## Config
 
@@ -34,6 +37,26 @@ PORT="9096"
 ```
 
 Full example: `config/config.ini.example`.
+
+`config.ini` source records live in `[source.<id>]` blocks:
+
+```ini
+[source.mister_default]
+LABEL="MiSTer Default"
+KIND="mister-fpga"
+SAVE_PATH="/media/fat/saves"
+ROM_PATH="/media/fat/games"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"
+```
+
+Autoscan behavior:
+
+- first `sync`/`watch` run writes managed source blocks when none exist
+- `--scan` refreshes known emulator paths and replaces only `MANAGED=true` entries
+- `--deep-scan` scans the full disk and writes `state/scan_report.json` (review mode)
+- `--deep-scan --apply-scan` applies deep-scan candidates into managed source blocks
 
 For compatibility with existing 1Retro-style deployments you can also set:
 

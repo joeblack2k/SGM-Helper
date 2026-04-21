@@ -82,6 +82,12 @@ pub enum Commands {
         force_upload: Option<bool>,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         dry_run: Option<bool>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        scan: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        deep_scan: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        apply_scan: bool,
         #[arg(long = "slot-name")]
         slot_name: Option<String>,
     },
@@ -102,6 +108,12 @@ pub enum Commands {
         force_upload: Option<bool>,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         dry_run: Option<bool>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        scan: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        deep_scan: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        apply_scan: bool,
         #[arg(long = "slot-name")]
         slot_name: Option<String>,
         #[arg(long, hide = true)]
@@ -118,6 +130,10 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
     },
     DeviceAuth {
         #[arg(long = "poll-interval", default_value_t = 5)]
@@ -198,4 +214,14 @@ pub enum StateCommand {
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     Show,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScheduleCommand {
+    Install {
+        #[arg(long = "every-minutes", default_value_t = 30)]
+        every_minutes: u32,
+    },
+    Status,
+    Uninstall,
 }

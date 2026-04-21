@@ -28,6 +28,15 @@ WATCH="false"
 WATCH_INTERVAL="30"
 FORCE_UPLOAD="false"
 DRY_RUN="false"
+
+[source.mister_default]
+LABEL="MiSTer Default"
+KIND="mister-fpga"
+SAVE_PATH="/media/fat/saves"
+ROM_PATH="/media/fat/games"
+RECURSIVE="true"
+MANAGED="false"
+ORIGIN="manual"
 ```
 
 ## 4. Login and sync
@@ -37,10 +46,35 @@ DRY_RUN="false"
 ./sgm-mister-helper sync
 ```
 
+Known-path rescan:
+
+```bash
+./sgm-mister-helper sync --scan
+```
+
+Deep scan (review only):
+
+```bash
+./sgm-mister-helper sync --deep-scan
+```
+
+Deep scan and apply:
+
+```bash
+./sgm-mister-helper sync --deep-scan --apply-scan
+```
+
 Watch mode:
 
 ```bash
 ./sgm-mister-helper watch --watch-interval 30
+```
+
+Scheduler install (every 30 min):
+
+```bash
+./sgm-mister-helper schedule install --every-minutes 30
+./sgm-mister-helper schedule status
 ```
 
 Manual PS1 container conversion:
