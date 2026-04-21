@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>SGM GameCube/Wii Helper</name>
+  <coder>joeblack2k</coder>
+  <version>0.1.0</version>
+  <release_date>20260421000000</release_date>
+  <short_description>Save Game Manager sync helper for Swiss and Wii Homebrew Launcher</short_description>
+  <long_description>
+    Sync GameCube memory card saves per game with Save Game Manager backend.
+    Supports server discovery, device password auth, upload and restore with version selection.
+  </long_description>
+  <ahb_access/>
+</app>

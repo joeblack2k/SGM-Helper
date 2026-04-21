@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- New Swiss-startable GameCube helper module at `helpers/gamecube` implemented in C + libogc.
+- Wii Homebrew Launcher compatibility for the same helper module (`PLATFORM=wii` build and HBC package target).
+- GameCube UI flow with server discovery, password prompt, `Save per game`, and `Restore from backend`.
+- mDNS-first discovery with `/24` fallback scan and manual IP fallback path.
+- Encrypted local device password storage for GameCube helper.
+- Per-game Memory Card Slot A flow:
+  - list local card saves
+  - export selected save as GCI
+  - upload selected save to backend
+- Restore flow:
+  - list GameCube saves from backend
+  - select version first
+  - require overwrite confirmation before import
+- GameCube documentation set:
+  - `docs/gamecube/install.md`
+  - `docs/gamecube/protocol-notes.md`
+  - `docs/gamecube/backend-worker-notes.md`
+- Host-side unit tests for secure store and JSON/grouping logic in `helpers/gamecube/tests/host`.
+
 ## [0.3.0] - 2026-04-21
 
 ### Added

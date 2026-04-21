@@ -10,16 +10,19 @@ platform defaults differ for MiSTer, Steam Deck, and Windows.
 - `helpers/mister` - MiSTer FPGA helper (`sgm-mister-helper`)
 - `helpers/steamdeck` - Steam Deck helper (`sgm-steamdeck-helper`)
 - `helpers/windows` - Windows helper (`sgm-windows-helper.exe`)
+- `helpers/gamecube` - Swiss-startable GameCube helper with Wii Homebrew Launcher support (`sgm-gamecube-helper.dol`, `sgm-wii-helper.dol`)
 - `helpers/anbernic` - reserved subfolder for future Anbernic helper
 - `docs/mister` - MiSTer install + protocol notes
 - `docs/steamdeck` - Steam Deck install + protocol notes
 - `docs/windows` - Windows install + protocol notes
+- `docs/gamecube` - GameCube install + protocol + backend worker notes
 
 ## Release Artifacts
 
 - MiSTer ARMv7: `sgm-mister-helper-armv7.tar.gz`
 - Steam Deck Linux x86_64: `sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz`
 - Windows x86_64: `sgm-windows-helper-x86_64-pc-windows-gnu.zip`
+- GameCube DOL: `sgm-gamecube-helper.dol`
 - Checksums: `sha256.txt`
 
 ## Supported Sync Model
@@ -78,6 +81,13 @@ Example first run:
 .\sgm-windows-helper.exe login --email you@example.com --app-password your-app-password
 .\sgm-windows-helper.exe sync
 ```
+
+GameCube/Wii quick flow:
+
+1. Launch helper from Swiss (GameCube) or Homebrew Launcher (Wii).
+2. Select discovered `Save Game Manager` server.
+3. Enter 6-character device password from web UI.
+4. Choose `Save per game` or `Restore from backend`.
 
 ## Config Contract (`config.ini`)
 
