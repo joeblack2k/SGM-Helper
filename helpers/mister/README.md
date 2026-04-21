@@ -13,6 +13,7 @@ MiSTer FPGA helper CLI for SGM self-hosted save sync.
 - `logout`
 - `token`
 - `sync`
+- `convert --input <path> --output <path> --from auto|raw|gme|vmp --to raw|gme|vmp`
 - `watch`
 - `source list`
 - `source add ...`

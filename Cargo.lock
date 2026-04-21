@@ -1535,6 +1535,7 @@ dependencies = [
 name = "sgm-mister-helper"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "assert_cmd",
  "clap",
@@ -1582,6 +1583,7 @@ dependencies = [
 name = "sgm-windows-helper"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "assert_cmd",
  "clap",

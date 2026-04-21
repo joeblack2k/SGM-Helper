@@ -58,3 +58,9 @@ Watch mode:
 ```bash
 ./sgm-steamdeck-helper watch --watch-interval 30
 ```
+
+Manual PS1 container conversion:
+
+```bash
+./sgm-steamdeck-helper convert --input ./card.mcr --output ./card.gme --from raw --to gme
+```

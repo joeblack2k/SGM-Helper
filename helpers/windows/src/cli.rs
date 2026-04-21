@@ -85,6 +85,16 @@ pub enum Commands {
         #[arg(long = "slot-name")]
         slot_name: Option<String>,
     },
+    Convert {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value = "auto")]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
     Watch {
         #[arg(long = "watch-interval")]
         watch_interval: Option<u64>,

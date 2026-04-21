@@ -42,3 +42,9 @@ Watch mode:
 ```powershell
 .\sgm-windows-helper.exe watch --watch-interval 30
 ```
+
+Manual PS1 container conversion:
+
+```powershell
+.\sgm-windows-helper.exe convert --input .\card.mcr --output .\card.gme --from raw --to gme
+```

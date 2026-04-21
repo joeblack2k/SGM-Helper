@@ -7,6 +7,8 @@ pub mod state;
 pub mod syncer;
 pub mod watcher;
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -16,6 +18,9 @@ use clap::Parser;
 use crate::api::{ApiClient, DeviceTokenPoll};
 use crate::cli::{Cli, Commands, ConfigCommand, SourceAddCommand, SourceCommand, StateCommand};
 use crate::config::{AppConfig, ConfigOverrides, LoadedConfig};
+use crate::scanner::{
+    SaveContainerFormat, encode_download_for_local_container, normalize_save_bytes_for_sync,
+};
 use crate::sources::{
     Source, SourceKind, load_source_store, remove_source, save_source_store,
     steamdeck_autodetect_note, upsert_source,
@@ -231,6 +236,37 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     report.conflicts,
                     report.skipped,
                     report.errors
+                );
+            }
+        }
+        Commands::Convert {
+            input,
+            output,
+            from,
+            to,
+        } => {
+            let input_bytes = fs::read(&input)
+                .with_context(|| format!("kan input bestand niet lezen: {}", input.display()))?;
+            let normalized_path = input_path_for_from_override(&input, &from)?;
+            let normalized = normalize_save_bytes_for_sync(&normalized_path, "psx", &input_bytes)?
+                .context("input is geen geldige PS1 savecontainer (raw/gme/vmp)")?;
+            let target_container = parse_ps1_target_container(&to)?;
+            let output_bytes =
+                encode_download_for_local_container(&normalized.canonical_bytes, target_container)?;
+
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("kan output map niet maken: {}", parent.display()))?;
+            }
+            fs::write(&output, output_bytes).with_context(|| {
+                format!("kan output bestand niet schrijven: {}", output.display())
+            })?;
+
+            if !cli.quiet {
+                println!(
+                    "Convert complete: {} -> {}",
+                    input.display(),
+                    output.display()
                 );
             }
         }
@@ -518,4 +554,34 @@ fn run_device_auth(cfg: &AppConfig, poll_interval: u64, quiet: bool) -> Result<(
     }
 
     bail!("Device authorization timed out.");
+}
+
+fn input_path_for_from_override(input: &Path, from: &str) -> Result<PathBuf> {
+    let normalized = from.trim().to_ascii_lowercase();
+    let mut path = input.to_path_buf();
+
+    let ext = match normalized.as_str() {
+        "auto" => return Ok(path),
+        "raw" | "ps1-raw" => "mcr",
+        "gme" | "ps1-gme" | "dexdrive" => "gme",
+        "vmp" | "ps1-vmp" => "vmp",
+        _ => {
+            bail!(
+                "onbekende --from waarde '{}'; gebruik auto, raw, gme of vmp",
+                from
+            );
+        }
+    };
+    path.set_extension(ext);
+    Ok(path)
+}
+
+fn parse_ps1_target_container(to: &str) -> Result<SaveContainerFormat> {
+    let normalized = to.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "raw" | "ps1-raw" => Ok(SaveContainerFormat::Ps1Raw),
+        "gme" | "ps1-gme" | "dexdrive" => Ok(SaveContainerFormat::Ps1DexDrive),
+        "vmp" | "ps1-vmp" => Ok(SaveContainerFormat::Ps1Vmp),
+        _ => bail!("onbekende --to waarde '{}'; gebruik raw, gme of vmp", to),
+    }
 }

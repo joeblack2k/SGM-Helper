@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 use crate::api::{ApiClient, ConflictCheckResponse};
 use crate::config::AppConfig;
 use crate::scanner::{
-    RomIndexEntry, discover_rom_index, discover_save_files, filename_stem, infer_system_slug,
-    md5_file, sha1_file, sha256_bytes, sha256_file,
+    RomIndexEntry, classify_supported_save, discover_rom_index, discover_save_files,
+    encode_download_for_local_container, filename_stem, md5_file, normalize_save_for_sync,
+    sha1_file, sha256_bytes,
 };
 use crate::sources::{SourceKind, load_source_store, resolved_sources_or_default};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
@@ -122,9 +123,46 @@ fn process_single_save(
     report: &mut SyncReport,
     verbose: bool,
 ) -> Result<Option<SyncedEntry>> {
-    let local_sha = sha256_file(save_path)?;
     let stem = filename_stem(save_path);
     let stem_key = stem.to_ascii_lowercase();
+    let rom_entry = rom_index.get(&stem_key);
+    let Some(classification) =
+        classify_supported_save(save_path, rom_entry.map(|entry| entry.path.as_path()))
+    else {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping non-supported save (outside allowed console families): {}",
+                save_path.display()
+            );
+        }
+        return Ok(None);
+    };
+    let system_slug = classification.system_slug;
+    let classification_evidence = classification.evidence;
+    let normalized_save = match normalize_save_for_sync(save_path, &system_slug)? {
+        Some(value) => value,
+        None => {
+            report.skipped += 1;
+            if verbose {
+                eprintln!(
+                    "Skipping {}: failed strict binary validation for {}",
+                    save_path.display(),
+                    system_slug
+                );
+            }
+            return Ok(None);
+        }
+    };
+    let local_sha = sha256_bytes(&normalized_save.canonical_bytes);
+    if verbose {
+        eprintln!(
+            "Detected {} savegame for {} ({})",
+            system_slug,
+            save_path.display(),
+            classification_evidence
+        );
+    }
 
     let lookup = api.lookup_rom(&stem).ok();
     let mut rom_sha1 = lookup
@@ -137,7 +175,7 @@ fn process_single_save(
         .and_then(|value| value.md5.clone());
 
     if rom_sha1.is_none()
-        && let Some(rom_entry) = rom_index.get(&stem_key)
+        && let Some(rom_entry) = rom_entry
     {
         if let Some((cached_sha1, cached_md5)) = rom_hash_cache.get(&stem_key).cloned() {
             rom_sha1 = Some(cached_sha1);
@@ -162,7 +200,6 @@ fn process_single_save(
         return Ok(None);
     };
 
-    let system_slug = infer_system_slug(save_path);
     let latest = api.latest_save(&rom_sha1, &options.slot_name)?;
 
     if !latest.exists {
@@ -171,8 +208,6 @@ fn process_single_save(
             return Ok(Some(synced_entry(local_sha, Some(rom_sha1), None)));
         }
 
-        let bytes = fs::read(save_path)
-            .with_context(|| format!("kan save bestand niet lezen: {}", save_path.display()))?;
         let filename = save_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -180,12 +215,12 @@ fn process_single_save(
 
         let _upload = api.upload_save(
             filename,
-            bytes,
+            normalized_save.canonical_bytes.clone(),
             &rom_sha1,
             rom_md5.as_deref(),
             &options.slot_name,
             fingerprint,
-            system_slug.as_deref(),
+            Some(&system_slug),
         )?;
 
         report.uploaded += 1;
@@ -215,8 +250,6 @@ fn process_single_save(
             )));
         }
 
-        let bytes = fs::read(save_path)
-            .with_context(|| format!("kan save bestand niet lezen: {}", save_path.display()))?;
         let filename = save_path
             .file_name()
             .and_then(|value| value.to_str())
@@ -224,12 +257,12 @@ fn process_single_save(
 
         api.upload_save(
             filename,
-            bytes,
+            normalized_save.canonical_bytes.clone(),
             &rom_sha1,
             rom_md5.as_deref(),
             &options.slot_name,
             fingerprint,
-            system_slug.as_deref(),
+            Some(&system_slug),
         )?;
         report.uploaded += 1;
         return Ok(Some(synced_entry(
@@ -244,6 +277,7 @@ fn process_single_save(
         handle_conflict(
             api,
             save_path,
+            &normalized_save.canonical_bytes,
             &local_sha,
             &rom_sha1,
             options,
@@ -269,12 +303,14 @@ fn process_single_save(
             )));
         }
 
-        let bytes = api.download_save(&save_id)?;
+        let canonical_bytes = api.download_save(&save_id)?;
+        let local_bytes =
+            encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
         if let Some(parent) = save_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("kan map niet maken: {}", parent.display()))?;
         }
-        fs::write(save_path, &bytes).with_context(|| {
+        fs::write(save_path, &local_bytes).with_context(|| {
             format!(
                 "kan save bestand niet overschrijven: {}",
                 save_path.display()
@@ -283,7 +319,7 @@ fn process_single_save(
         report.downloaded += 1;
 
         return Ok(Some(synced_entry(
-            sha256_bytes(&bytes),
+            sha256_bytes(&canonical_bytes),
             Some(rom_sha1),
             latest.version,
         )));
@@ -300,6 +336,7 @@ fn process_single_save(
 fn handle_conflict(
     api: &ApiClient,
     save_path: &std::path::Path,
+    canonical_bytes: &[u8],
     local_sha: &str,
     rom_sha1: &str,
     options: &SyncOptions,
@@ -311,12 +348,6 @@ fn handle_conflict(
         return Ok(());
     }
 
-    let bytes = fs::read(save_path).with_context(|| {
-        format!(
-            "kan save bestand niet lezen voor conflict report: {}",
-            save_path.display()
-        )
-    })?;
     let file_name = save_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -330,7 +361,7 @@ fn handle_conflict(
 
     let _ = api.conflict_report(
         file_name,
-        bytes,
+        canonical_bytes.to_vec(),
         rom_sha1,
         &options.slot_name,
         local_sha,
