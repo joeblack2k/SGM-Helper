@@ -48,6 +48,11 @@ Supported family filter in sync:
 
 The helper does not upload files blindly by `.sav` extension. It classifies candidates as real saves using console-specific extension/size rules plus binary payload checks.
 
+For PS1 formats, sync uses canonical normalization:
+
+- `.gme` and `.vmp` are validated and converted to canonical raw memory card bytes for hash/upload
+- on download, saves are written back in the original local container format where supported
+
 Watch mode:
 
 ```bash

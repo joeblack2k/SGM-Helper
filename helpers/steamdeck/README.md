@@ -50,9 +50,16 @@ Steam Deck scanning only syncs saves that can be classified as supported console
 Classification is not extension-only. The helper validates save candidates with:
 
 - supported extension per console
-- plausible save size window
+- known save size profiles per console (where available)
 - binary payload check (plain text files are rejected)
 - ROM/path hints for console detection (for example Game Boy, SNES, Genesis, NeoGeo)
+- format signatures/checksums for Sony memory card containers (PS1 raw/GME/VMP, PS2 superblock)
+
+Cross-emulator normalization currently supported:
+
+- PS1 raw memcard (`.mcr/.mc/.mcd/.psv`) <-> canonical raw sync payload
+- PS1 DexDrive (`.gme`) is decoded to canonical raw for upload/hash and re-encoded on download
+- PS1 PSP VMP (`.vmp`) signature is validated, decoded to canonical raw for upload/hash and re-encoded on download
 
 For compatibility with existing 1Retro-style deployments you can also set:
 

@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
+use aes::Aes128;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use anyhow::{Context, Result};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
@@ -10,10 +12,35 @@ use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "dsv", "gme", "mcr", "mc", "mcd",
-    "vmp", "psv", "ps2", "psu", "max", "cbs", "xps",
+    "vmp", "psv", "ps2", "bin",
 ];
 
-const MAX_SAVE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
+
+const PS1_MEMCARD_SIZE: usize = 131_072;
+const PS1_FRAME_SIZE: usize = 128;
+const PS1_HEADER_BLOCK_SIZE: usize = 8192;
+const PS1_DEXDRIVE_HEADER_LENGTH: usize = 3904;
+const PS1_DEXDRIVE_MAGIC: &[u8] = b"123-456-STD";
+const PS1_PSP_VMP_HEADER_LENGTH: usize = 0x80;
+const PS1_PSP_VMP_MAGIC: [u8; 12] = [0, 0x50, 0x4D, 0x56, 0x80, 0, 0, 0, 0, 0, 0, 0];
+const PS1_PSP_VMP_SALT_SEED_OFFSET: usize = 0x0C;
+const PS1_PSP_VMP_SALT_SEED_LEN: usize = 0x14;
+const PS1_PSP_VMP_SIGNATURE_OFFSET: usize = 0x20;
+const PS1_PSP_VMP_SIGNATURE_LEN: usize = 0x14;
+const PS1_PSP_VMP_SALT_LEN: usize = 0x40;
+const PS1_PSP_VMP_KEY: [u8; 16] = [
+    0xAB, 0x5A, 0xBC, 0x9F, 0xC1, 0xF4, 0x9D, 0xE6, 0xA0, 0x51, 0xDB, 0xAE, 0xFA, 0x51, 0x88, 0x59,
+];
+const PS1_PSP_VMP_IV_PRETEND: [u8; 16] = [
+    0xB3, 0x0F, 0xFE, 0xED, 0xB7, 0xDC, 0x5E, 0xB7, 0x13, 0x3D, 0xA6, 0x0D, 0x1B, 0x6B, 0x2C, 0xDC,
+];
+const PS1_PSP_VMP_SALT_SEED_INIT: [u8; 20] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+    0x10, 0x11, 0x12, 0x13,
+];
+
+const PS2_MEMCARD_MAGIC: &[u8] = b"Sony PS2 Memory Card Format ";
 
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "sms",
@@ -168,6 +195,84 @@ pub struct SaveClassification {
     pub evidence: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveContainerFormat {
+    Native,
+    Ps1Raw,
+    Ps1DexDrive,
+    Ps1Vmp,
+}
+
+#[derive(Debug, Clone)]
+pub struct NormalizedSave {
+    pub canonical_bytes: Vec<u8>,
+    pub local_container: SaveContainerFormat,
+}
+
+pub fn normalize_save_for_sync(
+    save_path: &Path,
+    system_slug: &str,
+) -> Result<Option<NormalizedSave>> {
+    let bytes = std::fs::read(save_path)
+        .with_context(|| format!("kan save bestand niet lezen: {}", save_path.display()))?;
+    normalize_save_bytes_for_sync(save_path, system_slug, &bytes)
+}
+
+pub fn normalize_save_bytes_for_sync(
+    save_path: &Path,
+    system_slug: &str,
+    bytes: &[u8],
+) -> Result<Option<NormalizedSave>> {
+    if system_slug != "psx" {
+        return Ok(Some(NormalizedSave {
+            canonical_bytes: bytes.to_vec(),
+            local_container: SaveContainerFormat::Native,
+        }));
+    }
+
+    let ext = path_extension(save_path).unwrap_or_default();
+    let normalized = match ext.as_str() {
+        "gme" => decode_ps1_dexdrive(bytes).map(|payload| NormalizedSave {
+            canonical_bytes: payload,
+            local_container: SaveContainerFormat::Ps1DexDrive,
+        }),
+        "vmp" => decode_ps1_vmp(bytes).map(|payload| NormalizedSave {
+            canonical_bytes: payload,
+            local_container: SaveContainerFormat::Ps1Vmp,
+        }),
+        _ => {
+            if validate_ps1_raw_memcard(bytes) {
+                Some(NormalizedSave {
+                    canonical_bytes: bytes.to_vec(),
+                    local_container: SaveContainerFormat::Ps1Raw,
+                })
+            } else {
+                None
+            }
+        }
+    };
+    Ok(normalized)
+}
+
+pub fn encode_download_for_local_container(
+    canonical_bytes: &[u8],
+    local_container: SaveContainerFormat,
+) -> Result<Vec<u8>> {
+    if !validate_ps1_raw_memcard(canonical_bytes) && local_container != SaveContainerFormat::Native
+    {
+        anyhow::bail!(
+            "canonieke PS1 save is ongeldig en kan niet worden teruggezet naar lokaal formaat"
+        );
+    }
+
+    let encoded = match local_container {
+        SaveContainerFormat::Native | SaveContainerFormat::Ps1Raw => canonical_bytes.to_vec(),
+        SaveContainerFormat::Ps1DexDrive => encode_ps1_dexdrive(canonical_bytes),
+        SaveContainerFormat::Ps1Vmp => encode_ps1_vmp(canonical_bytes)?,
+    };
+    Ok(encoded)
+}
+
 pub fn classify_supported_save(
     save_path: &Path,
     rom_path: Option<&Path>,
@@ -184,10 +289,13 @@ pub fn classify_supported_save(
         .and_then(system_slug_from_rom_extension)
         && is_plausible_save_for_system(&save_ext, save_size, slug)
     {
-        return Some(SaveClassification {
-            system_slug: slug.to_string(),
-            evidence: format!("rom-extension + .{} ({} bytes)", save_ext, save_size),
-        });
+        return classify_if_valid(
+            save_path,
+            &save_ext,
+            save_size,
+            slug,
+            format!("rom-extension + .{} ({} bytes)", save_ext, save_size),
+        );
     }
 
     let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
@@ -198,10 +306,13 @@ pub fn classify_supported_save(
 
     if contains_any(&combined, &["gameboy advance", "/gba/", "\\gba\\"]) {
         if is_plausible_save_for_system(&save_ext, save_size, "gba") {
-            return Some(SaveClassification {
-                system_slug: "gba".to_string(),
-                evidence: format!("path hint gba + .{} ({} bytes)", save_ext, save_size),
-            });
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                "gba",
+                format!("path hint gba + .{} ({} bytes)", save_ext, save_size),
+            );
         }
         return None;
     }
@@ -249,10 +360,13 @@ pub fn classify_supported_save(
     ) {
         let slug = infer_nintendo_slug(&combined);
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
-            return Some(SaveClassification {
-                system_slug: slug.to_string(),
-                evidence: format!("path hint nintendo + .{} ({} bytes)", save_ext, save_size),
-            });
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                slug,
+                format!("path hint nintendo + .{} ({} bytes)", save_ext, save_size),
+            );
         }
         return None;
     }
@@ -280,10 +394,13 @@ pub fn classify_supported_save(
     ) {
         let slug = infer_sega_slug(&combined);
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
-            return Some(SaveClassification {
-                system_slug: slug.to_string(),
-                evidence: format!("path hint sega + .{} ({} bytes)", save_ext, save_size),
-            });
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                slug,
+                format!("path hint sega + .{} ({} bytes)", save_ext, save_size),
+            );
         }
         return None;
     }
@@ -295,10 +412,13 @@ pub fn classify_supported_save(
         ],
     ) {
         if is_plausible_save_for_system(&save_ext, save_size, "neogeo") {
-            return Some(SaveClassification {
-                system_slug: "neogeo".to_string(),
-                evidence: format!("path hint neogeo + .{} ({} bytes)", save_ext, save_size),
-            });
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                "neogeo",
+                format!("path hint neogeo + .{} ({} bytes)", save_ext, save_size),
+            );
         }
         return None;
     }
@@ -339,10 +459,13 @@ pub fn classify_supported_save(
     ) {
         let slug = infer_sony_slug(&combined);
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
-            return Some(SaveClassification {
-                system_slug: slug.to_string(),
-                evidence: format!("path hint sony + .{} ({} bytes)", save_ext, save_size),
-            });
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                slug,
+                format!("path hint sony + .{} ({} bytes)", save_ext, save_size),
+            );
         }
         return None;
     }
@@ -350,13 +473,32 @@ pub fn classify_supported_save(
     if let Some(slug) = system_slug_from_save_extension(save_ext.as_str())
         && is_plausible_save_for_system(&save_ext, save_size, slug)
     {
-        return Some(SaveClassification {
-            system_slug: slug.to_string(),
-            evidence: format!("save extension .{} ({} bytes)", save_ext, save_size),
-        });
+        return classify_if_valid(
+            save_path,
+            &save_ext,
+            save_size,
+            slug,
+            format!("save extension .{} ({} bytes)", save_ext, save_size),
+        );
     }
 
     None
+}
+
+fn classify_if_valid(
+    save_path: &Path,
+    save_ext: &str,
+    save_size: u64,
+    slug: &str,
+    evidence: String,
+) -> Option<SaveClassification> {
+    if !passes_binary_validation(save_path, save_ext, save_size, slug) {
+        return None;
+    }
+    Some(SaveClassification {
+        system_slug: slug.to_string(),
+        evidence,
+    })
 }
 
 fn path_extension(path: &Path) -> Option<String> {
@@ -493,7 +635,7 @@ fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
         "eep" | "fla" | "sra" => Some("n64"),
         "dsv" => Some("nds"),
         "mcr" | "mc" | "mcd" | "vmp" | "psv" => Some("psx"),
-        "ps2" | "psu" | "max" | "cbs" | "xps" => Some("ps2"),
+        "ps2" | "bin" => Some("ps2"),
         _ => None,
     }
 }
@@ -519,12 +661,9 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
         "psx" => matches!(
             ext,
-            "sav" | "srm" | "ram" | "mcr" | "mc" | "mcd" | "vmp" | "psv"
+            "sav" | "srm" | "ram" | "mcr" | "mc" | "mcd" | "vmp" | "psv" | "gme"
         ),
-        "ps2" => matches!(
-            ext,
-            "sav" | "srm" | "ram" | "ps2" | "psu" | "max" | "cbs" | "xps"
-        ),
+        "ps2" => matches!(ext, "ps2" | "bin"),
         "psp" | "psvita" | "ps3" | "ps4" | "ps5" => matches!(ext, "sav" | "srm" | "ram"),
         _ => false,
     };
@@ -533,26 +672,295 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
     }
 
     match slug {
-        "nes" => (512..=262_144).contains(&size),
-        "snes" => (512..=524_288).contains(&size),
-        "gameboy" => (512..=262_144).contains(&size),
-        "gba" => (512..=1_048_576).contains(&size),
+        "nes" => matches!(
+            size,
+            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
+        ),
+        "snes" => matches!(
+            size,
+            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
+        ),
+        "gameboy" => matches!(
+            size,
+            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536
+        ),
+        "gba" => matches!(size, 512 | 8192 | 32768 | 65536 | 131072),
         "n64" => {
             if ext == "eep" {
                 size == 512 || size == 2048
+            } else if ext == "sra" {
+                size == 32 * 1024
+            } else if ext == "fla" {
+                size == 128 * 1024
             } else {
-                (512..=262_144).contains(&size)
+                matches!(size, 512 | 2048 | 32_768 | 131_072 | 786_432)
             }
         }
-        "nds" => (512..=16_777_216).contains(&size),
-        "genesis" | "master-system" | "game-gear" => (512..=524_288).contains(&size),
-        "neogeo" => (512..=2_097_152).contains(&size),
-        "psx" => (1024..=2_097_152).contains(&size),
-        "ps2" => (1024..=33_554_432).contains(&size),
+        "nds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
+        "genesis" | "master-system" | "game-gear" => {
+            matches!(
+                size,
+                64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
+            )
+        }
+        "neogeo" => size.is_power_of_two() && (512..=2_097_152).contains(&size),
+        "psx" => {
+            let size = size as usize;
+            size == PS1_MEMCARD_SIZE
+                || size == PS1_DEXDRIVE_HEADER_LENGTH + PS1_MEMCARD_SIZE
+                || size == PS1_PSP_VMP_HEADER_LENGTH + PS1_MEMCARD_SIZE
+        }
+        "ps2" => (8 * 1024 * 1024..=128 * 1024 * 1024).contains(&size) && size.is_multiple_of(512),
         "psp" | "psvita" | "ps3" => (1024..=67_108_864).contains(&size),
         "ps4" | "ps5" => (1024..=268_435_456).contains(&size),
         _ => false,
     }
+}
+
+fn passes_binary_validation(save_path: &Path, save_ext: &str, _save_size: u64, slug: &str) -> bool {
+    if looks_like_executable_or_archive(save_path) {
+        return false;
+    }
+
+    match slug {
+        "psx" => validate_psx_container(save_path, save_ext),
+        "ps2" => validate_ps2_memory_card_image(save_path),
+        _ => true,
+    }
+}
+
+fn looks_like_executable_or_archive(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut header = [0u8; 8];
+    let Ok(read) = reader.read(&mut header) else {
+        return false;
+    };
+    if read < 2 {
+        return false;
+    }
+
+    let slice = &header[..read];
+    slice.starts_with(b"MZ")
+        || slice.starts_with(b"\x7fELF")
+        || slice.starts_with(b"PK\x03\x04")
+        || slice.starts_with(b"PK\x05\x06")
+        || slice.starts_with(b"PK\x07\x08")
+        || slice.starts_with(b"\x1f\x8b")
+        || slice.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C])
+}
+
+fn validate_ps2_memory_card_image(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut magic = vec![0u8; PS2_MEMCARD_MAGIC.len()];
+    if reader.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    magic == PS2_MEMCARD_MAGIC
+}
+
+fn validate_psx_container(path: &Path, ext: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    match ext {
+        "gme" => decode_ps1_dexdrive(&bytes).is_some(),
+        "vmp" => decode_ps1_vmp(&bytes).is_some(),
+        _ => validate_ps1_raw_memcard(&bytes),
+    }
+}
+
+fn validate_ps1_raw_memcard(bytes: &[u8]) -> bool {
+    if bytes.len() != PS1_MEMCARD_SIZE {
+        return false;
+    }
+
+    let header = &bytes[..PS1_HEADER_BLOCK_SIZE];
+    let frame_count = PS1_HEADER_BLOCK_SIZE / PS1_FRAME_SIZE;
+    if frame_count < 64 {
+        return false;
+    }
+
+    let frame0 = &header[..PS1_FRAME_SIZE];
+    if !frame0.starts_with(b"MC") || !frame_checksum_ok(frame0) {
+        return false;
+    }
+
+    for frame_index in 1..=15 {
+        let start = frame_index * PS1_FRAME_SIZE;
+        let end = start + PS1_FRAME_SIZE;
+        if !frame_checksum_ok(&header[start..end]) {
+            return false;
+        }
+    }
+
+    let trailing_start = 63 * PS1_FRAME_SIZE;
+    let trailing_end = trailing_start + PS1_FRAME_SIZE;
+    let trailing = &header[trailing_start..trailing_end];
+    trailing.starts_with(b"MC") && frame_checksum_ok(trailing)
+}
+
+fn frame_checksum_ok(frame: &[u8]) -> bool {
+    if frame.len() != PS1_FRAME_SIZE {
+        return false;
+    }
+    let checksum = frame[..PS1_FRAME_SIZE - 1]
+        .iter()
+        .fold(0u8, |acc, value| acc ^ value);
+    checksum == frame[PS1_FRAME_SIZE - 1]
+}
+
+fn decode_ps1_dexdrive(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() == PS1_MEMCARD_SIZE && validate_ps1_raw_memcard(bytes) {
+        return Some(bytes.to_vec());
+    }
+    if bytes.len() != PS1_DEXDRIVE_HEADER_LENGTH + PS1_MEMCARD_SIZE {
+        return None;
+    }
+
+    let header = &bytes[..PS1_DEXDRIVE_HEADER_LENGTH];
+    let header_magic = header.starts_with(PS1_DEXDRIVE_MAGIC);
+    let blankish_header = header.iter().filter(|value| **value != 0).count() <= 16;
+    if !header_magic && !blankish_header {
+        return None;
+    }
+
+    let payload = &bytes[PS1_DEXDRIVE_HEADER_LENGTH..];
+    if !validate_ps1_raw_memcard(payload) {
+        return None;
+    }
+    Some(payload.to_vec())
+}
+
+fn encode_ps1_dexdrive(raw: &[u8]) -> Vec<u8> {
+    let mut header = vec![0u8; PS1_DEXDRIVE_HEADER_LENGTH];
+    header[..PS1_DEXDRIVE_MAGIC.len()].copy_from_slice(PS1_DEXDRIVE_MAGIC);
+    header[18] = 0x01;
+    header[20] = 0x01;
+    header[21] = b'M';
+    [header, raw.to_vec()].concat()
+}
+
+fn decode_ps1_vmp(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() != PS1_PSP_VMP_HEADER_LENGTH + PS1_MEMCARD_SIZE {
+        return None;
+    }
+
+    let header = &bytes[..PS1_PSP_VMP_HEADER_LENGTH];
+    if header[..PS1_PSP_VMP_MAGIC.len()] != PS1_PSP_VMP_MAGIC {
+        return None;
+    }
+
+    let salt_seed = &header
+        [PS1_PSP_VMP_SALT_SEED_OFFSET..PS1_PSP_VMP_SALT_SEED_OFFSET + PS1_PSP_VMP_SALT_SEED_LEN];
+    let signature_found = &header
+        [PS1_PSP_VMP_SIGNATURE_OFFSET..PS1_PSP_VMP_SIGNATURE_OFFSET + PS1_PSP_VMP_SIGNATURE_LEN];
+    let signature_calculated = calculate_ps1_vmp_signature(bytes, salt_seed)?;
+    if signature_found != signature_calculated {
+        return None;
+    }
+
+    let payload = &bytes[PS1_PSP_VMP_HEADER_LENGTH..];
+    if !validate_ps1_raw_memcard(payload) {
+        return None;
+    }
+    Some(payload.to_vec())
+}
+
+fn encode_ps1_vmp(raw: &[u8]) -> Result<Vec<u8>> {
+    if !validate_ps1_raw_memcard(raw) {
+        anyhow::bail!("kan geen VMP maken: input is geen geldige PS1 memory card");
+    }
+
+    let mut output = vec![0u8; PS1_PSP_VMP_HEADER_LENGTH + raw.len()];
+    output[..PS1_PSP_VMP_MAGIC.len()].copy_from_slice(&PS1_PSP_VMP_MAGIC);
+    output[PS1_PSP_VMP_SALT_SEED_OFFSET..PS1_PSP_VMP_SALT_SEED_OFFSET + PS1_PSP_VMP_SALT_SEED_LEN]
+        .copy_from_slice(&PS1_PSP_VMP_SALT_SEED_INIT);
+    output[PS1_PSP_VMP_HEADER_LENGTH..].copy_from_slice(raw);
+
+    let signature = calculate_ps1_vmp_signature(&output, &PS1_PSP_VMP_SALT_SEED_INIT)
+        .context("kon VMP signature niet berekenen")?;
+    output[PS1_PSP_VMP_SIGNATURE_OFFSET..PS1_PSP_VMP_SIGNATURE_OFFSET + PS1_PSP_VMP_SIGNATURE_LEN]
+        .copy_from_slice(&signature);
+
+    Ok(output)
+}
+
+fn calculate_ps1_vmp_signature(full_bytes: &[u8], salt_seed: &[u8]) -> Option<[u8; 20]> {
+    if full_bytes.len() < PS1_PSP_VMP_SIGNATURE_OFFSET + PS1_PSP_VMP_SIGNATURE_LEN
+        || salt_seed.len() < PS1_PSP_VMP_SALT_SEED_LEN
+    {
+        return None;
+    }
+
+    let mut salt = [0u8; PS1_PSP_VMP_SALT_LEN];
+    let mut seed_head = [0u8; 16];
+    seed_head.copy_from_slice(&salt_seed[..16]);
+
+    let decrypt = aes128_ecb_decrypt(seed_head);
+    let encrypt = aes128_ecb_encrypt(seed_head);
+    salt[..16].copy_from_slice(&decrypt);
+    salt[16..32].copy_from_slice(&encrypt);
+
+    for (index, value) in PS1_PSP_VMP_IV_PRETEND.iter().enumerate() {
+        salt[index] ^= value;
+    }
+
+    let mut work = [0xFFu8; 16];
+    work[..PS1_PSP_VMP_SALT_SEED_LEN - 16]
+        .copy_from_slice(&salt_seed[16..PS1_PSP_VMP_SALT_SEED_LEN]);
+    for (index, value) in work.iter().enumerate() {
+        salt[16 + index] ^= value;
+    }
+
+    for value in salt.iter_mut().skip(PS1_PSP_VMP_SALT_SEED_LEN) {
+        *value = 0;
+    }
+    for value in &mut salt {
+        *value ^= 0x36;
+    }
+
+    let mut hash_input = full_bytes.to_vec();
+    hash_input
+        [PS1_PSP_VMP_SIGNATURE_OFFSET..PS1_PSP_VMP_SIGNATURE_OFFSET + PS1_PSP_VMP_SIGNATURE_LEN]
+        .fill(0);
+
+    let mut hash1 = Sha1::new();
+    hash1.update(salt);
+    hash1.update(&hash_input);
+    let digest1 = hash1.finalize();
+
+    for value in &mut salt {
+        *value ^= 0x6A;
+    }
+
+    let mut hash2 = Sha1::new();
+    hash2.update(salt);
+    hash2.update(digest1);
+    let digest2 = hash2.finalize();
+
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&digest2);
+    Some(out)
+}
+
+fn aes128_ecb_encrypt(block: [u8; 16]) -> [u8; 16] {
+    let cipher = Aes128::new(&GenericArray::from(PS1_PSP_VMP_KEY));
+    let mut output = GenericArray::from(block);
+    cipher.encrypt_block(&mut output);
+    output.into()
+}
+
+fn aes128_ecb_decrypt(block: [u8; 16]) -> [u8; 16] {
+    let cipher = Aes128::new(&GenericArray::from(PS1_PSP_VMP_KEY));
+    let mut output = GenericArray::from(block);
+    cipher.decrypt_block(&mut output);
+    output.into()
 }
 
 fn looks_plain_text(path: &Path) -> bool {
@@ -584,6 +992,44 @@ fn looks_plain_text(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
+
+    fn set_frame_checksum(bytes: &mut [u8], frame_index: usize) {
+        let start = frame_index * PS1_FRAME_SIZE;
+        let end = start + PS1_FRAME_SIZE;
+        let frame = &mut bytes[start..end];
+        let checksum = frame[..PS1_FRAME_SIZE - 1]
+            .iter()
+            .fold(0u8, |acc, value| acc ^ value);
+        frame[PS1_FRAME_SIZE - 1] = checksum;
+    }
+
+    fn build_valid_ps1_memcard() -> Vec<u8> {
+        let mut bytes = vec![0u8; PS1_MEMCARD_SIZE];
+        bytes[0] = b'M';
+        bytes[1] = b'C';
+
+        for frame_index in 1..=15 {
+            let start = frame_index * PS1_FRAME_SIZE;
+            bytes[start] = 0xA0;
+            bytes[start + 8] = 0xFF;
+            bytes[start + 9] = 0xFF;
+            set_frame_checksum(&mut bytes, frame_index);
+        }
+
+        let trailing_start = 63 * PS1_FRAME_SIZE;
+        bytes[trailing_start] = b'M';
+        bytes[trailing_start + 1] = b'C';
+        set_frame_checksum(&mut bytes, 0);
+        set_frame_checksum(&mut bytes, 63);
+        bytes
+    }
+
+    fn write_ps2_memory_card(path: &Path) {
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(PS2_MEMCARD_MAGIC).unwrap();
+        file.set_len(8 * 1024 * 1024).unwrap();
+    }
 
     #[test]
     fn scanner_finds_supported_save_files() {
@@ -609,7 +1055,7 @@ mod tests {
         fs::create_dir_all(psx.parent().unwrap()).unwrap();
         fs::write(&snes, vec![0x00u8; 8192]).unwrap();
         fs::write(&sega, vec![0x00u8; 8192]).unwrap();
-        fs::write(&psx, vec![0x00u8; 131_072]).unwrap();
+        fs::write(&psx, build_valid_ps1_memcard()).unwrap();
         assert_eq!(infer_system_slug(&snes).as_deref(), Some("snes"));
         assert_eq!(infer_system_slug(&sega).as_deref(), Some("genesis"));
         assert_eq!(infer_system_slug(&psx).as_deref(), Some("psx"));
@@ -658,11 +1104,38 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let save = tmp.path().join("Emulation/saves/pcsx2/Gran Turismo 4.ps2");
         fs::create_dir_all(save.parent().unwrap()).unwrap();
-        fs::write(&save, vec![0x00u8; 2_097_152]).unwrap();
+        write_ps2_memory_card(&save);
 
         assert_eq!(
             infer_supported_console_slug(&save, None).as_deref(),
             Some("ps2")
         );
+    }
+
+    #[test]
+    fn ps1_dexdrive_is_normalized_for_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Emulation/saves/duckstation/card.gme");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let raw = build_valid_ps1_memcard();
+        fs::write(&save, encode_ps1_dexdrive(&raw)).unwrap();
+
+        let normalized = normalize_save_for_sync(&save, "psx")
+            .unwrap()
+            .expect("expected normalized save");
+        assert_eq!(normalized.local_container, SaveContainerFormat::Ps1DexDrive);
+        assert_eq!(normalized.canonical_bytes, raw);
+    }
+
+    #[test]
+    fn ps1_vmp_roundtrip_conversion_works() {
+        let raw = build_valid_ps1_memcard();
+        let encoded = encode_ps1_vmp(&raw).unwrap();
+        let decoded = decode_ps1_vmp(&encoded).expect("expected valid vmp");
+        assert_eq!(decoded, raw);
+
+        let rewritten =
+            encode_download_for_local_container(&raw, SaveContainerFormat::Ps1Vmp).unwrap();
+        assert_eq!(rewritten, encoded);
     }
 }
