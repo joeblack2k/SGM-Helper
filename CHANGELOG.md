@@ -35,6 +35,7 @@ All notable changes to this project are documented in this file.
 - Non-MiSTer sources keep `.sav` preference for N64.
 - Save extension preference is now profile-driven per source (`PROFILE`) instead of only source kind.
 - Added emulator profiles (`mister`, `retroarch`, `snes9x`, `zsnes`, `everdrive`, `generic`) to source config and CLI `source add --profile`.
+- PS1 sync now includes automatic shared-card fallback keys when ROM mapping is missing, plus alias uploads for multi-game cards and a shared-card restore safety guard.
 
 ## [0.3.1] - 2026-04-21
 

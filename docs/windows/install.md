@@ -82,3 +82,9 @@ Manual PS1 container conversion:
 ```powershell
 .\sgm-windows-helper.exe convert --input .\card.mcr --output .\card.gme --from raw --to gme
 ```
+
+PS1 shared/per-game auto-handling:
+
+- No manual toggle is required.
+- If ROM matching is missing, helper auto-detects PS1 serials and uses deterministic fallback sync keys.
+- For multi-game cards, helper uploads serial aliases to improve cross-frontend compatibility.

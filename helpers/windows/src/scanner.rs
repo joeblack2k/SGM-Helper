@@ -311,6 +311,26 @@ pub fn encode_download_for_local_container(
     Ok(encoded)
 }
 
+pub fn ps1_detected_serials(canonical_bytes: &[u8]) -> Vec<String> {
+    detect_ps1_serials_from_card(canonical_bytes)
+}
+
+pub fn ps1_fallback_rom_keys(canonical_bytes: &[u8]) -> Vec<String> {
+    let serials = detect_ps1_serials_from_card(canonical_bytes);
+    if serials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut keys = Vec::new();
+    if serials.len() > 1 {
+        keys.push(shared_ps1_card_key(&serials));
+    }
+    for serial in serials {
+        keys.push(format!("psx-serial:{}", serial));
+    }
+    keys
+}
+
 pub fn classify_supported_save(
     save_path: &Path,
     rom_path: Option<&Path>,
@@ -813,6 +833,73 @@ fn validate_psx_container(path: &Path, ext: &str) -> bool {
     }
 }
 
+fn detect_ps1_serials_from_card(bytes: &[u8]) -> Vec<String> {
+    if !validate_ps1_raw_memcard(bytes) {
+        return Vec::new();
+    }
+
+    let mut serials = BTreeSet::new();
+    for frame_index in 1..=15 {
+        let start = frame_index * PS1_FRAME_SIZE;
+        let end = start + PS1_FRAME_SIZE;
+        let frame = &bytes[start..end];
+
+        if !frame_checksum_ok(frame) {
+            continue;
+        }
+
+        let status = frame[0];
+        if status == 0x00 || status == 0xFF {
+            continue;
+        }
+
+        let name_bytes = &frame[0x0A..0x0A + 0x20];
+        let name = String::from_utf8_lossy(name_bytes)
+            .trim_matches(char::from(0))
+            .trim()
+            .to_ascii_uppercase();
+        if name.is_empty() {
+            continue;
+        }
+
+        if let Some(serial) = parse_ps1_serial_token(&name) {
+            serials.insert(serial);
+        }
+    }
+
+    serials.into_iter().collect()
+}
+
+fn parse_ps1_serial_token(name: &str) -> Option<String> {
+    const PREFIXES: &[&str] = &[
+        "SCUS", "SLUS", "SCES", "SLES", "SCPS", "SLPS", "SLPM", "SCED", "SLED", "SCPS", "SLKA",
+    ];
+
+    let normalized = name.replace('_', "-");
+    for prefix in PREFIXES {
+        let needle = format!("{}-", prefix);
+        if let Some(start) = normalized.find(&needle) {
+            let digits_start = start + needle.len();
+            if digits_start + 5 <= normalized.len() {
+                let digits = &normalized[digits_start..digits_start + 5];
+                if digits.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Some(format!("{}-{}", prefix.to_ascii_lowercase(), digits));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn shared_ps1_card_key(serials: &[String]) -> String {
+    let joined = serials.join(",");
+    let mut hasher = Sha1::new();
+    hasher.update(joined.as_bytes());
+    let hash = hex::encode(hasher.finalize());
+    format!("psx-shared:{}:{}", serials.len(), &hash[..16])
+}
+
 fn validate_ps1_raw_memcard(bytes: &[u8]) -> bool {
     if bytes.len() != PS1_MEMCARD_SIZE {
         return false;
@@ -1063,6 +1150,18 @@ mod tests {
         bytes
     }
 
+    fn set_ps1_directory_filename(card: &mut [u8], frame_index: usize, status: u8, filename: &str) {
+        let start = frame_index * PS1_FRAME_SIZE;
+        let end = start + PS1_FRAME_SIZE;
+        let frame = &mut card[start..end];
+        frame.fill(0);
+        frame[0] = status;
+        let bytes = filename.as_bytes();
+        let len = bytes.len().min(0x20);
+        frame[0x0A..0x0A + len].copy_from_slice(&bytes[..len]);
+        set_frame_checksum(card, frame_index);
+    }
+
     fn write_ps2_memory_card(path: &Path) {
         let mut file = fs::File::create(path).unwrap();
         file.write_all(PS2_MEMCARD_MAGIC).unwrap();
@@ -1176,6 +1275,32 @@ mod tests {
         let rewritten =
             encode_download_for_local_container(&raw, SaveContainerFormat::Ps1Vmp).unwrap();
         assert_eq!(rewritten, encoded);
+    }
+
+    #[test]
+    fn detects_ps1_serials_from_card_directory_entries() {
+        let mut raw = build_valid_ps1_memcard();
+        set_ps1_directory_filename(&mut raw, 1, 0xA0, "BASLUS-00594FF7");
+        set_ps1_directory_filename(&mut raw, 2, 0xA0, "BASLES-02222CAST");
+
+        let serials = ps1_detected_serials(&raw);
+        assert_eq!(
+            serials,
+            vec!["sles-02222".to_string(), "slus-00594".to_string()]
+        );
+    }
+
+    #[test]
+    fn builds_ps1_fallback_keys_with_shared_aliases() {
+        let mut raw = build_valid_ps1_memcard();
+        set_ps1_directory_filename(&mut raw, 1, 0xA0, "BASLUS-00594FF7");
+        set_ps1_directory_filename(&mut raw, 2, 0xA0, "BASLES-02222CAST");
+
+        let keys = ps1_fallback_rom_keys(&raw);
+        assert_eq!(keys.len(), 3);
+        assert!(keys[0].starts_with("psx-shared:2:"));
+        assert!(keys.contains(&"psx-serial:slus-00594".to_string()));
+        assert!(keys.contains(&"psx-serial:sles-02222".to_string()));
     }
 
     #[test]

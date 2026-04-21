@@ -43,6 +43,13 @@ Validation is strict. Files are not accepted by extension alone. Scanner checks 
 - PS1 container validation and conversion (`raw`, `.gme`, `.vmp`)
 - PS2 memory card header validation
 
+PS1 automatic shared-card fallback:
+
+- If no ROM mapping is found for a PS1 memory card, helper auto-detects PS1 serial IDs from the card directory.
+- Helper generates deterministic fallback backend keys (`psx-shared:*` and `psx-serial:*`) and syncs without user input.
+- For multi-game cards, helper adds serial aliases on upload to improve compatibility with per-game card setups.
+- Safety guard: helper skips destructive restore if cloud payload looks like a smaller single-game card while local card contains multiple PS1 serials.
+
 Extension policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
 
 - Decision is now based on per-source `PROFILE` (not only `KIND`)

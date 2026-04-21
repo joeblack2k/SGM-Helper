@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::api::{ApiClient, ConflictCheckResponse};
+use crate::api::{ApiClient, ConflictCheckResponse, LatestSaveResponse};
 use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, encode_download_for_local_container, filename_stem,
-    md5_file, normalize_save_for_sync, sha1_file, sha256_bytes,
+    md5_file, normalize_save_for_sync, ps1_detected_serials, ps1_fallback_rom_keys, sha1_file,
+    sha256_bytes,
 };
 use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
@@ -39,6 +40,12 @@ pub struct SyncReport {
 struct ProcessedEntry {
     state_key: String,
     entry: SyncedEntry,
+}
+
+#[derive(Debug, Clone)]
+struct LatestCandidate {
+    rom_sha1: String,
+    latest: LatestSaveResponse,
 }
 
 struct SyncLock {
@@ -298,6 +305,11 @@ fn process_single_save(
         }
     };
     let local_sha = sha256_bytes(&normalized_save.canonical_bytes);
+    let local_ps1_serials = if system_slug == "psx" {
+        ps1_detected_serials(&normalized_save.canonical_bytes)
+    } else {
+        Vec::new()
+    };
     if verbose {
         eprintln!(
             "Detected {} savegame for {} ({}) [adapter={} container={}]",
@@ -337,7 +349,25 @@ fn process_single_save(
         }
     }
 
-    let Some(rom_sha1) = rom_sha1 else {
+    let mut rom_keys = Vec::new();
+    if let Some(value) = rom_sha1.clone() {
+        rom_keys.push(value);
+    }
+
+    let mut using_ps1_fallback = false;
+    if rom_keys.is_empty() && system_slug == "psx" {
+        rom_keys = ps1_fallback_rom_keys(&normalized_save.canonical_bytes);
+        using_ps1_fallback = !rom_keys.is_empty();
+        if using_ps1_fallback && verbose {
+            eprintln!(
+                "PS1 shared/per-game fallback mapping active for {} => {}",
+                save_path.display(),
+                rom_keys.join(", ")
+            );
+        }
+    }
+
+    let Some(primary_rom_sha1) = rom_keys.first().cloned() else {
         report.skipped += 1;
         if verbose {
             eprintln!("No ROM mapping found for save {}", stem);
@@ -345,7 +375,44 @@ fn process_single_save(
         return Ok(None);
     };
 
-    let latest = api.latest_save(&rom_sha1, &options.slot_name)?;
+    let latest_candidates = fetch_latest_candidates(api, &rom_keys, &options.slot_name)?;
+    let Some(best_candidate) = select_best_latest_candidate(&latest_candidates) else {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "No latest candidate available for save {}",
+                save_path.display()
+            );
+        }
+        return Ok(None);
+    };
+    let active_rom_sha1 = best_candidate.rom_sha1.clone();
+    let latest = best_candidate.latest.clone();
+    let upload_keys = if using_ps1_fallback {
+        rom_keys.clone()
+    } else {
+        vec![active_rom_sha1.clone()]
+    };
+
+    if let Some(in_sync_candidate) = latest_candidates
+        .iter()
+        .find(|candidate| candidate.latest.sha256.as_deref() == Some(local_sha.as_str()))
+    {
+        report.in_sync += 1;
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(in_sync_candidate.rom_sha1.clone()),
+                in_sync_candidate.latest.version,
+                Some(&system_slug),
+                Some(normalized_save.local_container),
+                Some(normalized_save.adapter_profile),
+                Some(source_kind),
+                Some(source_name),
+            ),
+        )));
+    }
 
     if !latest.exists {
         if options.dry_run {
@@ -354,7 +421,7 @@ fn process_single_save(
                 state_key.clone(),
                 synced_entry(
                     local_sha,
-                    Some(rom_sha1),
+                    Some(primary_rom_sha1),
                     None,
                     Some(&system_slug),
                     Some(normalized_save.local_container),
@@ -370,39 +437,24 @@ fn process_single_save(
             .and_then(|value| value.to_str())
             .unwrap_or("save.bin");
 
-        let _upload = api.upload_save(
-            filename,
-            normalized_save.canonical_bytes.clone(),
-            &rom_sha1,
-            rom_md5.as_deref(),
-            &options.slot_name,
-            fingerprint,
-            Some(&system_slug),
-        )?;
+        for upload_rom_sha1 in &upload_keys {
+            let _upload = api.upload_save(
+                filename,
+                normalized_save.canonical_bytes.clone(),
+                upload_rom_sha1,
+                rom_md5.as_deref(),
+                &options.slot_name,
+                fingerprint,
+                Some(&system_slug),
+            )?;
+        }
 
         report.uploaded += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
                 local_sha,
-                Some(rom_sha1),
-                latest.version,
-                Some(&system_slug),
-                Some(normalized_save.local_container),
-                Some(normalized_save.adapter_profile),
-                Some(source_kind),
-                Some(source_name),
-            ),
-        )));
-    }
-
-    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
-        report.in_sync += 1;
-        return Ok(Some(processed_entry(
-            state_key.clone(),
-            synced_entry(
-                local_sha,
-                Some(rom_sha1),
+                Some(active_rom_sha1.clone()),
                 latest.version,
                 Some(&system_slug),
                 Some(normalized_save.local_container),
@@ -420,7 +472,7 @@ fn process_single_save(
                 state_key.clone(),
                 synced_entry(
                     local_sha,
-                    Some(rom_sha1),
+                    Some(active_rom_sha1.clone()),
                     latest.version,
                     Some(&system_slug),
                     Some(normalized_save.local_container),
@@ -436,21 +488,23 @@ fn process_single_save(
             .and_then(|value| value.to_str())
             .unwrap_or("save.bin");
 
-        api.upload_save(
-            filename,
-            normalized_save.canonical_bytes.clone(),
-            &rom_sha1,
-            rom_md5.as_deref(),
-            &options.slot_name,
-            fingerprint,
-            Some(&system_slug),
-        )?;
+        for upload_rom_sha1 in &upload_keys {
+            api.upload_save(
+                filename,
+                normalized_save.canonical_bytes.clone(),
+                upload_rom_sha1,
+                rom_md5.as_deref(),
+                &options.slot_name,
+                fingerprint,
+                Some(&system_slug),
+            )?;
+        }
         report.uploaded += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
                 local_sha,
-                Some(rom_sha1),
+                Some(active_rom_sha1.clone()),
                 latest.version,
                 Some(&system_slug),
                 Some(normalized_save.local_container),
@@ -461,14 +515,14 @@ fn process_single_save(
         )));
     }
 
-    let conflict = api.conflict_check(&rom_sha1, &options.slot_name)?;
+    let conflict = api.conflict_check(&active_rom_sha1, &options.slot_name)?;
     if conflict.exists {
         handle_conflict(
             api,
             save_path,
             &normalized_save.canonical_bytes,
             &local_sha,
-            &rom_sha1,
+            &active_rom_sha1,
             options,
             &conflict,
             source_name,
@@ -479,7 +533,7 @@ fn process_single_save(
             state_key.clone(),
             synced_entry(
                 local_sha,
-                Some(rom_sha1),
+                Some(active_rom_sha1.clone()),
                 latest.version,
                 Some(&system_slug),
                 Some(normalized_save.local_container),
@@ -506,7 +560,7 @@ fn process_single_save(
                 state_key.clone(),
                 synced_entry(
                     local_sha,
-                    Some(rom_sha1),
+                    Some(active_rom_sha1.clone()),
                     latest.version,
                     Some(&system_slug),
                     Some(normalized_save.local_container),
@@ -518,6 +572,36 @@ fn process_single_save(
         }
 
         let canonical_bytes = api.download_save(&save_id)?;
+        if system_slug == "psx" {
+            let downloaded_ps1_serials = ps1_detected_serials(&canonical_bytes);
+            if local_ps1_serials.len() > 1
+                && !downloaded_ps1_serials.is_empty()
+                && downloaded_ps1_serials.len() < local_ps1_serials.len()
+            {
+                report.skipped += 1;
+                if verbose {
+                    eprintln!(
+                        "Skipping PS1 restore for {} to avoid shared-card data loss (local serials: {:?}, cloud serials: {:?})",
+                        save_path.display(),
+                        local_ps1_serials,
+                        downloaded_ps1_serials
+                    );
+                }
+                return Ok(Some(processed_entry(
+                    state_key.clone(),
+                    synced_entry(
+                        local_sha,
+                        Some(active_rom_sha1.clone()),
+                        latest.version,
+                        Some(&system_slug),
+                        Some(normalized_save.local_container),
+                        Some(normalized_save.adapter_profile),
+                        Some(source_kind),
+                        Some(source_name),
+                    ),
+                )));
+            }
+        }
         let local_bytes =
             encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
         let target_save_path = preferred_save_path(
@@ -560,7 +644,7 @@ fn process_single_save(
             state_key.clone(),
             synced_entry(
                 sha256_bytes(&canonical_bytes),
-                Some(rom_sha1),
+                Some(active_rom_sha1.clone()),
                 latest.version,
                 Some(&system_slug),
                 Some(normalized_save.local_container),
@@ -689,6 +773,35 @@ fn process_missing_save(
 
 fn processed_entry(state_key: String, entry: SyncedEntry) -> ProcessedEntry {
     ProcessedEntry { state_key, entry }
+}
+
+fn fetch_latest_candidates(
+    api: &ApiClient,
+    rom_keys: &[String],
+    slot_name: &str,
+) -> Result<Vec<LatestCandidate>> {
+    let mut out = Vec::new();
+    for rom_sha1 in rom_keys {
+        let latest = api.latest_save(rom_sha1, slot_name)?;
+        out.push(LatestCandidate {
+            rom_sha1: rom_sha1.clone(),
+            latest,
+        });
+    }
+    Ok(out)
+}
+
+fn select_best_latest_candidate(candidates: &[LatestCandidate]) -> Option<&LatestCandidate> {
+    candidates.iter().max_by(|left, right| {
+        let left_exists = left.latest.exists;
+        let right_exists = right.latest.exists;
+        let left_version = left.latest.version.unwrap_or(-1);
+        let right_version = right.latest.version.unwrap_or(-1);
+
+        left_exists
+            .cmp(&right_exists)
+            .then(left_version.cmp(&right_version))
+    })
 }
 
 fn select_preferred_save_per_stem(

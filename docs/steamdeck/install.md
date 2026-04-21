@@ -79,6 +79,8 @@ For PS1 formats, sync uses canonical normalization:
 
 - `.gme` and `.vmp` are validated and converted to canonical raw memory card bytes for hash/upload
 - on download, saves are written back in the original local container format where supported
+- if ROM matching is missing, helper auto-detects PS1 serials from the card and falls back to deterministic PS1 sync keys
+- for multi-game cards, helper uploads serial aliases to improve compatibility with per-game card frontends
 
 Watch mode:
 
