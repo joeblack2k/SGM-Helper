@@ -1,3 +1,3 @@
 [workspace]
-members = ["helpers/mister", "helpers/windows"]
+members = ["helpers/mister", "helpers/windows", "helpers/steamdeck"]
 resolver = "2"

@@ -6,14 +6,15 @@ Open-source helper tooling for self-hosted retro save sync.
 
 - `helpers/mister` - MiSTer FPGA helper (phase 1)
 - `helpers/windows` - Windows helper (phase 1)
+- `helpers/steamdeck` - Steam Deck helper (phase 1)
 - `helpers/anbernic` - planned
-- `helpers/steamdeck` - planned
 - `docs/mister` - MiSTer install and protocol notes
 - `docs/windows` - Windows install and protocol notes
+- `docs/steamdeck` - Steam Deck install and protocol notes
 
 ## Current scope
 
-Phase 1 implements MiSTer and Windows helpers with:
+Phase 1 implements MiSTer, Windows, and Steam Deck helpers with:
 
 - app-password login flow
 - sync + watch workflows
