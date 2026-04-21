@@ -9,14 +9,15 @@ use sha2::Sha256;
 use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
-    "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "dsv", "gme",
+    "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "dsv", "gme", "mcr", "mc", "mcd",
+    "vmp", "psv", "ps2", "psu", "max", "cbs", "xps",
 ];
 
 const MAX_SAVE_BYTES: u64 = 16 * 1024 * 1024;
 
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "sms",
-    "gg", "cue", "iso", "chd", "pce", "a26", "a78", "col", "bin", "zip", "7z",
+    "gg", "cue", "iso", "chd", "pce", "a26", "a78", "col", "bin", "zip", "7z", "pbp", "cso", "vpk",
 ];
 
 #[derive(Debug, Clone)]
@@ -302,6 +303,50 @@ pub fn classify_supported_save(
         return None;
     }
 
+    if contains_any(
+        &combined,
+        &[
+            "playstation",
+            "sony",
+            "/psx/",
+            "\\psx\\",
+            "/ps1/",
+            "\\ps1\\",
+            "/ps2/",
+            "\\ps2\\",
+            "/psp/",
+            "\\psp\\",
+            "/ps3/",
+            "\\ps3\\",
+            "/psvita/",
+            "\\psvita\\",
+            "/vita/",
+            "\\vita\\",
+            "/ps4/",
+            "\\ps4\\",
+            "/ps5/",
+            "\\ps5\\",
+            "duckstation",
+            "pcsx",
+            "epsxe",
+            "mednafen-psx",
+            "beetle psx",
+            "pcsx2",
+            "ppsspp",
+            "rpcs3",
+            "vita3k",
+        ],
+    ) {
+        let slug = infer_sony_slug(&combined);
+        if is_plausible_save_for_system(&save_ext, save_size, slug) {
+            return Some(SaveClassification {
+                system_slug: slug.to_string(),
+                evidence: format!("path hint sony + .{} ({} bytes)", save_ext, save_size),
+            });
+        }
+        return None;
+    }
+
     if let Some(slug) = system_slug_from_save_extension(save_ext.as_str())
         && is_plausible_save_for_system(&save_ext, save_size, slug)
     {
@@ -331,6 +376,8 @@ fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
         "md" | "gen" => Some("genesis"),
         "sms" => Some("master-system"),
         "gg" => Some("game-gear"),
+        "pbp" | "cso" => Some("psp"),
+        "vpk" => Some("psvita"),
         _ => None,
     }
 }
@@ -371,10 +418,82 @@ fn infer_sega_slug(haystack: &str) -> &'static str {
     "genesis"
 }
 
+fn infer_sony_slug(haystack: &str) -> &'static str {
+    if contains_any(
+        haystack,
+        &["playstation 5", "/ps5/", "\\ps5\\", "sony ps5", "ps5"],
+    ) {
+        return "ps5";
+    }
+    if contains_any(
+        haystack,
+        &["playstation 4", "/ps4/", "\\ps4\\", "sony ps4", "ps4"],
+    ) {
+        return "ps4";
+    }
+    if contains_any(
+        haystack,
+        &[
+            "playstation 3",
+            "/ps3/",
+            "\\ps3\\",
+            "sony ps3",
+            "rpcs3",
+            "ps3",
+        ],
+    ) {
+        return "ps3";
+    }
+    if contains_any(
+        haystack,
+        &[
+            "playstation vita",
+            "ps vita",
+            "/psvita/",
+            "\\psvita\\",
+            "vita3k",
+            "/vita/",
+            "\\vita\\",
+            "psvita",
+        ],
+    ) {
+        return "psvita";
+    }
+    if contains_any(
+        haystack,
+        &[
+            "playstation portable",
+            "/psp/",
+            "\\psp\\",
+            "ppsspp",
+            "sony psp",
+            "psp",
+        ],
+    ) {
+        return "psp";
+    }
+    if contains_any(
+        haystack,
+        &[
+            "playstation 2",
+            "/ps2/",
+            "\\ps2\\",
+            "pcsx2",
+            "sony ps2",
+            "ps2",
+        ],
+    ) {
+        return "ps2";
+    }
+    "psx"
+}
+
 fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
     match ext {
         "eep" | "fla" | "sra" => Some("n64"),
         "dsv" => Some("nds"),
+        "mcr" | "mc" | "mcd" | "vmp" | "psv" => Some("psx"),
+        "ps2" | "psu" | "max" | "cbs" | "xps" => Some("ps2"),
         _ => None,
     }
 }
@@ -398,6 +517,15 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" => matches!(ext, "sav" | "srm" | "ram"),
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
+        "psx" => matches!(
+            ext,
+            "sav" | "srm" | "ram" | "mcr" | "mc" | "mcd" | "vmp" | "psv"
+        ),
+        "ps2" => matches!(
+            ext,
+            "sav" | "srm" | "ram" | "ps2" | "psu" | "max" | "cbs" | "xps"
+        ),
+        "psp" | "psvita" | "ps3" | "ps4" | "ps5" => matches!(ext, "sav" | "srm" | "ram"),
         _ => false,
     };
     if !extension_ok {
@@ -419,6 +547,10 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "nds" => (512..=16_777_216).contains(&size),
         "genesis" | "master-system" | "game-gear" => (512..=524_288).contains(&size),
         "neogeo" => (512..=2_097_152).contains(&size),
+        "psx" => (1024..=2_097_152).contains(&size),
+        "ps2" => (1024..=33_554_432).contains(&size),
+        "psp" | "psvita" | "ps3" => (1024..=67_108_864).contains(&size),
+        "ps4" | "ps5" => (1024..=268_435_456).contains(&size),
         _ => false,
     }
 }
@@ -471,12 +603,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let snes = tmp.path().join("saves/SNES/zelda.srm");
         let sega = tmp.path().join("saves/Sega/sonic.srm");
+        let psx = tmp.path().join("saves/PSX/ff7.mcr");
         fs::create_dir_all(snes.parent().unwrap()).unwrap();
         fs::create_dir_all(sega.parent().unwrap()).unwrap();
+        fs::create_dir_all(psx.parent().unwrap()).unwrap();
         fs::write(&snes, vec![0x00u8; 8192]).unwrap();
         fs::write(&sega, vec![0x00u8; 8192]).unwrap();
+        fs::write(&psx, vec![0x00u8; 131_072]).unwrap();
         assert_eq!(infer_system_slug(&snes).as_deref(), Some("snes"));
         assert_eq!(infer_system_slug(&sega).as_deref(), Some("genesis"));
+        assert_eq!(infer_system_slug(&psx).as_deref(), Some("psx"));
     }
 
     #[test]
@@ -515,5 +651,18 @@ mod tests {
         fs::write(&save, [0x00u8; 1024]).unwrap();
 
         assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn sony_path_hints_are_supported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Emulation/saves/pcsx2/Gran Turismo 4.ps2");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, vec![0x00u8; 2_097_152]).unwrap();
+
+        assert_eq!(
+            infer_supported_console_slug(&save, None).as_deref(),
+            Some("ps2")
+        );
     }
 }

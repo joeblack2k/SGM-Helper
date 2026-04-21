@@ -44,6 +44,7 @@ Supported family filter in sync:
 - Nintendo
 - Sega
 - NeoGeo
+- Sony (PS1/PS2/PSP/PS3/PS Vita/PS4/PS5)
 
 The helper does not upload files blindly by `.sav` extension. It classifies candidates as real saves using console-specific extension/size rules plus binary payload checks.
 

@@ -45,6 +45,7 @@ Steam Deck scanning only syncs saves that can be classified as supported console
 - Nintendo
 - Sega
 - NeoGeo
+- Sony (PS1/PS2/PSP/PS3/PS Vita/PS4/PS5)
 
 Classification is not extension-only. The helper validates save candidates with:
 

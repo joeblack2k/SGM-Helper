@@ -132,7 +132,7 @@ fn process_single_save(
         report.skipped += 1;
         if verbose {
             eprintln!(
-                "Skipping non-supported save (not Nintendo/Sega/NeoGeo): {}",
+                "Skipping non-supported save (outside allowed console families): {}",
                 save_path.display()
             );
         }
