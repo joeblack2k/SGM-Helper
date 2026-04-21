@@ -15,7 +15,7 @@ use clap::Parser;
 
 use crate::api::{ApiClient, DeviceTokenPoll};
 use crate::cli::{Cli, Commands, ConfigCommand, SourceAddCommand, SourceCommand, StateCommand};
-use crate::config::{ConfigOverrides, LoadedConfig};
+use crate::config::{AppConfig, ConfigOverrides, LoadedConfig};
 use crate::sources::{
     Source, SourceKind, load_source_store, remove_source, save_source_store, upsert_source,
 };
@@ -55,6 +55,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
         Commands::Login {
             email,
             app_password,
+            device,
         } => {
             let mut cfg = loaded.config.clone();
             if let Some(value) = email {
@@ -62,6 +63,11 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
             }
             if let Some(value) = app_password {
                 cfg.app_password = value;
+            }
+
+            if device {
+                run_device_auth(&cfg, 5, cli.quiet)?;
+                return Ok(());
             }
 
             if cfg.email.trim().is_empty() {
@@ -318,12 +324,19 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                         }
                     }
                 }
-                StateCommand::Clean => {
+                StateCommand::Clean { missing, all } => {
                     let mut state = load_sync_state(&state_dir)?;
                     let before = state.entries.len();
-                    state
-                        .entries
-                        .retain(|path, _| std::path::Path::new(path).exists());
+                    if all {
+                        state.entries.clear();
+                    } else {
+                        let remove_missing = missing || !all;
+                        if remove_missing {
+                            state
+                                .entries
+                                .retain(|path, _| std::path::Path::new(path).exists());
+                        }
+                    }
                     let removed = before.saturating_sub(state.entries.len());
                     crate::state::save_sync_state(&state_dir, &state)?;
                     println!("State cleaned. Removed {} missing entries.", removed);
@@ -359,40 +372,48 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
         },
         Commands::DeviceAuth { poll_interval } => {
             let cfg = loaded.config.clone();
-            let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
-            let device = api.start_device_auth()?;
-
-            println!("Device authorization started.");
-            println!("Open: {}", device.verification_uri);
-            println!("Code: {}", device.user_code);
-
-            let poll_interval = poll_interval.max(1);
-            let max_attempts = (device.expires_in_seconds / poll_interval).max(1);
-
-            for _ in 0..max_attempts {
-                match api.poll_device_token(&device.device_code)? {
-                    DeviceTokenPoll::Pending => {
-                        thread::sleep(Duration::from_secs(poll_interval));
-                    }
-                    DeviceTokenPoll::Success(token_response) => {
-                        let auth_me_email = api
-                            .with_token(Some(token_response.token.clone()))?
-                            .auth_me()
-                            .ok()
-                            .and_then(|user| user.email)
-                            .unwrap_or_else(|| "device-auth@local".to_string());
-                        let auth_state =
-                            AuthState::new(token_response.token, auth_me_email, cfg.base_url());
-                        save_auth_state(&cfg.resolved_state_dir()?, &auth_state)?;
-                        println!("Device login successful.");
-                        return Ok(());
-                    }
-                }
-            }
-
-            bail!("Device authorization timed out.");
+            run_device_auth(&cfg, poll_interval, cli.quiet)?;
         }
     }
 
     Ok(())
+}
+
+fn run_device_auth(cfg: &AppConfig, poll_interval: u64, quiet: bool) -> Result<()> {
+    let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
+    let device = api.start_device_auth()?;
+
+    if !quiet {
+        println!("Device authorization started.");
+        println!("Open: {}", device.verification_uri);
+        println!("Code: {}", device.user_code);
+    }
+
+    let poll_interval = poll_interval.max(1);
+    let max_attempts = (device.expires_in_seconds / poll_interval).max(1);
+
+    for _ in 0..max_attempts {
+        match api.poll_device_token(&device.device_code)? {
+            DeviceTokenPoll::Pending => {
+                thread::sleep(Duration::from_secs(poll_interval));
+            }
+            DeviceTokenPoll::Success(token_response) => {
+                let auth_me_email = api
+                    .with_token(Some(token_response.token.clone()))?
+                    .auth_me()
+                    .ok()
+                    .and_then(|user| user.email)
+                    .unwrap_or_else(|| "device-auth@local".to_string());
+                let auth_state =
+                    AuthState::new(token_response.token, auth_me_email, cfg.base_url());
+                save_auth_state(&cfg.resolved_state_dir()?, &auth_state)?;
+                if !quiet {
+                    println!("Device login successful.");
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    bail!("Device authorization timed out.");
 }

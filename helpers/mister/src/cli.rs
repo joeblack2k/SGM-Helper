@@ -53,6 +53,8 @@ pub enum Commands {
         email: Option<String>,
         #[arg(long = "app-password")]
         app_password: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        device: bool,
     },
     Logout,
     Token {
@@ -159,7 +161,12 @@ pub enum SourceAddCommand {
 #[derive(Debug, Subcommand)]
 pub enum StateCommand {
     List,
-    Clean,
+    Clean {
+        #[arg(long, action = ArgAction::SetTrue)]
+        missing: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
