@@ -159,6 +159,8 @@ pub enum SourceAddCommand {
     Custom {
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long = "saves", required = true)]
         saves: Vec<PathBuf>,
         #[arg(long = "roms")]
@@ -170,6 +172,8 @@ pub enum SourceAddCommand {
         #[arg(long)]
         name: String,
         #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
         root: PathBuf,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         recursive: Option<bool>,
@@ -177,6 +181,8 @@ pub enum SourceAddCommand {
     Retroarch {
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         root: PathBuf,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
@@ -186,6 +192,8 @@ pub enum SourceAddCommand {
         #[arg(long)]
         name: String,
         #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
         root: PathBuf,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
         recursive: Option<bool>,
@@ -193,6 +201,8 @@ pub enum SourceAddCommand {
     AnaloguePocket {
         #[arg(long)]
         name: String,
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         root: PathBuf,
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]

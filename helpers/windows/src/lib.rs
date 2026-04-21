@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
 use crate::api::{ApiClient, DeviceTokenPoll};
@@ -26,8 +26,8 @@ use crate::scanner::{
 };
 use crate::scheduler::{SchedulerBackend, install_schedule, scheduler_status, uninstall_schedule};
 use crate::sources::{
-    Source, SourceKind, load_source_store, migrate_legacy_sources_if_needed, remove_source,
-    save_source_store, upsert_source,
+    EmulatorProfile, Source, SourceKind, load_source_store, migrate_legacy_sources_if_needed,
+    remove_source, save_source_store, upsert_source,
 };
 use crate::state::{
     AuthState, clear_auth_state_for_base_url, load_auth_state, load_auth_state_for_base_url,
@@ -335,9 +335,10 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     } else {
                         for source in &store.sources {
                             println!(
-                                "{} | kind={} | recursive={} | saves={} | roms={}",
+                                "{} | kind={} | profile={} | recursive={} | saves={} | roms={}",
                                 source.name,
                                 source.kind.as_str(),
+                                source.profile.as_str(),
                                 source.recursive,
                                 source.save_roots.len(),
                                 source.rom_roots.len()
@@ -349,6 +350,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     let source = match source {
                         SourceAddCommand::Custom {
                             name,
+                            profile,
                             saves,
                             roms,
                             recursive,
@@ -357,58 +359,90 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                                 bail!("custom source vereist minimaal één --saves pad");
                             }
                             let rom_roots = if roms.is_empty() { saves.clone() } else { roms };
-                            Source::new(
+                            let mut source = Source::new(
                                 name,
                                 SourceKind::Custom,
                                 saves,
                                 rom_roots,
                                 recursive.unwrap_or(true),
-                            )
+                            );
+                            if let Some(profile) = profile {
+                                source.profile = parse_emulator_profile(&profile)?;
+                            }
+                            source
                         }
                         SourceAddCommand::MisterFpga {
                             name,
+                            profile,
                             root,
                             recursive,
-                        } => Source::new(
-                            name,
-                            SourceKind::MisterFpga,
-                            vec![root.join("saves")],
-                            vec![root.join("games")],
-                            recursive.unwrap_or(true),
-                        ),
+                        } => {
+                            let mut source = Source::new(
+                                name,
+                                SourceKind::MisterFpga,
+                                vec![root.join("saves")],
+                                vec![root.join("games")],
+                                recursive.unwrap_or(true),
+                            );
+                            if let Some(profile) = profile {
+                                source.profile = parse_emulator_profile(&profile)?;
+                            }
+                            source
+                        }
                         SourceAddCommand::Retroarch {
                             name,
+                            profile,
                             root,
                             recursive,
-                        } => Source::new(
-                            name,
-                            SourceKind::RetroArch,
-                            vec![root.join("saves")],
-                            vec![root.join("roms"), root.join("content")],
-                            recursive.unwrap_or(true),
-                        ),
+                        } => {
+                            let mut source = Source::new(
+                                name,
+                                SourceKind::RetroArch,
+                                vec![root.join("saves")],
+                                vec![root.join("roms"), root.join("content")],
+                                recursive.unwrap_or(true),
+                            );
+                            if let Some(profile) = profile {
+                                source.profile = parse_emulator_profile(&profile)?;
+                            }
+                            source
+                        }
                         SourceAddCommand::Openemu {
                             name,
+                            profile,
                             root,
                             recursive,
-                        } => Source::new(
-                            name,
-                            SourceKind::OpenEmu,
-                            vec![root.join("Save States")],
-                            vec![root],
-                            recursive.unwrap_or(true),
-                        ),
+                        } => {
+                            let mut source = Source::new(
+                                name,
+                                SourceKind::OpenEmu,
+                                vec![root.join("Save States")],
+                                vec![root],
+                                recursive.unwrap_or(true),
+                            );
+                            if let Some(profile) = profile {
+                                source.profile = parse_emulator_profile(&profile)?;
+                            }
+                            source
+                        }
                         SourceAddCommand::AnaloguePocket {
                             name,
+                            profile,
                             root,
                             recursive,
-                        } => Source::new(
-                            name,
-                            SourceKind::AnaloguePocket,
-                            vec![root.join("Saves"), root.join("saves")],
-                            vec![root],
-                            recursive.unwrap_or(true),
-                        ),
+                        } => {
+                            let mut source = Source::new(
+                                name,
+                                SourceKind::AnaloguePocket,
+                                vec![root.join("Saves"), root.join("saves")],
+                                vec![root],
+                                recursive.unwrap_or(true),
+                            );
+                            if let Some(profile) = profile {
+                                source.profile = parse_emulator_profile(&profile)?;
+                            }
+                            source
+                        }
                     };
 
                     upsert_source(&mut store, source.clone());
@@ -555,6 +589,10 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_emulator_profile(value: &str) -> Result<EmulatorProfile> {
+    EmulatorProfile::parse(value).ok_or_else(|| anyhow!("ongeldig emulatorprofiel '{}'", value))
 }
 
 fn load_active_auth_state(cfg: &AppConfig) -> Result<Option<AuthState>> {

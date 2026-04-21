@@ -33,6 +33,8 @@ All notable changes to this project are documented in this file.
 - `.fla` for 128KB FlashRAM saves
 - `.sav` fallback for 786432-byte controller pak saves
 - Non-MiSTer sources keep `.sav` preference for N64.
+- Save extension preference is now profile-driven per source (`PROFILE`) instead of only source kind.
+- Added emulator profiles (`mister`, `retroarch`, `snes9x`, `zsnes`, `everdrive`, `generic`) to source config and CLI `source add --profile`.
 
 ## [0.3.1] - 2026-04-21
 

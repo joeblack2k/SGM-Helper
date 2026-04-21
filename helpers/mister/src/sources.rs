@@ -50,11 +50,56 @@ impl SourceKind {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmulatorProfile {
+    Mister,
+    RetroArch,
+    Snes9x,
+    Zsnes,
+    EverDrive,
+    Generic,
+}
+
+impl EmulatorProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mister => "mister",
+            Self::RetroArch => "retroarch",
+            Self::Snes9x => "snes9x",
+            Self::Zsnes => "zsnes",
+            Self::EverDrive => "everdrive",
+            Self::Generic => "generic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "mister" | "mister-fpga" => Some(Self::Mister),
+            "retroarch" | "retro-arch" => Some(Self::RetroArch),
+            "snes9x" => Some(Self::Snes9x),
+            "zsnes" => Some(Self::Zsnes),
+            "everdrive" | "ever-drive" => Some(Self::EverDrive),
+            "generic" | "custom" => Some(Self::Generic),
+            _ => None,
+        }
+    }
+}
+
+pub fn default_profile_for_kind(kind: &SourceKind) -> EmulatorProfile {
+    match kind {
+        SourceKind::MisterFpga => EmulatorProfile::Mister,
+        SourceKind::RetroArch => EmulatorProfile::RetroArch,
+        _ => EmulatorProfile::Generic,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Source {
     pub id: String,
     pub name: String,
     pub kind: SourceKind,
+    pub profile: EmulatorProfile,
     pub save_roots: Vec<PathBuf>,
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
@@ -67,6 +112,7 @@ pub struct Source {
 pub struct ResolvedSource {
     pub name: String,
     pub kind: SourceKind,
+    pub profile: EmulatorProfile,
     pub save_roots: Vec<PathBuf>,
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
@@ -90,6 +136,7 @@ pub struct ScanCandidate {
     pub id: String,
     pub label: String,
     pub kind: String,
+    pub profile: String,
     pub save_path: PathBuf,
     pub rom_path: PathBuf,
     pub recursive: bool,
@@ -106,6 +153,7 @@ struct CandidatePath {
     id: String,
     label: String,
     kind: SourceKind,
+    profile: EmulatorProfile,
     save_path: PathBuf,
     rom_path: PathBuf,
     recursive: bool,
@@ -151,10 +199,12 @@ impl Source {
         recursive: bool,
     ) -> Self {
         let id = normalize_source_id(&name);
+        let profile = default_profile_for_kind(&kind);
         Self {
             id,
             name,
             kind,
+            profile,
             save_roots,
             rom_roots,
             recursive,
@@ -163,11 +213,12 @@ impl Source {
             created_at: now_rfc3339(),
         }
     }
-
+    #[allow(clippy::too_many_arguments)]
     fn managed(
         id: String,
         label: String,
         kind: SourceKind,
+        profile: EmulatorProfile,
         save_path: PathBuf,
         rom_path: PathBuf,
         recursive: bool,
@@ -177,6 +228,7 @@ impl Source {
             id,
             name: label,
             kind,
+            profile,
             save_roots: vec![save_path],
             rom_roots: vec![rom_path],
             recursive,
@@ -190,6 +242,7 @@ impl Source {
         ResolvedSource {
             name: self.name.clone(),
             kind: self.kind.clone(),
+            profile: self.profile.clone(),
             save_roots: self
                 .save_roots
                 .iter()
@@ -304,11 +357,14 @@ pub fn migrate_legacy_sources_if_needed(config: &AppConfig, verbose: bool) -> Re
             .first()
             .cloned()
             .unwrap_or_else(|| save_path.clone());
+        let kind = item.kind.clone();
+        let profile = default_profile_for_kind(&kind);
 
         migrated.sources.push(Source {
             id,
             name: item.name,
-            kind: item.kind,
+            kind,
+            profile,
             save_roots: vec![save_path],
             rom_roots: vec![rom_path],
             recursive: item.recursive,
@@ -564,6 +620,7 @@ fn known_scan_candidates(
             id: "steamdeck_emudeck".to_string(),
             label: "SteamDeck EmuDeck".to_string(),
             kind: SourceKind::SteamDeck,
+            profile: EmulatorProfile::RetroArch,
             save_path: note_root.join("saves"),
             rom_path: note_root.join("roms"),
             recursive: true,
@@ -577,6 +634,7 @@ fn known_scan_candidates(
             id: "retroarch_home".to_string(),
             label: "RetroArch Home".to_string(),
             kind: SourceKind::RetroArch,
+            profile: EmulatorProfile::RetroArch,
             save_path: home.join(".config/retroarch/saves"),
             rom_path: home.join("Emulation/roms"),
             recursive: true,
@@ -586,6 +644,7 @@ fn known_scan_candidates(
             id: "snes9x_home".to_string(),
             label: "Snes9x Home".to_string(),
             kind: SourceKind::Custom,
+            profile: EmulatorProfile::Snes9x,
             save_path: home.join("snes9x/save"),
             rom_path: home.join("roms/snes"),
             recursive: true,
@@ -597,6 +656,7 @@ fn known_scan_candidates(
         id: "mister_sd".to_string(),
         label: "MiSTer SD".to_string(),
         kind: SourceKind::MisterFpga,
+        profile: EmulatorProfile::Mister,
         save_path: PathBuf::from("/media/fat/saves"),
         rom_path: PathBuf::from("/media/fat/games"),
         recursive: true,
@@ -607,6 +667,7 @@ fn known_scan_candidates(
         id: "retroarch_system".to_string(),
         label: "RetroArch System".to_string(),
         kind: SourceKind::RetroArch,
+        profile: EmulatorProfile::RetroArch,
         save_path: PathBuf::from("/var/lib/retroarch/saves"),
         rom_path: PathBuf::from("/var/lib/retroarch/roms"),
         recursive: true,
@@ -618,6 +679,7 @@ fn known_scan_candidates(
         id: format!("{}_default", default_kind.as_str()),
         label: format!("{} Default", default_kind.as_str()),
         kind: default_kind.clone(),
+        profile: default_profile_for_kind(default_kind),
         save_path: fallback.save_path(),
         rom_path: fallback.rom_path(),
         recursive: true,
@@ -628,6 +690,7 @@ fn known_scan_candidates(
         id: format!("{}_root", default_kind.as_str()),
         label: format!("{} Root Direct", default_kind.as_str()),
         kind: default_kind.clone(),
+        profile: default_profile_for_kind(default_kind),
         save_path: root.clone(),
         rom_path: root,
         recursive: true,
@@ -680,6 +743,7 @@ fn evaluate_candidates(candidates: Vec<CandidatePath>) -> Vec<EvaluatedCandidate
                 id,
                 candidate.label.clone(),
                 candidate.kind.clone(),
+                candidate.profile.clone(),
                 candidate.save_path.clone(),
                 candidate.rom_path.clone(),
                 candidate.recursive,
@@ -765,6 +829,7 @@ fn deep_scan_candidates(config: &AppConfig) -> Result<Vec<EvaluatedCandidate>> {
                 id,
                 label,
                 SourceKind::Custom,
+                EmulatorProfile::Generic,
                 dir.clone(),
                 dir.clone(),
                 true,
@@ -858,6 +923,7 @@ fn write_scan_report(
                 id: value.source.id.clone(),
                 label: value.source.name.clone(),
                 kind: value.source.kind.as_str().to_string(),
+                profile: value.source.profile.as_str().to_string(),
                 save_path: value.source.save_path(),
                 rom_path: value.source.rom_path(),
                 recursive: value.source.recursive,
@@ -914,6 +980,12 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         .get("KIND")
         .and_then(|value| SourceKind::parse(value))
         .unwrap_or(SourceKind::Custom);
+    let profile = section
+        .values
+        .get("PROFILE")
+        .or_else(|| section.values.get("EMULATOR"))
+        .and_then(|value| EmulatorProfile::parse(value))
+        .unwrap_or_else(|| default_profile_for_kind(&kind));
 
     let label = section
         .values
@@ -952,6 +1024,7 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         id: section.id.clone(),
         name: label,
         kind,
+        profile,
         save_roots: vec![save_path],
         rom_roots: vec![rom_path],
         recursive,
@@ -1058,6 +1131,7 @@ fn render_config_with_sources(base: &str, sources: &[Source]) -> String {
         lines.push(format!("[source.{}]", source.id));
         lines.push(format!("LABEL=\"{}\"", escape_ini(&source.name)));
         lines.push(format!("KIND=\"{}\"", source.kind.as_str()));
+        lines.push(format!("PROFILE=\"{}\"", source.profile.as_str()));
         lines.push(format!(
             "SAVE_PATH=\"{}\"",
             escape_ini(&source.save_path().to_string_lossy())
@@ -1175,6 +1249,7 @@ URL="127.0.0.1"
 [source.super_nintendo]
 LABEL="Super Nintendo"
 KIND="retroarch"
+PROFILE="snes9x"
 SAVE_PATH="/home/snes9x/save"
 ROM_PATH="/home/roms/snes"
 RECURSIVE="true"
@@ -1188,8 +1263,23 @@ ORIGIN="manual"
         assert_eq!(source.id, "super_nintendo");
         assert_eq!(source.name, "Super Nintendo");
         assert_eq!(source.kind, SourceKind::RetroArch);
+        assert_eq!(source.profile, EmulatorProfile::Snes9x);
         assert_eq!(source.save_path().to_string_lossy(), "/home/snes9x/save");
         assert!(!source.managed);
+    }
+
+    #[test]
+    fn profile_defaults_to_kind_mapping_when_omitted() {
+        let content = r#"
+[source.legacy]
+LABEL="Legacy"
+KIND="mister-fpga"
+SAVE_PATH="/media/fat/saves"
+"#;
+
+        let sections = parse_source_sections(content).unwrap();
+        let source = source_from_section(&sections[0]).unwrap();
+        assert_eq!(source.profile, EmulatorProfile::Mister);
     }
 
     #[test]
@@ -1216,6 +1306,7 @@ HELLO="world"
                 "new_source".to_string(),
                 "New Source".to_string(),
                 SourceKind::Custom,
+                EmulatorProfile::Generic,
                 PathBuf::from("/tmp/new"),
                 PathBuf::from("/tmp/new"),
                 true,

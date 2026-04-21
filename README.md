@@ -45,10 +45,11 @@ Validation is strict. Files are not accepted by extension alone. Scanner checks 
 
 Extension policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
 
-- MiSTer sources prefer `.sav`
-- RetroArch/SteamDeck/Windows/Custom sources prefer `.srm`
-- If both variants exist for the same ROM stem, sync prioritizes the preferred extension per source
-- N64 exception: on MiSTer, helper preserves/targets native save types by size (`.eep`, `.sra`, `.fla`)
+- Decision is now based on per-source `PROFILE` (not only `KIND`)
+- `PROFILE="mister"` prefers `.sav`
+- `PROFILE="retroarch"`, `PROFILE="snes9x"`, `PROFILE="zsnes"`, `PROFILE="everdrive"`, `PROFILE="generic"` prefer `.srm`
+- If both variants exist for the same ROM stem, sync prioritizes the preferred extension per source profile
+- N64 exception: `PROFILE="mister"` and `PROFILE="everdrive"` preserve/target native save types by size (`.eep`, `.sra`, `.fla`)
 
 Supported console families in strict classification:
 
@@ -153,6 +154,7 @@ Sources are stored in `config.ini` as first-class config:
 [source.super_nintendo]
 LABEL="Super Nintendo"
 KIND="retroarch"
+PROFILE="snes9x"
 SAVE_PATH="/home/snes9x/save"
 ROM_PATH="/home/roms/snes"
 RECURSIVE="true"
@@ -163,7 +165,8 @@ ORIGIN="manual"
 Source keys:
 
 - `LABEL` display name
-- `KIND` adapter/profile kind
+- `KIND` platform/source kind
+- `PROFILE` emulator profile used for save-extension mapping (`mister`, `retroarch`, `snes9x`, `zsnes`, `everdrive`, `generic`)
 - `SAVE_PATH` save directory
 - `ROM_PATH` ROM directory (optional but recommended)
 - `RECURSIVE` include nested directories
@@ -310,11 +313,11 @@ Source management commands:
 
 - `source list`
 - `source remove --name <source-id>`
-- `source add custom --name <id> --saves <path>... [--roms <path>...] [--recursive[=true|false]]`
-- `source add mister-fpga --name <id> --root <path> [--recursive[=true|false]]`
-- `source add retroarch --name <id> --root <path> [--recursive[=true|false]]`
-- `source add openemu --name <id> --root <path> [--recursive[=true|false]]`
-- `source add analogue-pocket --name <id> --root <path> [--recursive[=true|false]]`
+- `source add custom --name <id> [--profile <mister|retroarch|snes9x|zsnes|everdrive|generic>] --saves <path>... [--roms <path>...] [--recursive[=true|false]]`
+- `source add mister-fpga --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
+- `source add retroarch --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
+- `source add openemu --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
+- `source add analogue-pocket --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
 
 ### `state`
 

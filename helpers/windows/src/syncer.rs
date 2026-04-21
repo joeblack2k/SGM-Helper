@@ -11,7 +11,7 @@ use crate::scanner::{
     discover_rom_index, discover_save_files, encode_download_for_local_container, filename_stem,
     md5_file, normalize_save_for_sync, sha1_file, sha256_bytes,
 };
-use crate::sources::{SourceKind, prepare_sources_for_sync};
+use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
 
 #[derive(Debug, Clone)]
@@ -120,7 +120,7 @@ pub fn run_sync(
 
         let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
         let preferred_save_by_stem =
-            select_preferred_save_per_stem(&source.kind, &save_files, &rom_index);
+            select_preferred_save_per_stem(&source.kind, &source.profile, &save_files, &rom_index);
         report.scanned += save_files.len();
 
         let fingerprint = hostname::get()
@@ -152,6 +152,7 @@ pub fn run_sync(
                 &fingerprint,
                 &source.name,
                 &source.kind,
+                &source.profile,
                 &rom_index,
                 &mut rom_hash_cache,
                 options,
@@ -211,6 +212,7 @@ pub fn run_sync(
                 &entry,
                 &source.name,
                 &source.kind,
+                &source.profile,
                 options,
                 &mut report,
                 verbose,
@@ -256,6 +258,7 @@ fn process_single_save(
     fingerprint: &str,
     source_name: &str,
     source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
     rom_index: &HashMap<String, RomIndexEntry>,
     rom_hash_cache: &mut HashMap<String, (String, String)>,
     options: &SyncOptions,
@@ -493,6 +496,7 @@ fn process_single_save(
             let target_save_path = preferred_save_path(
                 save_path,
                 source_kind,
+                source_profile,
                 Some(&system_slug),
                 normalized_save.local_container,
                 Some(normalized_save.canonical_bytes.len() as u64),
@@ -519,6 +523,7 @@ fn process_single_save(
         let target_save_path = preferred_save_path(
             save_path,
             source_kind,
+            source_profile,
             Some(&system_slug),
             normalized_save.local_container,
             Some(canonical_bytes.len() as u64),
@@ -580,6 +585,7 @@ fn process_missing_save(
     existing_entry: &SyncedEntry,
     source_name: &str,
     source_kind: &SourceKind,
+    _source_profile: &EmulatorProfile,
     options: &SyncOptions,
     report: &mut SyncReport,
     verbose: bool,
@@ -687,6 +693,7 @@ fn processed_entry(state_key: String, entry: SyncedEntry) -> ProcessedEntry {
 
 fn select_preferred_save_per_stem(
     source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
     save_files: &[PathBuf],
     rom_index: &HashMap<String, RomIndexEntry>,
 ) -> HashMap<String, PathBuf> {
@@ -701,16 +708,20 @@ fn select_preferred_save_per_stem(
 
         let extension = save_extension(save_path);
         let save_size = save_path.metadata().ok().map(|meta| meta.len());
-        let score =
-            preferred_extension_for_system(source_kind, &classification.system_slug, save_size)
-                .map(|preferred| {
-                    if extension.as_deref() == Some(preferred) {
-                        2
-                    } else {
-                        1
-                    }
-                })
-                .unwrap_or(1);
+        let score = preferred_extension_for_system(
+            source_kind,
+            source_profile,
+            &classification.system_slug,
+            save_size,
+        )
+        .map(|preferred| {
+            if extension.as_deref() == Some(preferred) {
+                2
+            } else {
+                1
+            }
+        })
+        .unwrap_or(1);
 
         match selected.get_mut(&stem_key) {
             Some((existing_path, existing_score)) => {
@@ -734,6 +745,7 @@ fn select_preferred_save_per_stem(
 fn preferred_save_path(
     save_path: &Path,
     source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
     system_slug: Option<&str>,
     local_container: SaveContainerFormat,
     canonical_size: Option<u64>,
@@ -745,7 +757,7 @@ fn preferred_save_path(
         return save_path.to_path_buf();
     };
     let Some(preferred_extension) =
-        preferred_extension_for_system(source_kind, system_slug, canonical_size)
+        preferred_extension_for_system(source_kind, source_profile, system_slug, canonical_size)
     else {
         return save_path.to_path_buf();
     };
@@ -759,30 +771,41 @@ fn preferred_save_path(
 
 fn preferred_extension_for_system(
     source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
     system_slug: &str,
     save_size: Option<u64>,
 ) -> Option<&'static str> {
     match system_slug {
         "nes" | "snes" | "gameboy" | "gba" | "genesis" | "master-system" | "game-gear"
-        | "neogeo" => {
-            if matches!(source_kind, SourceKind::MisterFpga) {
-                Some("sav")
-            } else {
-                Some("srm")
-            }
-        }
-        "n64" => preferred_extension_for_n64(source_kind, save_size),
+        | "neogeo" => preferred_extension_for_cartridge(source_profile),
+        "n64" => preferred_extension_for_n64(source_kind, source_profile, save_size),
         "nds" | "psp" | "psvita" | "ps3" | "ps4" | "ps5" => Some("sav"),
         "ps2" => Some("ps2"),
         _ => None,
     }
 }
 
+fn preferred_extension_for_cartridge(source_profile: &EmulatorProfile) -> Option<&'static str> {
+    match source_profile {
+        EmulatorProfile::Mister => Some("sav"),
+        EmulatorProfile::RetroArch
+        | EmulatorProfile::Snes9x
+        | EmulatorProfile::Zsnes
+        | EmulatorProfile::EverDrive
+        | EmulatorProfile::Generic => Some("srm"),
+    }
+}
+
 fn preferred_extension_for_n64(
     source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
     save_size: Option<u64>,
 ) -> Option<&'static str> {
-    if !matches!(source_kind, SourceKind::MisterFpga) {
+    if !matches!(
+        source_profile,
+        EmulatorProfile::Mister | EmulatorProfile::EverDrive
+    ) && !matches!(source_kind, SourceKind::MisterFpga)
+    {
         return Some("sav");
     }
 
@@ -880,13 +903,34 @@ mod tests {
 
     #[test]
     fn prefers_sav_for_mister_snes() {
-        let ext = preferred_extension_for_system(&SourceKind::MisterFpga, "snes", None);
+        let ext = preferred_extension_for_system(
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            "snes",
+            None,
+        );
         assert_eq!(ext, Some("sav"));
     }
 
     #[test]
     fn prefers_srm_for_retroarch_snes() {
-        let ext = preferred_extension_for_system(&SourceKind::RetroArch, "snes", None);
+        let ext = preferred_extension_for_system(
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "snes",
+            None,
+        );
+        assert_eq!(ext, Some("srm"));
+    }
+
+    #[test]
+    fn prefers_srm_for_zsnes_profile() {
+        let ext = preferred_extension_for_system(
+            &SourceKind::Custom,
+            &EmulatorProfile::Zsnes,
+            "snes",
+            None,
+        );
         assert_eq!(ext, Some("srm"));
     }
 
@@ -896,6 +940,7 @@ mod tests {
         let target = preferred_save_path(
             &path,
             &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
             Some("snes"),
             SaveContainerFormat::Native,
             None,
@@ -909,6 +954,7 @@ mod tests {
         let target = preferred_save_path(
             &path,
             &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
             Some("psx"),
             SaveContainerFormat::Ps1Raw,
             None,
@@ -919,15 +965,30 @@ mod tests {
     #[test]
     fn prefers_n64_native_extension_on_mister_by_size() {
         assert_eq!(
-            preferred_extension_for_system(&SourceKind::MisterFpga, "n64", Some(512)),
+            preferred_extension_for_system(
+                &SourceKind::MisterFpga,
+                &EmulatorProfile::Mister,
+                "n64",
+                Some(512)
+            ),
             Some("eep")
         );
         assert_eq!(
-            preferred_extension_for_system(&SourceKind::MisterFpga, "n64", Some(32_768)),
+            preferred_extension_for_system(
+                &SourceKind::MisterFpga,
+                &EmulatorProfile::Mister,
+                "n64",
+                Some(32_768)
+            ),
             Some("sra")
         );
         assert_eq!(
-            preferred_extension_for_system(&SourceKind::MisterFpga, "n64", Some(131_072)),
+            preferred_extension_for_system(
+                &SourceKind::MisterFpga,
+                &EmulatorProfile::Mister,
+                "n64",
+                Some(131_072)
+            ),
             Some("fla")
         );
     }
@@ -935,8 +996,26 @@ mod tests {
     #[test]
     fn prefers_n64_sav_for_non_mister_sources() {
         assert_eq!(
-            preferred_extension_for_system(&SourceKind::RetroArch, "n64", Some(32_768)),
+            preferred_extension_for_system(
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                "n64",
+                Some(32_768)
+            ),
             Some("sav")
+        );
+    }
+
+    #[test]
+    fn prefers_n64_native_extension_for_everdrive_profile() {
+        assert_eq!(
+            preferred_extension_for_system(
+                &SourceKind::Custom,
+                &EmulatorProfile::EverDrive,
+                "n64",
+                Some(32_768)
+            ),
+            Some("sra")
         );
     }
 }
