@@ -45,6 +45,8 @@ Supported family filter in sync:
 - Sega
 - NeoGeo
 
+The helper does not upload files blindly by `.sav` extension. It classifies candidates as real saves using console-specific extension/size rules plus binary payload checks.
+
 Watch mode:
 
 ```bash

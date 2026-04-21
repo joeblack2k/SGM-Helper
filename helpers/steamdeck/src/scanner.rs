@@ -9,9 +9,10 @@ use sha2::Sha256;
 use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
-    "sav", "srm", "state", "eep", "fla", "sa1", "dat", "rtc", "ram", "ss", "fgp", "mcr", "mc",
-    "sra", "dsv", "gme",
+    "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "dsv", "gme",
 ];
+
+const MAX_SAVE_BYTES: u64 = 16 * 1024 * 1024;
 
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "sms",
@@ -153,15 +154,39 @@ pub fn known_save_extensions() -> BTreeSet<&'static str> {
 }
 
 pub fn infer_system_slug(path: &Path) -> Option<String> {
-    infer_supported_console_slug(path, None)
+    classify_supported_save(path, None).map(|value| value.system_slug)
 }
 
 pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -> Option<String> {
+    classify_supported_save(save_path, rom_path).map(|value| value.system_slug)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveClassification {
+    pub system_slug: String,
+    pub evidence: String,
+}
+
+pub fn classify_supported_save(
+    save_path: &Path,
+    rom_path: Option<&Path>,
+) -> Option<SaveClassification> {
+    let save_ext = path_extension(save_path)?;
+
+    let save_size = save_path.metadata().ok()?.len();
+    if !is_plausible_save_size(save_size) || looks_plain_text(save_path) {
+        return None;
+    }
+
     if let Some(slug) = rom_path
         .and_then(path_extension)
         .and_then(system_slug_from_rom_extension)
+        && is_plausible_save_for_system(&save_ext, save_size, slug)
     {
-        return Some(slug.to_string());
+        return Some(SaveClassification {
+            system_slug: slug.to_string(),
+            evidence: format!("rom-extension + .{} ({} bytes)", save_ext, save_size),
+        });
     }
 
     let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
@@ -171,7 +196,13 @@ pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -
     let combined = format!("{} {}", save_lower, rom_lower);
 
     if contains_any(&combined, &["gameboy advance", "/gba/", "\\gba\\"]) {
-        return Some("gba".to_string());
+        if is_plausible_save_for_system(&save_ext, save_size, "gba") {
+            return Some(SaveClassification {
+                system_slug: "gba".to_string(),
+                evidence: format!("path hint gba + .{} ({} bytes)", save_ext, save_size),
+            });
+        }
+        return None;
     }
     if contains_any(
         &combined,
@@ -198,10 +229,31 @@ pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -
             "gameboy",
             "/gb/",
             "\\gb\\",
+            "melonds",
+            "desmume",
+            "ryujinx",
+            "citra",
+            "yuzu",
+            "suyu",
+            "dolphin",
+            "mgba",
+            "visualboyadvance",
+            "vba",
+            "bsnes",
+            "snes9x",
+            "fceux",
+            "nestopia",
             "nintendo",
         ],
     ) {
-        return Some(infer_nintendo_slug(&combined).to_string());
+        let slug = infer_nintendo_slug(&combined);
+        if is_plausible_save_for_system(&save_ext, save_size, slug) {
+            return Some(SaveClassification {
+                system_slug: slug.to_string(),
+                evidence: format!("path hint nintendo + .{} ({} bytes)", save_ext, save_size),
+            });
+        }
+        return None;
     }
 
     if contains_any(
@@ -225,7 +277,14 @@ pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -
             "sega",
         ],
     ) {
-        return Some(infer_sega_slug(&combined).to_string());
+        let slug = infer_sega_slug(&combined);
+        if is_plausible_save_for_system(&save_ext, save_size, slug) {
+            return Some(SaveClassification {
+                system_slug: slug.to_string(),
+                evidence: format!("path hint sega + .{} ({} bytes)", save_ext, save_size),
+            });
+        }
+        return None;
     }
 
     if contains_any(
@@ -234,7 +293,22 @@ pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -
             "neo geo", "neogeo", "neo-geo", "/mvs/", "\\mvs\\", "/aes/", "\\aes\\",
         ],
     ) {
-        return Some("neogeo".to_string());
+        if is_plausible_save_for_system(&save_ext, save_size, "neogeo") {
+            return Some(SaveClassification {
+                system_slug: "neogeo".to_string(),
+                evidence: format!("path hint neogeo + .{} ({} bytes)", save_ext, save_size),
+            });
+        }
+        return None;
+    }
+
+    if let Some(slug) = system_slug_from_save_extension(save_ext.as_str())
+        && is_plausible_save_for_system(&save_ext, save_size, slug)
+    {
+        return Some(SaveClassification {
+            system_slug: slug.to_string(),
+            evidence: format!("save extension .{} ({} bytes)", save_ext, save_size),
+        });
     }
 
     None
@@ -297,6 +371,83 @@ fn infer_sega_slug(haystack: &str) -> &'static str {
     "genesis"
 }
 
+fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "eep" | "fla" | "sra" => Some("n64"),
+        "dsv" => Some("nds"),
+        _ => None,
+    }
+}
+
+fn is_plausible_save_size(size: u64) -> bool {
+    size > 0 && size <= MAX_SAVE_BYTES
+}
+
+fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
+    if !is_plausible_save_size(size) {
+        return false;
+    }
+
+    let extension_ok = match slug {
+        "nes" => matches!(ext, "sav" | "srm" | "ram"),
+        "snes" => matches!(ext, "srm" | "sav" | "sa1"),
+        "gameboy" => matches!(ext, "sav" | "srm" | "gme" | "rtc" | "ram"),
+        "gba" => matches!(ext, "sav" | "srm" | "sa1"),
+        "n64" => matches!(ext, "sav" | "eep" | "fla" | "sra"),
+        "nds" => matches!(ext, "sav" | "dsv"),
+        "genesis" => matches!(ext, "sav" | "srm" | "ram"),
+        "master-system" | "game-gear" => matches!(ext, "sav" | "srm" | "ram"),
+        "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
+        _ => false,
+    };
+    if !extension_ok {
+        return false;
+    }
+
+    match slug {
+        "nes" => (512..=262_144).contains(&size),
+        "snes" => (512..=524_288).contains(&size),
+        "gameboy" => (512..=262_144).contains(&size),
+        "gba" => (512..=1_048_576).contains(&size),
+        "n64" => {
+            if ext == "eep" {
+                size == 512 || size == 2048
+            } else {
+                (512..=262_144).contains(&size)
+            }
+        }
+        "nds" => (512..=16_777_216).contains(&size),
+        "genesis" | "master-system" | "game-gear" => (512..=524_288).contains(&size),
+        "neogeo" => (512..=2_097_152).contains(&size),
+        _ => false,
+    }
+}
+
+fn looks_plain_text(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut reader = BufReader::new(file);
+    let mut buffer = [0u8; 4096];
+    let Ok(read) = reader.read(&mut buffer) else {
+        return false;
+    };
+    if read == 0 {
+        return false;
+    }
+
+    let bytes = &buffer[..read];
+    if bytes.contains(&0) {
+        return false;
+    }
+
+    let printable = bytes
+        .iter()
+        .filter(|value| matches!(**value, b'\n' | b'\r' | b'\t' | 0x20..=0x7e))
+        .count();
+    printable.saturating_mul(100) >= bytes.len().saturating_mul(95)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,8 +468,13 @@ mod tests {
 
     #[test]
     fn infer_system_slug_from_path() {
-        let snes = PathBuf::from("/media/fat/saves/SNES/zelda.srm");
-        let sega = PathBuf::from("/media/fat/saves/Sega/sonic.srm");
+        let tmp = tempfile::tempdir().unwrap();
+        let snes = tmp.path().join("saves/SNES/zelda.srm");
+        let sega = tmp.path().join("saves/Sega/sonic.srm");
+        fs::create_dir_all(snes.parent().unwrap()).unwrap();
+        fs::create_dir_all(sega.parent().unwrap()).unwrap();
+        fs::write(&snes, vec![0x00u8; 8192]).unwrap();
+        fs::write(&sega, vec![0x00u8; 8192]).unwrap();
         assert_eq!(infer_system_slug(&snes).as_deref(), Some("snes"));
         assert_eq!(infer_system_slug(&sega).as_deref(), Some("genesis"));
     }
@@ -331,11 +487,33 @@ mod tests {
 
     #[test]
     fn rom_extension_can_classify_supported_console() {
-        let save = PathBuf::from("/tmp/anything.sav");
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("anything.sav");
+        fs::write(&save, vec![0x00u8; 32768]).unwrap();
         let rom = PathBuf::from("/roms/gb/pokemon.gb");
         assert_eq!(
             infer_supported_console_slug(&save, Some(&rom)).as_deref(),
             Some("gameboy")
         );
+    }
+
+    #[test]
+    fn text_files_are_rejected_even_with_save_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Nintendo/notes.sav");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, b"this is clearly text and not a real save file").unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn unsupported_extension_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Nintendo/zelda.dat");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, [0x00u8; 1024]).unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
     }
 }

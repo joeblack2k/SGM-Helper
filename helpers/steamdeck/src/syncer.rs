@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use crate::api::{ApiClient, ConflictCheckResponse};
 use crate::config::AppConfig;
 use crate::scanner::{
-    RomIndexEntry, discover_rom_index, discover_save_files, filename_stem,
-    infer_supported_console_slug, md5_file, sha1_file, sha256_bytes, sha256_file,
+    RomIndexEntry, classify_supported_save, discover_rom_index, discover_save_files, filename_stem,
+    md5_file, sha1_file, sha256_bytes, sha256_file,
 };
 use crate::sources::{SourceKind, load_source_store, resolved_sources_or_default};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
@@ -126,8 +126,8 @@ fn process_single_save(
     let stem = filename_stem(save_path);
     let stem_key = stem.to_ascii_lowercase();
     let rom_entry = rom_index.get(&stem_key);
-    let Some(system_slug) =
-        infer_supported_console_slug(save_path, rom_entry.map(|entry| entry.path.as_path()))
+    let Some(classification) =
+        classify_supported_save(save_path, rom_entry.map(|entry| entry.path.as_path()))
     else {
         report.skipped += 1;
         if verbose {
@@ -138,6 +138,16 @@ fn process_single_save(
         }
         return Ok(None);
     };
+    let system_slug = classification.system_slug;
+    let classification_evidence = classification.evidence;
+    if verbose {
+        eprintln!(
+            "Detected {} savegame for {} ({})",
+            system_slug,
+            save_path.display(),
+            classification_evidence
+        );
+    }
 
     let lookup = api.lookup_rom(&stem).ok();
     let mut rom_sha1 = lookup
@@ -197,7 +207,7 @@ fn process_single_save(
             rom_md5.as_deref(),
             &options.slot_name,
             fingerprint,
-            Some(system_slug.as_str()),
+            Some(&system_slug),
         )?;
 
         report.uploaded += 1;
@@ -241,7 +251,7 @@ fn process_single_save(
             rom_md5.as_deref(),
             &options.slot_name,
             fingerprint,
-            Some(system_slug.as_str()),
+            Some(&system_slug),
         )?;
         report.uploaded += 1;
         return Ok(Some(synced_entry(

@@ -46,6 +46,13 @@ Steam Deck scanning only syncs saves that can be classified as supported console
 - Sega
 - NeoGeo
 
+Classification is not extension-only. The helper validates save candidates with:
+
+- supported extension per console
+- plausible save size window
+- binary payload check (plain text files are rejected)
+- ROM/path hints for console detection (for example Game Boy, SNES, Genesis, NeoGeo)
+
 For compatibility with existing 1Retro-style deployments you can also set:
 
 - `ONE_RETRO_API_URL=http://host:port`

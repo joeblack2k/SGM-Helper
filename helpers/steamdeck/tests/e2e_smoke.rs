@@ -65,7 +65,7 @@ fn watch_smoke_persists_state_and_exits_with_max_cycles() {
     let state_dir = tmp.path().join("state");
     fs::create_dir_all(root.join("Nintendo")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
-    fs::write(root.join("Nintendo/metroid.sav"), b"watch-save").unwrap();
+    fs::write(root.join("Nintendo/metroid.sav"), vec![0x00u8; 32768]).unwrap();
 
     let config = write_config(&tmp, &server, &root, &state_dir);
 
