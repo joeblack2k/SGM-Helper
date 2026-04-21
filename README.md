@@ -48,6 +48,7 @@ Extension policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
 - MiSTer sources prefer `.sav`
 - RetroArch/SteamDeck/Windows/Custom sources prefer `.srm`
 - If both variants exist for the same ROM stem, sync prioritizes the preferred extension per source
+- N64 exception: on MiSTer, helper preserves/targets native save types by size (`.eep`, `.sra`, `.fla`)
 
 Supported console families in strict classification:
 

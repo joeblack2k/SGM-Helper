@@ -25,6 +25,15 @@ All notable changes to this project are documented in this file.
   - `docs/gamecube/backend-worker-notes.md`
 - Host-side unit tests for secure store and JSON/grouping logic in `helpers/gamecube/tests/host`.
 
+### Changed
+
+- N64 extension preference now respects MiSTer-native save types by payload size:
+- `.eep` for 512/2048-byte EEPROM saves
+- `.sra` for 32KB SRAM saves
+- `.fla` for 128KB FlashRAM saves
+- `.sav` fallback for 786432-byte controller pak saves
+- Non-MiSTer sources keep `.sav` preference for N64.
+
 ## [0.3.1] - 2026-04-21
 
 ### Added

@@ -495,6 +495,7 @@ fn process_single_save(
                 source_kind,
                 Some(&system_slug),
                 normalized_save.local_container,
+                Some(normalized_save.canonical_bytes.len() as u64),
             );
             state_key = target_save_path.to_string_lossy().to_string();
             return Ok(Some(processed_entry(
@@ -520,6 +521,7 @@ fn process_single_save(
             source_kind,
             Some(&system_slug),
             normalized_save.local_container,
+            Some(canonical_bytes.len() as u64),
         );
         if let Some(parent) = target_save_path.parent() {
             fs::create_dir_all(parent)
@@ -698,15 +700,17 @@ fn select_preferred_save_per_stem(
         };
 
         let extension = save_extension(save_path);
-        let score = preferred_extension_for_system(source_kind, &classification.system_slug)
-            .map(|preferred| {
-                if extension.as_deref() == Some(preferred) {
-                    2
-                } else {
-                    1
-                }
-            })
-            .unwrap_or(1);
+        let save_size = save_path.metadata().ok().map(|meta| meta.len());
+        let score =
+            preferred_extension_for_system(source_kind, &classification.system_slug, save_size)
+                .map(|preferred| {
+                    if extension.as_deref() == Some(preferred) {
+                        2
+                    } else {
+                        1
+                    }
+                })
+                .unwrap_or(1);
 
         match selected.get_mut(&stem_key) {
             Some((existing_path, existing_score)) => {
@@ -732,6 +736,7 @@ fn preferred_save_path(
     source_kind: &SourceKind,
     system_slug: Option<&str>,
     local_container: SaveContainerFormat,
+    canonical_size: Option<u64>,
 ) -> PathBuf {
     if local_container != SaveContainerFormat::Native {
         return save_path.to_path_buf();
@@ -739,7 +744,9 @@ fn preferred_save_path(
     let Some(system_slug) = system_slug else {
         return save_path.to_path_buf();
     };
-    let Some(preferred_extension) = preferred_extension_for_system(source_kind, system_slug) else {
+    let Some(preferred_extension) =
+        preferred_extension_for_system(source_kind, system_slug, canonical_size)
+    else {
         return save_path.to_path_buf();
     };
     if save_extension(save_path).as_deref() == Some(preferred_extension) {
@@ -753,6 +760,7 @@ fn preferred_save_path(
 fn preferred_extension_for_system(
     source_kind: &SourceKind,
     system_slug: &str,
+    save_size: Option<u64>,
 ) -> Option<&'static str> {
     match system_slug {
         "nes" | "snes" | "gameboy" | "gba" | "genesis" | "master-system" | "game-gear"
@@ -763,8 +771,26 @@ fn preferred_extension_for_system(
                 Some("srm")
             }
         }
-        "n64" | "nds" | "psp" | "psvita" | "ps3" | "ps4" | "ps5" => Some("sav"),
+        "n64" => preferred_extension_for_n64(source_kind, save_size),
+        "nds" | "psp" | "psvita" | "ps3" | "ps4" | "ps5" => Some("sav"),
         "ps2" => Some("ps2"),
+        _ => None,
+    }
+}
+
+fn preferred_extension_for_n64(
+    source_kind: &SourceKind,
+    save_size: Option<u64>,
+) -> Option<&'static str> {
+    if !matches!(source_kind, SourceKind::MisterFpga) {
+        return Some("sav");
+    }
+
+    match save_size {
+        Some(512) | Some(2_048) => Some("eep"),
+        Some(32_768) => Some("sra"),
+        Some(131_072) => Some("fla"),
+        Some(786_432) => Some("sav"),
         _ => None,
     }
 }
@@ -854,13 +880,13 @@ mod tests {
 
     #[test]
     fn prefers_sav_for_mister_snes() {
-        let ext = preferred_extension_for_system(&SourceKind::MisterFpga, "snes");
+        let ext = preferred_extension_for_system(&SourceKind::MisterFpga, "snes", None);
         assert_eq!(ext, Some("sav"));
     }
 
     #[test]
     fn prefers_srm_for_retroarch_snes() {
-        let ext = preferred_extension_for_system(&SourceKind::RetroArch, "snes");
+        let ext = preferred_extension_for_system(&SourceKind::RetroArch, "snes", None);
         assert_eq!(ext, Some("srm"));
     }
 
@@ -872,6 +898,7 @@ mod tests {
             &SourceKind::MisterFpga,
             Some("snes"),
             SaveContainerFormat::Native,
+            None,
         );
         assert_eq!(target.to_string_lossy(), "/userdata/saves/snes/zelda.sav");
     }
@@ -884,7 +911,32 @@ mod tests {
             &SourceKind::MisterFpga,
             Some("psx"),
             SaveContainerFormat::Ps1Raw,
+            None,
         );
         assert_eq!(target, path);
+    }
+
+    #[test]
+    fn prefers_n64_native_extension_on_mister_by_size() {
+        assert_eq!(
+            preferred_extension_for_system(&SourceKind::MisterFpga, "n64", Some(512)),
+            Some("eep")
+        );
+        assert_eq!(
+            preferred_extension_for_system(&SourceKind::MisterFpga, "n64", Some(32_768)),
+            Some("sra")
+        );
+        assert_eq!(
+            preferred_extension_for_system(&SourceKind::MisterFpga, "n64", Some(131_072)),
+            Some("fla")
+        );
+    }
+
+    #[test]
+    fn prefers_n64_sav_for_non_mister_sources() {
+        assert_eq!(
+            preferred_extension_for_system(&SourceKind::RetroArch, "n64", Some(32_768)),
+            Some("sav")
+        );
     }
 }
