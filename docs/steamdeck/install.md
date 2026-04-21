@@ -13,6 +13,8 @@ Extract files to a folder, for example:
 
 By default, the helper looks for `config.ini` in the same directory as the executable.
 
+When no custom source config exists, the helper auto-detects EmuDeck and prefers `.../Emulation/saves`.
+
 ## 3. Create config.ini
 
 Example:
@@ -36,6 +38,12 @@ DRY_RUN="false"
 ./sgm-steamdeck-helper login --email you@example.com --app-password your-app-password
 ./sgm-steamdeck-helper sync
 ```
+
+Supported family filter in sync:
+
+- Nintendo
+- Sega
+- NeoGeo
 
 Watch mode:
 

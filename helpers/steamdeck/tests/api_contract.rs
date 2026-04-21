@@ -155,9 +155,9 @@ fn sync_uploads_when_no_cloud_save_exists() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     let state_dir = tmp.path().join("state");
-    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(root.join("Nintendo")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
-    fs::write(root.join("wario.sav"), b"hello save").unwrap();
+    fs::write(root.join("Nintendo/wario.sav"), b"hello save").unwrap();
     let config = write_config(&tmp, &server, &root, &state_dir);
 
     Command::cargo_bin("sgm-steamdeck-helper")
@@ -229,9 +229,9 @@ fn sync_reports_conflict_when_backend_marks_conflict() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     let state_dir = tmp.path().join("state");
-    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(root.join("Nintendo")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
-    fs::write(root.join("chrono.sav"), b"local-content").unwrap();
+    fs::write(root.join("Nintendo/chrono.sav"), b"local-content").unwrap();
     let config = write_config(&tmp, &server, &root, &state_dir);
 
     Command::cargo_bin("sgm-steamdeck-helper")

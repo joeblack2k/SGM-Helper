@@ -38,6 +38,14 @@ Default `ROOT` for SteamOS is set to:
 
 - `/home/deck/.steam/steam/steamapps/compatdata`
 
+When no custom `source` config exists, the helper auto-detects EmuDeck and uses `.../Emulation/saves`.
+
+Steam Deck scanning only syncs saves that can be classified as supported console families:
+
+- Nintendo
+- Sega
+- NeoGeo
+
 For compatibility with existing 1Retro-style deployments you can also set:
 
 - `ONE_RETRO_API_URL=http://host:port`

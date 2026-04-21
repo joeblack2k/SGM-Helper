@@ -17,7 +17,8 @@ use crate::api::{ApiClient, DeviceTokenPoll};
 use crate::cli::{Cli, Commands, ConfigCommand, SourceAddCommand, SourceCommand, StateCommand};
 use crate::config::{AppConfig, ConfigOverrides, LoadedConfig};
 use crate::sources::{
-    Source, SourceKind, load_source_store, remove_source, save_source_store, upsert_source,
+    Source, SourceKind, load_source_store, remove_source, save_source_store,
+    steamdeck_autodetect_note, upsert_source,
 };
 use crate::state::{
     AuthState, clear_auth_state_for_base_url, load_auth_state, load_auth_state_for_base_url,
@@ -201,6 +202,8 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 cfg.dry_run = value;
             }
 
+            print_steamdeck_autodetect_note_if_needed(&cfg, cli.quiet)?;
+
             let auth = load_active_auth_state(&cfg)?.context(format!(
                 "geen auth-token gevonden voor {}; run eerst `login`",
                 cfg.base_url()
@@ -249,6 +252,8 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 cfg.dry_run = value;
             }
 
+            print_steamdeck_autodetect_note_if_needed(&cfg, cli.quiet)?;
+
             let auth = load_active_auth_state(&cfg)?.context(format!(
                 "geen auth-token gevonden voor {}; run eerst `login`",
                 cfg.base_url()
@@ -279,6 +284,9 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                         println!(
                             "Geen geconfigureerde sources. Fallback: default-steamdeck op ROOT."
                         );
+                        if let Some(note) = steamdeck_autodetect_note() {
+                            println!("{}", note);
+                        }
                     } else {
                         for source in &store.sources {
                             println!(
@@ -455,6 +463,22 @@ fn load_active_auth_state(cfg: &AppConfig) -> Result<Option<AuthState>> {
         return Ok(Some(auth));
     }
     load_auth_state(&state_dir)
+}
+
+fn print_steamdeck_autodetect_note_if_needed(cfg: &AppConfig, quiet: bool) -> Result<()> {
+    if quiet {
+        return Ok(());
+    }
+
+    let state_dir = cfg.resolved_state_dir()?;
+    let store = load_source_store(&state_dir)?;
+    if store.sources.is_empty()
+        && let Some(note) = steamdeck_autodetect_note()
+    {
+        println!("{}", note);
+    }
+
+    Ok(())
 }
 
 fn run_device_auth(cfg: &AppConfig, poll_interval: u64, quiet: bool) -> Result<()> {

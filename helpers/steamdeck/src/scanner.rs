@@ -153,44 +153,148 @@ pub fn known_save_extensions() -> BTreeSet<&'static str> {
 }
 
 pub fn infer_system_slug(path: &Path) -> Option<String> {
-    let lower_parts: Vec<String> = path
-        .components()
-        .filter_map(|part| part.as_os_str().to_str())
-        .map(|part| part.to_ascii_lowercase())
-        .collect();
+    infer_supported_console_slug(path, None)
+}
 
-    let lookup = |needles: &[&str]| -> bool {
-        lower_parts
-            .iter()
-            .any(|part| needles.iter().any(|needle| part.contains(needle)))
-    };
+pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -> Option<String> {
+    if let Some(slug) = rom_path
+        .and_then(path_extension)
+        .and_then(system_slug_from_rom_extension)
+    {
+        return Some(slug.to_string());
+    }
 
-    if lookup(&["snes", "super nintendo", "sfc"]) {
-        return Some("snes".to_string());
-    }
-    if lookup(&["nes", "famicom"]) {
-        return Some("nes".to_string());
-    }
-    if lookup(&["gameboy", "gbc", "gb"]) {
-        return Some("gameboy".to_string());
-    }
-    if lookup(&["gba", "gameboy advance"]) {
+    let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
+    let rom_lower = rom_path
+        .map(|path| path.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let combined = format!("{} {}", save_lower, rom_lower);
+
+    if contains_any(&combined, &["gameboy advance", "/gba/", "\\gba\\"]) {
         return Some("gba".to_string());
     }
-    if lookup(&["n64", "nintendo 64"]) {
-        return Some("n64".to_string());
+    if contains_any(
+        &combined,
+        &[
+            "game boy color",
+            "gameboy color",
+            "/gbc/",
+            "\\gbc\\",
+            "nintendo ds",
+            "/nds/",
+            "\\nds\\",
+            "nintendo 64",
+            "/n64/",
+            "\\n64\\",
+            "super nintendo",
+            "/snes/",
+            "\\snes\\",
+            "/sfc/",
+            "\\sfc\\",
+            "famicom",
+            "/nes/",
+            "\\nes\\",
+            "game boy",
+            "gameboy",
+            "/gb/",
+            "\\gb\\",
+            "nintendo",
+        ],
+    ) {
+        return Some(infer_nintendo_slug(&combined).to_string());
     }
-    if lookup(&["genesis", "megadrive", "mega drive", "md"]) {
-        return Some("genesis".to_string());
+
+    if contains_any(
+        &combined,
+        &[
+            "master system",
+            "/sms/",
+            "\\sms\\",
+            "game gear",
+            "/gg/",
+            "\\gg\\",
+            "genesis",
+            "mega drive",
+            "megadrive",
+            "/md/",
+            "\\md\\",
+            "/gen/",
+            "\\gen\\",
+            "saturn",
+            "dreamcast",
+            "sega",
+        ],
+    ) {
+        return Some(infer_sega_slug(&combined).to_string());
     }
-    if lookup(&["psx", "ps1", "playstation"]) {
-        return Some("psx".to_string());
-    }
-    if lookup(&["nds", "nintendo ds"]) {
-        return Some("nds".to_string());
+
+    if contains_any(
+        &combined,
+        &[
+            "neo geo", "neogeo", "neo-geo", "/mvs/", "\\mvs\\", "/aes/", "\\aes\\",
+        ],
+    ) {
+        return Some("neogeo".to_string());
     }
 
     None
+}
+
+fn path_extension(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
+    match ext.as_str() {
+        "nes" | "fds" => Some("nes"),
+        "sfc" | "smc" => Some("snes"),
+        "n64" | "z64" | "v64" => Some("n64"),
+        "gb" | "gbc" => Some("gameboy"),
+        "gba" => Some("gba"),
+        "nds" => Some("nds"),
+        "md" | "gen" => Some("genesis"),
+        "sms" => Some("master-system"),
+        "gg" => Some("game-gear"),
+        _ => None,
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn infer_nintendo_slug(haystack: &str) -> &'static str {
+    if contains_any(haystack, &["gameboy advance", "/gba/", "\\gba\\"]) {
+        return "gba";
+    }
+    if contains_any(haystack, &["nintendo ds", "/nds/", "\\nds\\"]) {
+        return "nds";
+    }
+    if contains_any(haystack, &["nintendo 64", "/n64/", "\\n64\\"]) {
+        return "n64";
+    }
+    if contains_any(
+        haystack,
+        &["super nintendo", "/snes/", "\\snes\\", "/sfc/", "\\sfc\\"],
+    ) {
+        return "snes";
+    }
+    if contains_any(haystack, &["famicom", "/nes/", "\\nes\\"]) {
+        return "nes";
+    }
+    "gameboy"
+}
+
+fn infer_sega_slug(haystack: &str) -> &'static str {
+    if contains_any(haystack, &["master system", "/sms/", "\\sms\\"]) {
+        return "master-system";
+    }
+    if contains_any(haystack, &["game gear", "/gg/", "\\gg\\"]) {
+        return "game-gear";
+    }
+    "genesis"
 }
 
 #[cfg(test)]
@@ -214,8 +318,24 @@ mod tests {
     #[test]
     fn infer_system_slug_from_path() {
         let snes = PathBuf::from("/media/fat/saves/SNES/zelda.srm");
-        let psx = PathBuf::from("/media/fat/saves/PSX/ff7.mcr");
+        let sega = PathBuf::from("/media/fat/saves/Sega/sonic.srm");
         assert_eq!(infer_system_slug(&snes).as_deref(), Some("snes"));
-        assert_eq!(infer_system_slug(&psx).as_deref(), Some("psx"));
+        assert_eq!(infer_system_slug(&sega).as_deref(), Some("genesis"));
+    }
+
+    #[test]
+    fn unsupported_paths_are_not_classified() {
+        let path = PathBuf::from("/home/deck/.steam/steam/steamapps/compatdata/242550/icudtl.dat");
+        assert!(infer_supported_console_slug(&path, None).is_none());
+    }
+
+    #[test]
+    fn rom_extension_can_classify_supported_console() {
+        let save = PathBuf::from("/tmp/anything.sav");
+        let rom = PathBuf::from("/roms/gb/pokemon.gb");
+        assert_eq!(
+            infer_supported_console_slug(&save, Some(&rom)).as_deref(),
+            Some("gameboy")
+        );
     }
 }

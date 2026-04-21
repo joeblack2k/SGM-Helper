@@ -63,9 +63,9 @@ fn watch_smoke_persists_state_and_exits_with_max_cycles() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     let state_dir = tmp.path().join("state");
-    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(root.join("Nintendo")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
-    fs::write(root.join("metroid.sav"), b"watch-save").unwrap();
+    fs::write(root.join("Nintendo/metroid.sav"), b"watch-save").unwrap();
 
     let config = write_config(&tmp, &server, &root, &state_dir);
 

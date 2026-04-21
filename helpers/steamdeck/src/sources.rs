@@ -178,13 +178,25 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
             vec![root.clone()],
             true,
         ),
-        SourceKind::SteamDeck => Source::new(
-            "default-steamdeck".to_string(),
-            SourceKind::SteamDeck,
-            vec![root.clone()],
-            vec![root.clone(), PathBuf::from("/home/deck/Emulation/roms")],
-            true,
-        ),
+        SourceKind::SteamDeck => {
+            if let Some(emudeck_root) = detect_emudeck_root() {
+                Source::new(
+                    "auto-emudeck".to_string(),
+                    SourceKind::SteamDeck,
+                    vec![emudeck_root.join("saves")],
+                    vec![emudeck_root.join("roms"), emudeck_root.join("content")],
+                    true,
+                )
+            } else {
+                Source::new(
+                    "default-steamdeck".to_string(),
+                    SourceKind::SteamDeck,
+                    vec![root.clone()],
+                    vec![root.clone(), PathBuf::from("/home/deck/Emulation/roms")],
+                    true,
+                )
+            }
+        }
         SourceKind::Custom => Source::new(
             "default-custom".to_string(),
             SourceKind::Custom,
@@ -195,6 +207,40 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
     };
 
     Ok(source)
+}
+
+pub fn steamdeck_autodetect_note() -> Option<String> {
+    detect_emudeck_root().map(|root| {
+        format!(
+            "EmuDeck detected: using {} as save location.",
+            root.join("saves").display()
+        )
+    })
+}
+
+fn detect_emudeck_root() -> Option<PathBuf> {
+    detect_emudeck_root_from_candidates(&emudeck_candidates())
+}
+
+fn detect_emudeck_root_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|root| root.join("saves").is_dir())
+        .cloned()
+}
+
+fn emudeck_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/home/deck/Emulation")];
+
+    if let Ok(entries) = fs::read_dir("/run/media") {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("Emulation"));
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 pub fn upsert_source(store: &mut SourceStore, source: Source) {
@@ -272,5 +318,18 @@ mod tests {
             source.rom_roots[1].to_string_lossy(),
             "/home/deck/Emulation/roms"
         );
+    }
+
+    #[test]
+    fn detects_emudeck_root_from_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let emudeck_root = tmp.path().join("Emulation");
+        fs::create_dir_all(emudeck_root.join("saves")).unwrap();
+
+        let selected = detect_emudeck_root_from_candidates(&[
+            tmp.path().join("missing"),
+            emudeck_root.clone(),
+        ]);
+        assert_eq!(selected, Some(emudeck_root));
     }
 }
