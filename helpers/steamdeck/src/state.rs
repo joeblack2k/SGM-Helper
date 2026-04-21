@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use crate::scanner::{SaveAdapterProfile, SaveContainerFormat};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthState {
     pub token: String,
@@ -48,6 +50,16 @@ pub struct SyncedEntry {
     pub sha256: String,
     pub rom_sha1: Option<String>,
     pub version: Option<i64>,
+    #[serde(default)]
+    pub system_slug: Option<String>,
+    #[serde(default)]
+    pub local_container: Option<SaveContainerFormat>,
+    #[serde(default)]
+    pub adapter_profile: Option<SaveAdapterProfile>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub source_name: Option<String>,
     pub updated_at: String,
 }
 
@@ -270,5 +282,34 @@ mod tests {
         let loaded2 = load_auth_state_for_base_url(&state_dir, "http://two:3001").unwrap();
         assert_eq!(loaded1.unwrap().token, "tok-1");
         assert_eq!(loaded2.unwrap().token, "tok-2");
+    }
+
+    #[test]
+    fn legacy_sync_state_without_adapter_fields_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            sync_state_path(&state_dir),
+            r#"{
+  "entries": {
+    "/tmp/example.sav": {
+      "sha256": "abc",
+      "rom_sha1": "def",
+      "version": 1,
+      "updated_at": "2026-01-01T00:00:00Z"
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let state = load_sync_state(&state_dir).unwrap();
+        let entry = state.entries.get("/tmp/example.sav").unwrap();
+        assert_eq!(entry.sha256, "abc");
+        assert_eq!(entry.rom_sha1.as_deref(), Some("def"));
+        assert!(entry.system_slug.is_none());
+        assert!(entry.local_container.is_none());
+        assert!(entry.adapter_profile.is_none());
     }
 }

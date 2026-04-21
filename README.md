@@ -20,6 +20,8 @@ Phase 1 implements MiSTer, Windows, and Steam Deck helpers with:
 - sync + watch workflows
 - local state tracking
 - `config.ini` driven backend endpoint settings
+- canonical backend sync model (`local emulator format -> canonical raw -> local emulator format`)
+- adapter metadata persistence for deterministic restore/conversion behavior
 
 Minimum `config.ini`:
 
@@ -29,3 +31,14 @@ PORT="9096"
 ```
 
 See `helpers/mister/config/config.ini.example` and `docs/mister/install.md` for full setup.
+
+## Canonical Sync Flow
+
+The helpers use a canonical backend-first model:
+
+1. Local save files are scanned and strictly validated.
+2. Helper converts local emulator/container format to canonical bytes for upload.
+3. Backend stores canonical/raw save bytes.
+4. On download, helper converts canonical bytes back to the local container format.
+5. Adapter metadata is stored in `state/sync_state.json` so missing local files can be restored
+   in the correct local format on the next sync.

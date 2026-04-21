@@ -203,3 +203,86 @@ fn convert_ps1_raw_to_gme_and_back_roundtrip() {
     let output = fs::read(&roundtrip_raw).unwrap();
     assert_eq!(output, raw);
 }
+
+#[test]
+fn sync_restores_missing_file_from_cloud_using_saved_adapter_metadata() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_restore","expiresInDays":7}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"restore@example.com"}}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200).header("content-type", "application/json").body(
+            r#"{"success":true,"exists":true,"sha256":"remote-sha","version":2,"id":"save-remote"}"#,
+        );
+    });
+
+    let restored_bytes = vec![0x55u8; 32768];
+    let download_mock = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(restored_bytes.clone());
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let missing_save_path = root.join("Nintendo/metroid.sav");
+    assert!(!missing_save_path.exists());
+
+    let sync_state = format!(
+        r#"{{
+  "entries": {{
+    "{}": {{
+      "sha256": "old-sha",
+      "rom_sha1": "restore-rom-sha",
+      "version": 1,
+      "system_slug": "snes",
+      "local_container": "native",
+      "adapter_profile": "identity",
+      "source_kind": "steamdeck",
+      "source_name": "default-steamdeck",
+      "updated_at": "2026-01-01T00:00:00Z"
+    }}
+  }}
+}}"#,
+        missing_save_path.display()
+    );
+    fs::write(state_dir.join("sync_state.json"), sync_state).unwrap();
+
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("restore@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .assert()
+        .success();
+
+    assert!(missing_save_path.exists());
+    assert_eq!(fs::read(&missing_save_path).unwrap(), restored_bytes);
+    assert!(download_mock.calls() >= 1);
+}

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
 use walkdir::WalkDir;
@@ -195,7 +196,8 @@ pub struct SaveClassification {
     pub evidence: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SaveContainerFormat {
     Native,
     Ps1Raw,
@@ -203,10 +205,42 @@ pub enum SaveContainerFormat {
     Ps1Vmp,
 }
 
+impl SaveContainerFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Ps1Raw => "ps1-raw",
+            Self::Ps1DexDrive => "ps1-dexdrive",
+            Self::Ps1Vmp => "ps1-vmp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SaveAdapterProfile {
+    Identity,
+    Ps1Raw,
+    Ps1DexDrive,
+    Ps1Vmp,
+}
+
+impl SaveAdapterProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Ps1Raw => "ps1-raw",
+            Self::Ps1DexDrive => "ps1-dexdrive",
+            Self::Ps1Vmp => "ps1-vmp",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NormalizedSave {
     pub canonical_bytes: Vec<u8>,
     pub local_container: SaveContainerFormat,
+    pub adapter_profile: SaveAdapterProfile,
 }
 
 pub fn normalize_save_for_sync(
@@ -227,6 +261,7 @@ pub fn normalize_save_bytes_for_sync(
         return Ok(Some(NormalizedSave {
             canonical_bytes: bytes.to_vec(),
             local_container: SaveContainerFormat::Native,
+            adapter_profile: SaveAdapterProfile::Identity,
         }));
     }
 
@@ -235,16 +270,19 @@ pub fn normalize_save_bytes_for_sync(
         "gme" => decode_ps1_dexdrive(bytes).map(|payload| NormalizedSave {
             canonical_bytes: payload,
             local_container: SaveContainerFormat::Ps1DexDrive,
+            adapter_profile: SaveAdapterProfile::Ps1DexDrive,
         }),
         "vmp" => decode_ps1_vmp(bytes).map(|payload| NormalizedSave {
             canonical_bytes: payload,
             local_container: SaveContainerFormat::Ps1Vmp,
+            adapter_profile: SaveAdapterProfile::Ps1Vmp,
         }),
         _ => {
             if validate_ps1_raw_memcard(bytes) {
                 Some(NormalizedSave {
                     canonical_bytes: bytes.to_vec(),
                     local_container: SaveContainerFormat::Ps1Raw,
+                    adapter_profile: SaveAdapterProfile::Ps1Raw,
                 })
             } else {
                 None
@@ -1124,6 +1162,7 @@ mod tests {
             .unwrap()
             .expect("expected normalized save");
         assert_eq!(normalized.local_container, SaveContainerFormat::Ps1DexDrive);
+        assert_eq!(normalized.adapter_profile, SaveAdapterProfile::Ps1DexDrive);
         assert_eq!(normalized.canonical_bytes, raw);
     }
 
@@ -1137,5 +1176,21 @@ mod tests {
         let rewritten =
             encode_download_for_local_container(&raw, SaveContainerFormat::Ps1Vmp).unwrap();
         assert_eq!(rewritten, encoded);
+    }
+
+    #[test]
+    fn non_ps1_saves_use_identity_adapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Nintendo/mario.srm");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let payload = vec![0x42u8; 8192];
+        fs::write(&save, &payload).unwrap();
+
+        let normalized = normalize_save_for_sync(&save, "snes")
+            .unwrap()
+            .expect("expected normalized save");
+        assert_eq!(normalized.local_container, SaveContainerFormat::Native);
+        assert_eq!(normalized.adapter_profile, SaveAdapterProfile::Identity);
+        assert_eq!(normalized.canonical_bytes, payload);
     }
 }

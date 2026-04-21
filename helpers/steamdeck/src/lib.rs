@@ -425,15 +425,32 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                         println!("Geen sync-state entries.");
                     } else {
                         for (path, entry) in state.entries {
+                            let source_label =
+                                match (entry.source_kind.clone(), entry.source_name.clone()) {
+                                    (Some(kind), Some(name)) => format!("{} ({})", kind, name),
+                                    (Some(kind), None) => kind,
+                                    (None, Some(name)) => name,
+                                    (None, None) => "-".to_string(),
+                                };
                             println!(
-                                "{} | sha256={} | rom_sha1={} | version={}",
+                                "{} | sha256={} | rom_sha1={} | version={} | system={} | container={} | adapter={} | source={}",
                                 path,
                                 entry.sha256,
                                 entry.rom_sha1.unwrap_or_else(|| "-".to_string()),
                                 entry
                                     .version
                                     .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "-".to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                entry.system_slug.unwrap_or_else(|| "-".to_string()),
+                                entry
+                                    .local_container
+                                    .map(|value| value.as_str().to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                entry
+                                    .adapter_profile
+                                    .map(|value| value.as_str().to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                source_label,
                             );
                         }
                     }
