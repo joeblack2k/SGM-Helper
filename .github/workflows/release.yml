@@ -1,4 +1,4 @@
-name: Release ARMv7
+name: Release ARMv7 + Windows
 
 on:
   push:
@@ -18,29 +18,44 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Windows cross toolchain
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@cargo-zigbuild
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
 
-      - name: Add ARMv7 target
-        run: rustup target add armv7-unknown-linux-musleabihf
+      - name: Add release targets
+        run: |
+          rustup target add armv7-unknown-linux-musleabihf
+          rustup target add x86_64-pc-windows-gnu
 
       - name: Build ARMv7 release binary
         run: cargo zigbuild -p sgm-mister-helper --release --target armv7-unknown-linux-musleabihf
+
+      - name: Build Windows release binary
+        run: cargo build -p sgm-windows-helper --release --target x86_64-pc-windows-gnu
 
       - name: Package artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
           cp target/armv7-unknown-linux-musleabihf/release/sgm-mister-helper dist/
+          cp target/x86_64-pc-windows-gnu/release/sgm-windows-helper.exe dist/
           tar -C dist -czf dist/sgm-mister-helper-armv7.tar.gz sgm-mister-helper
-          (cd dist && sha256sum sgm-mister-helper-armv7.tar.gz > sha256.txt)
+          zip -j dist/sgm-windows-helper-x86_64-pc-windows-gnu.zip dist/sgm-windows-helper.exe
+          (
+            cd dist
+            sha256sum sgm-mister-helper-armv7.tar.gz > sha256.txt
+            sha256sum sgm-windows-helper-x86_64-pc-windows-gnu.zip >> sha256.txt
+          )
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/sgm-mister-helper-armv7.tar.gz
+            dist/sgm-windows-helper-x86_64-pc-windows-gnu.zip
             dist/sha256.txt
