@@ -8,6 +8,7 @@ use anyhow::Result;
 
 use crate::api::ApiClient;
 use crate::config::AppConfig;
+use crate::sources::SourceKind;
 use crate::state::AuthState;
 use crate::syncer::{SyncOptions, run_sync};
 
@@ -16,6 +17,8 @@ pub struct WatchOptions {
     pub interval_secs: u64,
     pub force_upload: bool,
     pub dry_run: bool,
+    pub slot_name: String,
+    pub default_source_kind: SourceKind,
     pub max_cycles: Option<u32>,
 }
 
@@ -59,7 +62,8 @@ pub fn run_watch(
             &SyncOptions {
                 force_upload: options.force_upload,
                 dry_run: options.dry_run,
-                slot_name: "default".to_string(),
+                slot_name: options.slot_name.clone(),
+                default_source_kind: options.default_source_kind.clone(),
             },
             verbose,
         )?;

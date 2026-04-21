@@ -80,11 +80,35 @@ pub struct ConflictReportResponse {
     pub conflict_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceAuthResponse {
+    #[serde(rename = "deviceCode")]
+    pub device_code: String,
+    #[serde(rename = "userCode")]
+    pub user_code: String,
+    #[serde(rename = "verificationUri")]
+    pub verification_uri: String,
+    #[serde(rename = "expiresInSeconds")]
+    pub expires_in_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeviceTokenPoll {
+    Pending,
+    Success(TokenResponse),
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct AppPasswordRequest<'a> {
     email: &'a str,
     #[serde(rename = "appPassword")]
     app_password: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeviceTokenRequest<'a> {
+    #[serde(rename = "deviceCode")]
+    device_code: &'a str,
 }
 
 impl ApiClient {
@@ -167,6 +191,7 @@ impl ApiClient {
         parse_json_response(response)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_save(
         &self,
         filename: &str,
@@ -175,6 +200,7 @@ impl ApiClient {
         rom_md5: Option<&str>,
         slot_name: &str,
         fingerprint: &str,
+        system_slug: Option<&str>,
     ) -> Result<UploadSaveResponse> {
         let url = self.url("/saves");
         let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(filename.to_string());
@@ -191,6 +217,11 @@ impl ApiClient {
         {
             form = form.text("rom_md5", md5.to_string());
         }
+        if let Some(system_slug) = system_slug
+            && !system_slug.trim().is_empty()
+        {
+            form = form.text("system", system_slug.to_string());
+        }
 
         let response = self
             .client
@@ -201,6 +232,47 @@ impl ApiClient {
             .context("request naar /saves (multipart) faalde")?;
 
         parse_json_response(response)
+    }
+
+    pub fn start_device_auth(&self) -> Result<DeviceAuthResponse> {
+        let url = self.url("/auth/device");
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .send()
+            .context("request naar /auth/device faalde")?;
+        parse_json_response(response)
+    }
+
+    pub fn poll_device_token(&self, device_code: &str) -> Result<DeviceTokenPoll> {
+        let url = self.url("/auth/device/token");
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(&DeviceTokenRequest { device_code })
+            .send()
+            .context("request naar /auth/device/token faalde")?;
+
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            return Ok(DeviceTokenPoll::Pending);
+        }
+        if response.status() == reqwest::StatusCode::OK {
+            return Ok(DeviceTokenPoll::Success(
+                response
+                    .json::<TokenResponse>()
+                    .context("kan device token response niet deserializen")?,
+            ));
+        }
+
+        let status = response.status();
+        let body = response.text().unwrap_or_else(|_| String::new());
+        bail!(
+            "device-token polling faalde: status={} body={}",
+            status,
+            truncate(&body, 300)
+        );
     }
 
     pub fn download_save(&self, save_id: &str) -> Result<Vec<u8>> {

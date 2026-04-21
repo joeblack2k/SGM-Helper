@@ -2,16 +2,23 @@ pub mod api;
 pub mod cli;
 pub mod config;
 pub mod scanner;
+pub mod sources;
 pub mod state;
 pub mod syncer;
 pub mod watcher;
 
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::api::ApiClient;
-use crate::cli::{Cli, Commands, ConfigCommand, StateCommand};
+use crate::api::{ApiClient, DeviceTokenPoll};
+use crate::cli::{Cli, Commands, ConfigCommand, SourceAddCommand, SourceCommand, StateCommand};
 use crate::config::{ConfigOverrides, LoadedConfig};
+use crate::sources::{
+    Source, SourceKind, load_source_store, remove_source, save_source_store, upsert_source,
+};
 use crate::state::{
     AuthState, clear_auth_state, load_auth_state, load_sync_state, save_auth_state,
 };
@@ -26,6 +33,7 @@ pub fn run() -> Result<()> {
 
     let global_overrides = ConfigOverrides {
         url: cli.url.clone(),
+        api_url: cli.api_url.clone(),
         port: cli.port,
         email: cli.email.clone(),
         app_password: cli.app_password.clone(),
@@ -94,25 +102,26 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 );
             }
         }
-        Commands::Token => {
+        Commands::Token { details } => {
             let state_dir = loaded.config.resolved_state_dir()?;
-            let auth = load_auth_state(&state_dir)?;
-            match auth {
-                Some(auth) => {
-                    let suffix = auth.token_suffix(6);
-                    println!(
-                        "Token aanwezig: yes\nemail: {}\nbase_url: {}\naangemaakt: {}\ntoken_suffix: {}",
-                        auth.email, auth.base_url, auth.created_at, suffix
-                    );
-                }
-                None => {
-                    println!("Token aanwezig: no");
-                }
+            let auth = load_auth_state(&state_dir)?
+                .context("geen auth.json gevonden; run eerst `login` of `device-auth`")?;
+            if details {
+                println!(
+                    "Token aanwezig: yes\nemail: {}\nbase_url: {}\naangemaakt: {}\ntoken_suffix: {}",
+                    auth.email,
+                    auth.base_url,
+                    auth.created_at,
+                    auth.token_suffix(6)
+                );
+            } else {
+                println!("{}", auth.token);
             }
         }
         Commands::Sync {
             force_upload,
             dry_run,
+            slot_name,
         } => {
             let mut cfg = loaded.config.clone();
             if let Some(value) = force_upload {
@@ -131,7 +140,8 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 &SyncOptions {
                     force_upload: cfg.force_upload,
                     dry_run: cfg.dry_run,
-                    slot_name: "default".to_string(),
+                    slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
+                    default_source_kind: SourceKind::Windows,
                 },
                 cli.verbose,
             )?;
@@ -153,6 +163,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
             watch_interval,
             force_upload,
             dry_run,
+            slot_name,
             max_cycles,
         } => {
             let mut cfg = loaded.config.clone();
@@ -176,11 +187,116 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     interval_secs: cfg.watch_interval,
                     force_upload: cfg.force_upload,
                     dry_run: cfg.dry_run,
+                    slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
+                    default_source_kind: SourceKind::Windows,
                     max_cycles,
                 },
                 cli.verbose,
                 cli.quiet,
             )?;
+        }
+        Commands::Source { command } => {
+            let state_dir = loaded.config.resolved_state_dir()?;
+            let mut store = load_source_store(&state_dir)?;
+
+            match command {
+                SourceCommand::List => {
+                    if store.sources.is_empty() {
+                        println!(
+                            "Geen geconfigureerde sources. Fallback: default-windows op ROOT."
+                        );
+                    } else {
+                        for source in &store.sources {
+                            println!(
+                                "{} | kind={} | recursive={} | saves={} | roms={}",
+                                source.name,
+                                source.kind.as_str(),
+                                source.recursive,
+                                source.save_roots.len(),
+                                source.rom_roots.len()
+                            );
+                        }
+                    }
+                }
+                SourceCommand::Add { source } => {
+                    let source = match source {
+                        SourceAddCommand::Custom {
+                            name,
+                            saves,
+                            roms,
+                            recursive,
+                        } => {
+                            if saves.is_empty() {
+                                bail!("custom source vereist minimaal één --saves pad");
+                            }
+                            let rom_roots = if roms.is_empty() { saves.clone() } else { roms };
+                            Source::new(
+                                name,
+                                SourceKind::Custom,
+                                saves,
+                                rom_roots,
+                                recursive.unwrap_or(true),
+                            )
+                        }
+                        SourceAddCommand::MisterFpga {
+                            name,
+                            root,
+                            recursive,
+                        } => Source::new(
+                            name,
+                            SourceKind::MisterFpga,
+                            vec![root.join("saves")],
+                            vec![root.join("games")],
+                            recursive.unwrap_or(true),
+                        ),
+                        SourceAddCommand::Retroarch {
+                            name,
+                            root,
+                            recursive,
+                        } => Source::new(
+                            name,
+                            SourceKind::RetroArch,
+                            vec![root.join("saves")],
+                            vec![root.join("roms"), root.join("content")],
+                            recursive.unwrap_or(true),
+                        ),
+                        SourceAddCommand::Openemu {
+                            name,
+                            root,
+                            recursive,
+                        } => Source::new(
+                            name,
+                            SourceKind::OpenEmu,
+                            vec![root.join("Save States")],
+                            vec![root],
+                            recursive.unwrap_or(true),
+                        ),
+                        SourceAddCommand::AnaloguePocket {
+                            name,
+                            root,
+                            recursive,
+                        } => Source::new(
+                            name,
+                            SourceKind::AnaloguePocket,
+                            vec![root.join("Saves"), root.join("saves")],
+                            vec![root],
+                            recursive.unwrap_or(true),
+                        ),
+                    };
+
+                    upsert_source(&mut store, source.clone());
+                    save_source_store(&state_dir, &store)?;
+                    println!("Source '{}' opgeslagen.", source.name);
+                }
+                SourceCommand::Remove { name } => {
+                    if remove_source(&mut store, &name) {
+                        save_source_store(&state_dir, &store)?;
+                        println!("Source '{}' verwijderd.", name);
+                    } else {
+                        println!("Source '{}' niet gevonden.", name);
+                    }
+                }
+            }
         }
         Commands::State { command } => {
             let state_dir = loaded.config.resolved_state_dir()?;
@@ -243,10 +359,40 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             }
         },
-        Commands::DeviceAuth => {
-            println!(
-                "device-auth is not supported in phase 1. Use `login --email ... --app-password ...`."
-            );
+        Commands::DeviceAuth { poll_interval } => {
+            let cfg = loaded.config.clone();
+            let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
+            let device = api.start_device_auth()?;
+
+            println!("Device authorization started.");
+            println!("Open: {}", device.verification_uri);
+            println!("Code: {}", device.user_code);
+
+            let poll_interval = poll_interval.max(1);
+            let max_attempts = (device.expires_in_seconds / poll_interval).max(1);
+
+            for _ in 0..max_attempts {
+                match api.poll_device_token(&device.device_code)? {
+                    DeviceTokenPoll::Pending => {
+                        thread::sleep(Duration::from_secs(poll_interval));
+                    }
+                    DeviceTokenPoll::Success(token_response) => {
+                        let auth_me_email = api
+                            .with_token(Some(token_response.token.clone()))?
+                            .auth_me()
+                            .ok()
+                            .and_then(|user| user.email)
+                            .unwrap_or_else(|| "device-auth@local".to_string());
+                        let auth_state =
+                            AuthState::new(token_response.token, auth_me_email, cfg.base_url());
+                        save_auth_state(&cfg.resolved_state_dir()?, &auth_state)?;
+                        println!("Device login successful.");
+                        return Ok(());
+                    }
+                }
+            }
+
+            bail!("Device authorization timed out.");
         }
     }
 

@@ -5,14 +5,17 @@ Windows helper CLI for SGM self-hosted save sync.
 ## Commands
 
 - `login --email <email> --app-password <password>`
+- `device-auth --poll-interval 5`
 - `logout`
 - `token`
 - `sync`
 - `watch`
+- `source list`
+- `source add ...`
+- `source remove --name <name>`
 - `state list`
 - `state clean`
 - `config show`
-- `device-auth` (phase 1 placeholder)
 
 ## Config
 

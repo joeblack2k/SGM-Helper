@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOverrides {
     pub url: Option<String>,
+    pub api_url: Option<String>,
     pub port: Option<u16>,
     pub email: Option<String>,
     pub app_password: Option<String>,
@@ -79,6 +80,21 @@ impl AppConfig {
         ini_values: &HashMap<String, String>,
         binary_dir: PathBuf,
     ) -> Result<Self> {
+        if let Some(api_url) = overrides
+            .api_url
+            .clone()
+            .or_else(|| env_values.get("ONE_RETRO_API_URL").cloned())
+            .or_else(|| env_values.get("API_URL").cloned())
+            .or_else(|| ini_values.get("API_URL").cloned())
+        {
+            let (url, port) = parse_api_url_host_port(&api_url)?;
+            let mut merged_overrides = overrides.clone();
+            merged_overrides.url = Some(url);
+            merged_overrides.port = Some(port);
+            merged_overrides.api_url = None;
+            return AppConfig::from_sources(&merged_overrides, env_values, ini_values, binary_dir);
+        }
+
         let url = choose_string(
             overrides.url.clone(),
             env_values,
@@ -207,6 +223,8 @@ fn parse_ini_content(content: &str) -> Result<HashMap<String, String>> {
 fn collect_env_values() -> HashMap<String, String> {
     let mut values = HashMap::new();
     for key in [
+        "ONE_RETRO_API_URL",
+        "API_URL",
         "URL",
         "PORT",
         "EMAIL",
@@ -347,6 +365,36 @@ fn validate_host_only(host: &str) -> Result<()> {
     Ok(())
 }
 
+fn parse_api_url_host_port(value: &str) -> Result<(String, u16)> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        bail!("API_URL/ONE_RETRO_API_URL mag niet leeg zijn");
+    }
+    let without_scheme = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .unwrap_or(raw);
+    let authority = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .trim();
+    if authority.is_empty() {
+        bail!("ongeldige API_URL/ONE_RETRO_API_URL");
+    }
+
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        let parsed_port = port
+            .parse::<u16>()
+            .with_context(|| "ongeldige poort in API_URL/ONE_RETRO_API_URL")?;
+        (host.to_string(), parsed_port)
+    } else {
+        (authority.to_string(), 80)
+    };
+    validate_host_only(&host)?;
+    Ok((host, port))
+}
+
 fn normalize_route_prefix(prefix: &str) -> String {
     let mut trimmed = prefix.trim().trim_end_matches('/').to_string();
     if trimmed == "/" {
@@ -404,6 +452,7 @@ mod tests {
         let cfg = test_sources(
             ConfigOverrides {
                 url: Some("10.0.0.5".into()),
+                api_url: None,
                 ..ConfigOverrides::default()
             },
             &[("URL", "10.0.0.4")],

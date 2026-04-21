@@ -5,14 +5,17 @@ MiSTer FPGA helper CLI for SGM self-hosted save sync.
 ## Commands
 
 - `login --email <email> --app-password <password>`
+- `device-auth --poll-interval 5`
 - `logout`
 - `token`
 - `sync`
 - `watch`
+- `source list`
+- `source add ...`
+- `source remove --name <name>`
 - `state list`
 - `state clean`
 - `config show`
-- `device-auth` (phase 1 placeholder)
 
 ## Config
 
@@ -26,3 +29,8 @@ PORT="9096"
 ```
 
 Full example: `config/config.ini.example`.
+
+For compatibility with existing 1Retro-style deployments you can also set:
+
+- `ONE_RETRO_API_URL=http://host:port`
+- `API_URL=http://host:port`
