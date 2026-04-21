@@ -36,7 +36,7 @@ jobs:
           mkdir -p dist
           cp target/armv7-unknown-linux-musleabihf/release/sgm-mister-helper dist/
           tar -C dist -czf dist/sgm-mister-helper-armv7.tar.gz sgm-mister-helper
-          (cd dist && shasum -a 256 sgm-mister-helper-armv7.tar.gz > sha256.txt)
+          (cd dist && sha256sum sgm-mister-helper-armv7.tar.gz > sha256.txt)
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
