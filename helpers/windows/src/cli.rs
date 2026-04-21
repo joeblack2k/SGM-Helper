@@ -48,6 +48,16 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    Signup {
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long = "display-name")]
+        display_name: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        skip_verification: bool,
+    },
     Login {
         #[arg(long)]
         email: Option<String>,
@@ -55,6 +65,10 @@ pub enum Commands {
         app_password: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
         device: bool,
+    },
+    ResendVerification {
+        #[arg(long)]
+        email: Option<String>,
     },
     Logout,
     Token {

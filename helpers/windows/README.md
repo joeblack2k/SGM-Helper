@@ -4,8 +4,10 @@ Windows helper CLI for SGM self-hosted save sync.
 
 ## Commands
 
+- `signup --email <email> --display-name <name>`
 - `login --email <email> --app-password <password>`
 - `device-auth --poll-interval 5`
+- `resend-verification --email <email>`
 - `logout`
 - `token`
 - `sync`
@@ -29,3 +31,8 @@ PORT="9096"
 ```
 
 Full example: `config/config.ini.example`.
+
+For compatibility with existing 1Retro-style deployments you can also set:
+
+- `ONE_RETRO_API_URL=http://host:port`
+- `API_URL=http://host:port`

@@ -52,6 +52,41 @@ pub fn run() -> Result<()> {
 
 fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
     match cli.command {
+        Commands::Signup {
+            email,
+            display_name,
+            password,
+            skip_verification,
+        } => {
+            let mut cfg = loaded.config.clone();
+            if let Some(value) = email {
+                cfg.email = value;
+            }
+            if cfg.email.trim().is_empty() {
+                bail!("signup vereist een email (`--email` of EMAIL in config.ini)");
+            }
+
+            let inferred_display = cfg
+                .email
+                .split('@')
+                .next()
+                .unwrap_or("sgm-user")
+                .to_string();
+            let display_name = display_name.unwrap_or(inferred_display);
+            let password = password
+                .or_else(|| {
+                    if cfg.app_password.trim().is_empty() {
+                        None
+                    } else {
+                        Some(cfg.app_password.clone())
+                    }
+                })
+                .unwrap_or_else(|| "sgm-helper-password".to_string());
+
+            let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
+            let response = api.signup(&cfg.email, &display_name, &password, skip_verification)?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
         Commands::Login {
             email,
             app_password,
@@ -107,6 +142,18 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     state_dir.join("auth.json").display()
                 );
             }
+        }
+        Commands::ResendVerification { email } => {
+            let mut cfg = loaded.config.clone();
+            if let Some(value) = email {
+                cfg.email = value;
+            }
+            if cfg.email.trim().is_empty() {
+                bail!("resend-verification vereist een email (`--email` of EMAIL in config.ini)");
+            }
+            let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
+            let response = api.resend_verification(&cfg.email)?;
+            println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Commands::Token { details } => {
             let state_dir = loaded.config.resolved_state_dir()?;

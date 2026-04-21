@@ -106,6 +106,21 @@ struct AppPasswordRequest<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct SignupRequest<'a> {
+    email: &'a str,
+    #[serde(rename = "displayName")]
+    display_name: &'a str,
+    password: &'a str,
+    #[serde(rename = "skipVerification")]
+    skip_verification: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ResendVerificationRequest<'a> {
+    email: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct DeviceTokenRequest<'a> {
     #[serde(rename = "deviceCode")]
     device_code: &'a str,
@@ -155,6 +170,41 @@ impl ApiClient {
             .send()
             .context("request naar /auth/token/app-password faalde")?;
 
+        parse_json_response(response)
+    }
+
+    pub fn signup(
+        &self,
+        email: &str,
+        display_name: &str,
+        password: &str,
+        skip_verification: bool,
+    ) -> Result<serde_json::Value> {
+        let url = self.url("/auth/signup");
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(&SignupRequest {
+                email,
+                display_name,
+                password,
+                skip_verification,
+            })
+            .send()
+            .context("request naar /auth/signup faalde")?;
+        parse_json_response(response)
+    }
+
+    pub fn resend_verification(&self, email: &str) -> Result<serde_json::Value> {
+        let url = self.url("/auth/resend-verification");
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(&ResendVerificationRequest { email })
+            .send()
+            .context("request naar /auth/resend-verification faalde")?;
         parse_json_response(response)
     }
 
