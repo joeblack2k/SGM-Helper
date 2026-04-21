@@ -66,6 +66,57 @@ fn login_with_app_password_persists_token() {
 }
 
 #[test]
+fn login_with_password_uses_login_and_token_endpoints() {
+    let server = MockServer::start();
+    let login = server.mock(|when, then| {
+        when.method(POST).path("/auth/login");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"password@example.com"}}"#);
+    });
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_password","expiresInDays":7}"#);
+    });
+    let me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"password@example.com"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-mister-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(config)
+        .arg("login")
+        .arg("--email")
+        .arg("password@example.com")
+        .arg("--password")
+        .arg("secret")
+        .assert()
+        .success();
+
+    assert_eq!(login.calls(), 1);
+    assert_eq!(token.calls(), 1);
+    assert_eq!(me.calls(), 1);
+
+    let auth_path = state_dir.join("auth.json");
+    assert!(auth_path.exists());
+    let auth: Value = serde_json::from_str(&fs::read_to_string(auth_path).unwrap()).unwrap();
+    assert_eq!(auth["token"], "tok_password");
+}
+
+#[test]
 fn sync_uploads_when_no_cloud_save_exists() {
     let server = MockServer::start();
     let _token = server.mock(|when, then| {

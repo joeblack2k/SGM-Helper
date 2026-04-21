@@ -6,6 +6,8 @@ MiSTer FPGA helper CLI for SGM self-hosted save sync.
 
 - `signup --email <email> --display-name <name>`
 - `login --email <email> --app-password <password>`
+- `login --email <email> --password <password>`
+- `login --device` (or just `login` when no password is configured)
 - `device-auth --poll-interval 5`
 - `resend-verification --email <email>`
 - `logout`

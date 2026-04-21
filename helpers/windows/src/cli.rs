@@ -61,6 +61,8 @@ pub enum Commands {
     Login {
         #[arg(long)]
         email: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
         #[arg(long = "app-password")]
         app_password: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]

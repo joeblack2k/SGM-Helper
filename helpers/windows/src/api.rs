@@ -20,6 +20,11 @@ pub struct TokenResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct LoginResponse {
+    pub user: Option<AuthUser>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthMeResponse {
     pub user: Option<AuthUser>,
 }
@@ -121,6 +126,15 @@ struct ResendVerificationRequest<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct LoginRequest<'a> {
+    email: &'a str,
+    password: &'a str,
+    #[serde(rename = "deviceType")]
+    device_type: &'a str,
+    fingerprint: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct DeviceTokenRequest<'a> {
     #[serde(rename = "deviceCode")]
     device_code: &'a str,
@@ -170,6 +184,41 @@ impl ApiClient {
             .send()
             .context("request naar /auth/token/app-password faalde")?;
 
+        parse_json_response(response)
+    }
+
+    pub fn login_password(
+        &self,
+        email: &str,
+        password: &str,
+        device_type: &str,
+        fingerprint: &str,
+    ) -> Result<LoginResponse> {
+        let url = self.url("/auth/login");
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(&LoginRequest {
+                email,
+                password,
+                device_type,
+                fingerprint,
+            })
+            .send()
+            .context("request naar /auth/login faalde")?;
+        parse_json_response(response)
+    }
+
+    pub fn mint_token(&self) -> Result<TokenResponse> {
+        let url = self.url("/auth/token");
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(&serde_json::json!({}))
+            .send()
+            .context("request naar /auth/token faalde")?;
         parse_json_response(response)
     }
 

@@ -20,7 +20,8 @@ use crate::sources::{
     Source, SourceKind, load_source_store, remove_source, save_source_store, upsert_source,
 };
 use crate::state::{
-    AuthState, clear_auth_state, load_auth_state, load_sync_state, save_auth_state,
+    AuthState, clear_auth_state_for_base_url, load_auth_state, load_auth_state_for_base_url,
+    load_sync_state, save_auth_state_for_base_url,
 };
 use crate::syncer::{SyncOptions, run_sync};
 use crate::watcher::{WatchOptions, run_watch};
@@ -89,6 +90,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
         }
         Commands::Login {
             email,
+            password,
             app_password,
             device,
         } => {
@@ -100,7 +102,8 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 cfg.app_password = value;
             }
 
-            if device {
+            let wants_device = device || (password.is_none() && cfg.app_password.trim().is_empty());
+            if wants_device {
                 run_device_auth(&cfg, 5, cli.quiet)?;
                 return Ok(());
             }
@@ -108,24 +111,35 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
             if cfg.email.trim().is_empty() {
                 bail!("login vereist een email (`--email` of EMAIL in config.ini)");
             }
-            if cfg.app_password.trim().is_empty() {
-                bail!(
-                    "login vereist een app-password (`--app-password` of APP_PASSWORD in config.ini)"
-                );
-            }
+
+            let fingerprint = hostname::get()
+                .ok()
+                .and_then(|value| value.into_string().ok())
+                .unwrap_or_else(|| "helper".to_string());
 
             let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
-            let token_response = api
-                .token_app_password(&cfg.email, &cfg.app_password)
-                .context("app-password login faalde")?;
+            let token_response = if let Some(password) = password {
+                let _login = api
+                    .login_password(&cfg.email, &password, "windows", &fingerprint)
+                    .context("email/password login faalde")?;
+                api.mint_token().context("token mint faalde na login")?
+            } else {
+                if cfg.app_password.trim().is_empty() {
+                    bail!("login vereist --password of --app-password (of gebruik --device)");
+                }
+                api.token_app_password(&cfg.email, &cfg.app_password)
+                    .context("app-password login faalde")?
+            };
+
             let auth_me_email = api
+                .with_token(Some(token_response.token.clone()))?
                 .auth_me()
                 .ok()
                 .and_then(|user| user.email)
                 .unwrap_or_else(|| cfg.email.clone());
 
             let auth_state = AuthState::new(token_response.token, auth_me_email, cfg.base_url());
-            save_auth_state(&cfg.resolved_state_dir()?, &auth_state)?;
+            save_auth_state_for_base_url(&cfg.resolved_state_dir()?, &auth_state)?;
             if !cli.quiet {
                 println!(
                     "Login successful. Token opgeslagen in {}",
@@ -135,11 +149,13 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
         }
         Commands::Logout => {
             let state_dir = loaded.config.resolved_state_dir()?;
-            clear_auth_state(&state_dir)?;
+            let base_url = loaded.config.base_url();
+            clear_auth_state_for_base_url(&state_dir, &base_url)?;
             if !cli.quiet {
                 println!(
-                    "Token verwijderd uit {}",
-                    state_dir.join("auth.json").display()
+                    "Token verwijderd voor {} (state: {})",
+                    base_url,
+                    state_dir.display()
                 );
             }
         }
@@ -156,9 +172,10 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
         Commands::Token { details } => {
-            let state_dir = loaded.config.resolved_state_dir()?;
-            let auth = load_auth_state(&state_dir)?
-                .context("geen auth.json gevonden; run eerst `login` of `device-auth`")?;
+            let auth = load_active_auth_state(&loaded.config)?.context(format!(
+                "geen auth-token gevonden voor {}; run eerst `login` of `device-auth`",
+                loaded.config.base_url()
+            ))?;
             if details {
                 println!(
                     "Token aanwezig: yes\nemail: {}\nbase_url: {}\naangemaakt: {}\ntoken_suffix: {}",
@@ -184,8 +201,10 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 cfg.dry_run = value;
             }
 
-            let auth = load_auth_state(&cfg.resolved_state_dir()?)?
-                .context("geen auth.json gevonden; run eerst `login` met app-password")?;
+            let auth = load_active_auth_state(&cfg)?.context(format!(
+                "geen auth-token gevonden voor {}; run eerst `login`",
+                cfg.base_url()
+            ))?;
 
             let report = run_sync(
                 &cfg,
@@ -230,8 +249,10 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 cfg.dry_run = value;
             }
 
-            let auth = load_auth_state(&cfg.resolved_state_dir()?)?
-                .context("geen auth.json gevonden; run eerst `login` met app-password")?;
+            let auth = load_active_auth_state(&cfg)?.context(format!(
+                "geen auth-token gevonden voor {}; run eerst `login`",
+                cfg.base_url()
+            ))?;
 
             run_watch(
                 &cfg,
@@ -428,6 +449,14 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
     Ok(())
 }
 
+fn load_active_auth_state(cfg: &AppConfig) -> Result<Option<AuthState>> {
+    let state_dir = cfg.resolved_state_dir()?;
+    if let Some(auth) = load_auth_state_for_base_url(&state_dir, &cfg.base_url())? {
+        return Ok(Some(auth));
+    }
+    load_auth_state(&state_dir)
+}
+
 fn run_device_auth(cfg: &AppConfig, poll_interval: u64, quiet: bool) -> Result<()> {
     let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
     let device = api.start_device_auth()?;
@@ -455,7 +484,7 @@ fn run_device_auth(cfg: &AppConfig, poll_interval: u64, quiet: bool) -> Result<(
                     .unwrap_or_else(|| "device-auth@local".to_string());
                 let auth_state =
                     AuthState::new(token_response.token, auth_me_email, cfg.base_url());
-                save_auth_state(&cfg.resolved_state_dir()?, &auth_state)?;
+                save_auth_state_for_base_url(&cfg.resolved_state_dir()?, &auth_state)?;
                 if !quiet {
                     println!("Device login successful.");
                 }
