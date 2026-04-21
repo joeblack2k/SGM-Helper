@@ -12,6 +12,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#if defined(GAMECUBE_TARGET) || defined(WII_TARGET)
+#include <network.h>
+#define select net_select
+#endif
+
 #define HTTP_REQ_MAX (1024 * 1024)
 
 static int set_nonblocking(int fd, int enable) {

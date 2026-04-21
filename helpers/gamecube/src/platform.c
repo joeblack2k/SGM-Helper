@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #if defined(GAMECUBE_TARGET) || defined(WII_TARGET)
 #include <fat.h>
@@ -56,7 +55,10 @@ void sgm_platform_sleep_ms(int ms) {
   if (ms <= 0) {
     return;
   }
-  usleep((useconds_t)ms * 1000);
+  int frames = (ms + 15) / 16;
+  for (int i = 0; i < frames; i++) {
+    VIDEO_WaitVSync();
+  }
 }
 
 void sgm_platform_clear(void) {
@@ -159,11 +161,15 @@ int sgm_platform_get_fingerprint(char* out, size_t out_size) {
     snprintf(ip, sizeof(ip), "0.0.0.0");
   }
 
-  u32 console_type = SYS_GetConsoleType();
+  unsigned long hash = 2166136261u;
+  for (size_t i = 0; ip[i] != '\0'; i++) {
+    hash ^= (unsigned long)(unsigned char)ip[i];
+    hash *= 16777619u;
+  }
 #ifdef WII_TARGET
-  snprintf(out, out_size, "wii-%08lx-%s", (unsigned long)console_type, ip);
+  snprintf(out, out_size, "wii-%08lx-%s", hash, ip);
 #else
-  snprintf(out, out_size, "gc-%08lx-%s", (unsigned long)console_type, ip);
+  snprintf(out, out_size, "gc-%08lx-%s", hash, ip);
 #endif
   return 0;
 }

@@ -4,14 +4,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef GAMECUBE_TARGET
+#if defined(GAMECUBE_TARGET) || defined(WII_TARGET)
 
+#include <malloc.h>
 #include <ogc/card.h>
 
 #define SGM_CARD_SLOT 0
 
 static unsigned char g_card_work_area[32768] __attribute__((aligned(32)));
 static int g_card_mounted = 0;
+
+static size_t align32(size_t value) {
+  return (value + 31u) & ~(size_t)31u;
+}
 
 int sgm_card_init(void) {
   CARD_Init("", "");
@@ -73,8 +78,9 @@ int sgm_card_list_local_games(int slot, SgmLocalGame* out_games, int max_games) 
     memset(game, 0, sizeof(*game));
 
     game->fileno = (int)dirs[i].fileno;
-    snprintf(game->filename, sizeof(game->filename), "%s", dirs[i].filename);
-    snprintf(game->display_title, sizeof(game->display_title), "%s", dirs[i].filename);
+    snprintf(game->filename, sizeof(game->filename), "%.*s", CARD_FILENAMELEN, dirs[i].filename);
+    snprintf(game->display_title, sizeof(game->display_title), "%.*s", CARD_FILENAMELEN,
+             dirs[i].filename);
 
     memcpy(game->gamecode, dirs[i].gamecode, 4);
     game->gamecode[4] = '\0';
@@ -116,19 +122,31 @@ int sgm_card_export_gci(int slot, int fileno, SgmBlob* out_blob, SgmLocalGame* o
   }
 
   size_t payload_len = (size_t)file.len;
+  size_t payload_aligned = align32(payload_len > 0 ? payload_len : 32);
+  unsigned char* payload = (unsigned char*)memalign(32, payload_aligned);
+  if (!payload) {
+    CARD_Close(&file);
+    return -1;
+  }
+  memset(payload, 0, payload_aligned);
+
+  if (CARD_Read(&file, payload, (u32)payload_len, 0) < 0) {
+    free(payload);
+    CARD_Close(&file);
+    return -1;
+  }
+
   size_t total_len = sizeof(card_direntry) + payload_len;
   unsigned char* gci = (unsigned char*)malloc(total_len);
   if (!gci) {
+    free(payload);
     CARD_Close(&file);
     return -1;
   }
 
   memcpy(gci, &entry, sizeof(card_direntry));
-  if (CARD_Read(&file, gci + sizeof(card_direntry), (u32)payload_len, 0) < 0) {
-    free(gci);
-    CARD_Close(&file);
-    return -1;
-  }
+  memcpy(gci + sizeof(card_direntry), payload, payload_len);
+  free(payload);
 
   CARD_Close(&file);
 
@@ -138,8 +156,9 @@ int sgm_card_export_gci(int slot, int fileno, SgmBlob* out_blob, SgmLocalGame* o
   if (out_meta) {
     memset(out_meta, 0, sizeof(*out_meta));
     out_meta->fileno = fileno;
-    snprintf(out_meta->filename, sizeof(out_meta->filename), "%s", dir.filename);
-    snprintf(out_meta->display_title, sizeof(out_meta->display_title), "%s", dir.filename);
+    snprintf(out_meta->filename, sizeof(out_meta->filename), "%.*s", CARD_FILENAMELEN, dir.filename);
+    snprintf(out_meta->display_title, sizeof(out_meta->display_title), "%.*s",
+             CARD_FILENAMELEN, dir.filename);
     memcpy(out_meta->gamecode, dir.gamecode, 4);
     out_meta->gamecode[4] = '\0';
     memcpy(out_meta->company, dir.company, 2);
@@ -192,7 +211,7 @@ int sgm_card_has_matching_entry(int slot, const unsigned char* gci_data, size_t 
   }
 
   if (out_name && out_name_size > 0) {
-    snprintf(out_name, out_name_size, "%s", existing.filename);
+    snprintf(out_name, out_name_size, "%.*s", CARD_FILENAMELEN, existing.filename);
   }
   return 1;
 }
@@ -212,7 +231,7 @@ int sgm_card_import_gci(int slot, const unsigned char* gci_data, size_t gci_len,
   int has_existing = find_matching_entry(header, &existing) == 0;
   if (has_existing && !overwrite_existing) {
     if (conflict_name && conflict_name_size > 0) {
-      snprintf(conflict_name, conflict_name_size, "%s", existing.filename);
+      snprintf(conflict_name, conflict_name_size, "%.*s", CARD_FILENAMELEN, existing.filename);
     }
     return 1;
   }
@@ -223,18 +242,39 @@ int sgm_card_import_gci(int slot, const unsigned char* gci_data, size_t gci_len,
     }
   }
 
+  card_dir new_entry;
+  memset(&new_entry, 0, sizeof(new_entry));
+  new_entry.chn = SGM_CARD_SLOT;
+  new_entry.filelen = (u32)payload_len;
+  new_entry.permissions = header->permission;
+  memcpy(new_entry.filename, header->filename, CARD_FILENAMELEN);
+  memcpy(new_entry.gamecode, header->gamecode, sizeof(new_entry.gamecode));
+  memcpy(new_entry.company, header->company, sizeof(new_entry.company));
+  new_entry.showall = true;
+
   card_file file;
-  card_direntry new_entry = *header;
   if (CARD_CreateEntry(SGM_CARD_SLOT, &new_entry, &file) < 0) {
     return -1;
   }
 
-  if (CARD_Write(&file, (void*)payload, (u32)payload_len, 0) < 0) {
+  size_t payload_aligned = align32(payload_len > 0 ? payload_len : 32);
+  unsigned char* write_buffer = (unsigned char*)memalign(32, payload_aligned);
+  if (!write_buffer) {
     CARD_Close(&file);
     return -1;
   }
+  memset(write_buffer, 0, payload_aligned);
+  memcpy(write_buffer, payload, payload_len);
 
-  CARD_SetStatusEx(SGM_CARD_SLOT, file.filenum, &new_entry);
+  if (CARD_Write(&file, write_buffer, (u32)payload_len, 0) < 0) {
+    free(write_buffer);
+    CARD_Close(&file);
+    return -1;
+  }
+  free(write_buffer);
+
+  card_direntry new_status = *header;
+  CARD_SetStatusEx(SGM_CARD_SLOT, file.filenum, &new_status);
   CARD_Close(&file);
 
   return 0;

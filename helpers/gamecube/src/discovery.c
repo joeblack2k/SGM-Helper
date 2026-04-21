@@ -9,6 +9,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#if defined(GAMECUBE_TARGET) || defined(WII_TARGET)
+#include <network.h>
+#define select net_select
+#endif
+
 #include "backend.h"
 #include "platform.h"
 

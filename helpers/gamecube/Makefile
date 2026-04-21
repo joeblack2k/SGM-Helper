@@ -2,23 +2,27 @@ PLATFORM ?= gamecube
 BASE_TARGET := sgm-gamecube-helper
 TARGET := $(BASE_TARGET)
 BUILD := build
+OBJDIR := $(BUILD)/$(PLATFORM)
 SRC_DIR := src
 INCLUDE_DIR := include
 
 SOURCES := $(wildcard $(SRC_DIR)/*.c)
-OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
+OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(OBJDIR)/%.o,$(SOURCES))
 
 CFLAGS_COMMON := -std=c11 -Wall -Wextra -I$(INCLUDE_DIR) -I$(SRC_DIR)
+EXTRA_LIBS :=
 
 ifeq ($(PLATFORM),wii)
 TARGET := sgm-wii-helper
-PLATFORM_DEFINES := -DWII_TARGET -DHW_RVL
+PLATFORM_DEFINES := -DWII_TARGET
 PLATFORM_CFLAGS := -mrvl -mcpu=750 -meabi -mhard-float
 LIBOGC_LIBDIR := wii
+EXTRA_LIBS := -lfat -lwiiuse -lbte
 else ifeq ($(PLATFORM),gamecube)
-PLATFORM_DEFINES := -DGAMECUBE_TARGET -DHW_DOL -DGEKKO
-PLATFORM_CFLAGS := -mcpu=750 -meabi -mhard-float
+PLATFORM_DEFINES := -DGAMECUBE_TARGET
+PLATFORM_CFLAGS := -mogc -mcpu=750 -meabi -mhard-float
 LIBOGC_LIBDIR := cube
+EXTRA_LIBS := -lfat -ldb -lbba
 else
 $(error Unsupported PLATFORM '$(PLATFORM)'. Use PLATFORM=gamecube or PLATFORM=wii)
 endif
@@ -27,11 +31,12 @@ endif
 
 all: $(BUILD)/$(TARGET).dol
 
-$(BUILD):
+$(OBJDIR):
+	@mkdir -p $(OBJDIR)
 	@mkdir -p $(BUILD)
 
 # Console build (devkitPro/libogc)
-$(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
+$(OBJDIR)/%.o: $(SRC_DIR)/%.c | $(OBJDIR)
 	@if [ -z "$(DEVKITPRO)" ] || [ -z "$(DEVKITPPC)" ]; then \
 		echo "DEVKITPRO/DEVKITPPC are required for console build"; \
 		exit 1; \
@@ -41,8 +46,8 @@ $(BUILD)/%.o: $(SRC_DIR)/%.c | $(BUILD)
 		-I$(DEVKITPRO)/libogc/include -c $< -o $@
 
 $(BUILD)/$(TARGET).elf: $(OBJECTS)
-	$(DEVKITPPC)/bin/powerpc-eabi-gcc $^ -o $@ \
-		-L$(DEVKITPRO)/libogc/lib/$(LIBOGC_LIBDIR) -logc -lfat -lm \
+	$(DEVKITPPC)/bin/powerpc-eabi-gcc $(PLATFORM_CFLAGS) $^ -o $@ \
+		-L$(DEVKITPRO)/libogc/lib/$(LIBOGC_LIBDIR) $(EXTRA_LIBS) -logc -lm \
 		-Wl,-Map,$(BUILD)/$(TARGET).map -Wl,--gc-sections
 
 $(BUILD)/$(TARGET).dol: $(BUILD)/$(TARGET).elf
@@ -57,14 +62,16 @@ package-hbc:
 	@echo "Packaged Homebrew Launcher app in $(BUILD)/hbc/sgm-gamecube-helper"
 
 # Host simulation build for local verification of non-hardware logic
-host: $(BUILD)
+host:
+	@mkdir -p $(BUILD)
 	cc $(CFLAGS_COMMON) -DHOST_BUILD $(SOURCES) -o $(BUILD)/$(TARGET)-host
 	@echo "Built $(BUILD)/$(TARGET)-host"
 
 # Host unit tests
 TEST_SOURCES := tests/host/test_main.c tests/host/test_secure_store.c tests/host/test_json_helpers.c $(SRC_DIR)/secure_store.c $(SRC_DIR)/json_helpers.c
 
-test-host: $(BUILD)
+test-host:
+	@mkdir -p $(BUILD)
 	cc -std=c11 -Wall -Wextra -I$(INCLUDE_DIR) -I$(SRC_DIR) $(TEST_SOURCES) -o $(BUILD)/host-tests
 	$(BUILD)/host-tests
 

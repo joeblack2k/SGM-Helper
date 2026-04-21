@@ -100,14 +100,20 @@ static int acquire_password(Session* session) {
 
   while (1) {
     char entered[16] = {0};
+    char normalized[8] = {0};
     if (sgm_ui_prompt_password(entered, sizeof(entered)) != 0) {
       return -1;
     }
 
-    if (sgm_backend_validate_password(&session->server, entered, session->fingerprint,
+    if (sgm_password_normalize(entered, normalized, sizeof(normalized)) != 0) {
+      sgm_ui_show_status("Invalid password", "Use format ABC123 or ABC-123", 1);
+      continue;
+    }
+
+    if (sgm_backend_validate_password(&session->server, normalized, session->fingerprint,
                                       error, sizeof(error)) == 0) {
-      snprintf(session->compact_password, sizeof(session->compact_password), "%s", entered);
-      sgm_secure_store_save_password(SGM_SECURE_STORE_PATH, session->fingerprint, entered);
+      snprintf(session->compact_password, sizeof(session->compact_password), "%s", normalized);
+      sgm_secure_store_save_password(SGM_SECURE_STORE_PATH, session->fingerprint, normalized);
       return 0;
     }
 
