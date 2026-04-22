@@ -42,6 +42,8 @@ Validation is strict. Files are not accepted by extension alone. Scanner checks 
 - console/path hints
 - PS1 container validation and conversion (`raw`, `.gme`, `.vmp`)
 - PS2 memory card header validation
+- Dreamcast VMU/DCI/VMS validation and metadata extraction (entries/icons/title/app)
+- Dreamcast NVRAM blob rejection (`dc_nvmem.bin`)
 
 PlayStation helper contract:
 
@@ -65,6 +67,7 @@ Supported console families in strict classification:
 
 - Nintendo
 - Sega
+- Dreamcast
 - NeoGeo
 - Sony (PS1, PS2, PSP, PS3, PS Vita, PS4, PS5)
 

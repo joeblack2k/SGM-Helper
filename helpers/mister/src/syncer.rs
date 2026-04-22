@@ -328,6 +328,12 @@ fn process_single_save(
             device_type,
             &effective_slot_name,
         ))
+    } else if is_dreamcast_system(&system_slug) {
+        Some(dreamcast_line_key(
+            &system_slug,
+            device_type,
+            &effective_slot_name,
+        ))
     } else {
         None
     };
@@ -765,6 +771,10 @@ fn is_playstation_system(system_slug: &str) -> bool {
     matches!(system_slug, "psx" | "ps2")
 }
 
+fn is_dreamcast_system(system_slug: &str) -> bool {
+    system_slug == "dreamcast"
+}
+
 fn helper_device_type_for_upload(
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
@@ -799,14 +809,21 @@ fn resolve_slot_name_for_sync(
     save_path: &Path,
     configured_slot: &str,
 ) -> String {
-    if !is_playstation_system(system_slug) {
-        return configured_slot.to_string();
+    if is_playstation_system(system_slug) {
+        if let Some(slot) = parse_playstation_slot(configured_slot) {
+            return slot;
+        }
+        return infer_playstation_slot_from_path(save_path);
     }
 
-    if let Some(slot) = parse_playstation_slot(configured_slot) {
-        return slot;
+    if is_dreamcast_system(system_slug) {
+        if let Some(slot) = parse_dreamcast_slot(configured_slot) {
+            return slot;
+        }
+        return infer_dreamcast_slot_from_path(save_path);
     }
-    infer_playstation_slot_from_path(save_path)
+
+    configured_slot.to_string()
 }
 
 fn parse_playstation_slot(value: &str) -> Option<String> {
@@ -849,6 +866,27 @@ fn infer_playstation_slot_from_path(path: &Path) -> String {
     parse_playstation_slot(&text).unwrap_or_else(|| "Memory Card 1".to_string())
 }
 
+fn parse_dreamcast_slot(value: &str) -> Option<String> {
+    let upper = value.trim().to_ascii_uppercase();
+    if upper.is_empty() || upper == "DEFAULT" {
+        return None;
+    }
+    for bank in ['A', 'B', 'C', 'D'] {
+        for slot in ['1', '2', '3', '4'] {
+            let needle = format!("{bank}{slot}");
+            if upper.contains(&needle) {
+                return Some(needle);
+            }
+        }
+    }
+    None
+}
+
+fn infer_dreamcast_slot_from_path(path: &Path) -> String {
+    let text = path.to_string_lossy().to_ascii_uppercase();
+    parse_dreamcast_slot(&text).unwrap_or_else(|| "A1".to_string())
+}
+
 fn playstation_line_key(system_slug: &str, device_type: &str, slot_name: &str) -> String {
     let normalized_slot = slot_name
         .trim()
@@ -858,6 +896,15 @@ fn playstation_line_key(system_slug: &str, device_type: &str, slot_name: &str) -
     format!(
         "ps-line:{}:{}:{}",
         system_slug, device_type, normalized_slot
+    )
+}
+
+fn dreamcast_line_key(system_slug: &str, device_type: &str, slot_name: &str) -> String {
+    format!(
+        "dc-line:{}:{}:{}",
+        system_slug,
+        device_type,
+        slot_name.trim().to_ascii_lowercase()
     )
 }
 
@@ -1227,6 +1274,34 @@ mod tests {
         assert_eq!(
             infer_playstation_slot_from_path(Path::new("/games/ps2/custom.ps2")),
             "Memory Card 1".to_string()
+        );
+    }
+
+    #[test]
+    fn resolves_dreamcast_slot_from_path() {
+        assert_eq!(
+            resolve_slot_name_for_sync(
+                "dreamcast",
+                Path::new("/userdata/saves/dreamcast/Sonic Adventure 2.A3.bin"),
+                "default",
+            ),
+            "A3"
+        );
+        assert_eq!(
+            resolve_slot_name_for_sync(
+                "dreamcast",
+                Path::new("/userdata/saves/dreamcast/unknown.bin"),
+                "default",
+            ),
+            "A1"
+        );
+    }
+
+    #[test]
+    fn dreamcast_line_key_uses_slot_and_device() {
+        assert_eq!(
+            dreamcast_line_key("dreamcast", "retroarch", "A2"),
+            "dc-line:dreamcast:retroarch:a2"
         );
     }
 }

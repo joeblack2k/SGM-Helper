@@ -6,6 +6,11 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Dreamcast scanner support across MiSTer, Steam Deck, and Windows helpers:
+- accepts VMU images (`.bin`), VMS packages (`.vms`), and DCI dumps (`.dci`)
+- strict VMU validation (root/FAT/directory chain checks) and NVRAM rejection (`dc_nvmem.bin`)
+- metadata enrichment in detection evidence (container type, entry count, icon frame count, sample title/app)
+- Dreamcast sync identity keys per slot/device (`dc-line:<system>:<device_type>:<slot>`) for deterministic cross-device sync.
 - New Swiss-startable GameCube helper module at `helpers/gamecube` implemented in C + libogc.
 - Wii Homebrew Launcher compatibility for the same helper module (`PLATFORM=wii` build and HBC package target).
 - GameCube UI flow with server discovery, password prompt, `Save per game`, and `Restore from backend`.
@@ -27,6 +32,7 @@ All notable changes to this project are documented in this file.
 
 ### Changed
 
+- Dreamcast slot detection now resolves from configured slot or path hints (`A1`..`D4`) with `A1` fallback.
 - N64 extension preference now respects MiSTer-native save types by payload size:
 - `.eep` for 512/2048-byte EEPROM saves
 - `.sra` for 32KB SRAM saves
@@ -40,6 +46,10 @@ All notable changes to this project are documented in this file.
 - runtime-based `device_type` mapping (`mister`/`retroarch` for PS1, `pcsx2` for PS2)
 - slot resolution to `Memory Card 1/2` from config/path hints
 - deterministic PS line keys (`ps-line:<system>:<device_type>:<slot>`) instead of ROM-lookup fallback
+
+### Notes
+
+- Backend must explicitly accept Dreamcast payloads; helper-side detection/validation is now in place, but unsupported backend validators return `422`.
 
 ## [0.3.1] - 2026-04-21
 

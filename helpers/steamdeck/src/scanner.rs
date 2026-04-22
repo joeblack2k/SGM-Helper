@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "dsv", "gme", "mcr", "mc", "mcd",
-    "vmp", "psv", "ps2", "bin",
+    "vmp", "psv", "ps2", "bin", "vms", "dci",
 ];
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -42,10 +42,22 @@ const PS1_PSP_VMP_SALT_SEED_INIT: [u8; 20] = [
 ];
 
 const PS2_MEMCARD_MAGIC: &[u8] = b"Sony PS2 Memory Card Format ";
+const DC_BLOCK_SIZE: usize = 512;
+const DC_VMU_BLOCK_COUNT: usize = 256;
+const DC_VMU_SIZE: usize = DC_BLOCK_SIZE * DC_VMU_BLOCK_COUNT;
+const DC_ROOT_BLOCK: usize = 255;
+const DC_DIR_ENTRY_SIZE: usize = 32;
+const DC_DCI_HEADER_SIZE: usize = 32;
+const DC_FILETYPE_DATA: u8 = 0x33;
+const DC_FILETYPE_GAME: u8 = 0xCC;
+const DC_FAT_FREE: u16 = 0xFFFC;
+const DC_FAT_END: u16 = 0xFFFA;
+const DC_NVMEM_MAGIC: &[u8] = b"KATANA_FLASH____";
 
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "sms",
-    "gg", "cue", "iso", "chd", "pce", "a26", "a78", "col", "bin", "zip", "7z", "pbp", "cso", "vpk",
+    "gg", "cue", "iso", "chd", "gdi", "cdi", "pce", "a26", "a78", "col", "bin", "zip", "7z", "pbp",
+    "cso", "vpk",
 ];
 
 #[derive(Debug, Clone)]
@@ -194,6 +206,22 @@ pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -
 pub struct SaveClassification {
     pub system_slug: String,
     pub evidence: String,
+}
+
+#[derive(Debug, Clone)]
+struct DreamcastPkgHeader {
+    short_desc: String,
+    app_id: String,
+    icon_count: u16,
+}
+
+#[derive(Debug, Clone)]
+struct DreamcastMetadata {
+    container: &'static str,
+    save_entries: usize,
+    icon_frames: usize,
+    sample_title: Option<String>,
+    sample_app: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,10 +556,20 @@ fn classify_if_valid(
     save_ext: &str,
     save_size: u64,
     slug: &str,
-    evidence: String,
+    mut evidence: String,
 ) -> Option<SaveClassification> {
     if !passes_binary_validation(save_path, save_ext, save_size, slug) {
         return None;
+    }
+    if slug == "dreamcast"
+        && let Some(metadata) = inspect_dreamcast_metadata(save_path, save_ext)
+    {
+        let title = metadata.sample_title.unwrap_or_else(|| "-".to_string());
+        let app = metadata.sample_app.unwrap_or_else(|| "-".to_string());
+        evidence = format!(
+            "{} [{} entries={} icons={} title={} app={}]",
+            evidence, metadata.container, metadata.save_entries, metadata.icon_frames, title, app
+        );
     }
     Some(SaveClassification {
         system_slug: slug.to_string(),
@@ -556,6 +594,7 @@ fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
         "md" | "gen" => Some("genesis"),
         "sms" => Some("master-system"),
         "gg" => Some("game-gear"),
+        "gdi" | "cdi" => Some("dreamcast"),
         "pbp" | "cso" => Some("psp"),
         "vpk" => Some("psvita"),
         _ => None,
@@ -589,6 +628,23 @@ fn infer_nintendo_slug(haystack: &str) -> &'static str {
 }
 
 fn infer_sega_slug(haystack: &str) -> &'static str {
+    if contains_any(
+        haystack,
+        &[
+            "dreamcast",
+            "/dreamcast/",
+            "\\dreamcast\\",
+            "/dc/",
+            "\\dc\\",
+            "flycast",
+            "redream",
+            "demul",
+            "reicast",
+            "vmu",
+        ],
+    ) {
+        return "dreamcast";
+    }
     if contains_any(haystack, &["master system", "/sms/", "\\sms\\"]) {
         return "master-system";
     }
@@ -674,6 +730,7 @@ fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
         "dsv" => Some("nds"),
         "mcr" | "mc" | "mcd" | "vmp" | "psv" => Some("psx"),
         "ps2" | "bin" => Some("ps2"),
+        "vms" | "dci" => Some("dreamcast"),
         _ => None,
     }
 }
@@ -696,6 +753,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "nds" => matches!(ext, "sav" | "dsv"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" => matches!(ext, "sav" | "srm" | "ram"),
+        "dreamcast" => matches!(ext, "bin" | "vms" | "dci"),
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
         "psx" => matches!(
             ext,
@@ -741,6 +799,18 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
                 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
             )
         }
+        "dreamcast" => {
+            if ext == "bin" {
+                size as usize == DC_VMU_SIZE
+            } else if ext == "dci" {
+                (DC_DCI_HEADER_SIZE + DC_BLOCK_SIZE) as u64 <= size
+                    && size <= (DC_DCI_HEADER_SIZE + DC_VMU_SIZE) as u64
+                    && (size as usize - DC_DCI_HEADER_SIZE).is_multiple_of(DC_BLOCK_SIZE)
+            } else {
+                (DC_BLOCK_SIZE as u64..=DC_VMU_SIZE as u64).contains(&size)
+                    && size.is_multiple_of(DC_BLOCK_SIZE as u64)
+            }
+        }
         "neogeo" => size.is_power_of_two() && (512..=2_097_152).contains(&size),
         "psx" => {
             let size = size as usize;
@@ -761,6 +831,7 @@ fn passes_binary_validation(save_path: &Path, save_ext: &str, _save_size: u64, s
     }
 
     match slug {
+        "dreamcast" => validate_dreamcast_container(save_path, save_ext),
         "psx" => validate_psx_container(save_path, save_ext),
         "ps2" => validate_ps2_memory_card_image(save_path),
         _ => true,
@@ -800,6 +871,330 @@ fn validate_ps2_memory_card_image(path: &Path) -> bool {
         return false;
     }
     magic == PS2_MEMCARD_MAGIC
+}
+
+fn validate_dreamcast_container(path: &Path, ext: &str) -> bool {
+    inspect_dreamcast_metadata(path, ext).is_some()
+}
+
+fn inspect_dreamcast_metadata(path: &Path, ext: &str) -> Option<DreamcastMetadata> {
+    let bytes = std::fs::read(path).ok()?;
+    match ext {
+        "bin" => inspect_dreamcast_vmu_image(&bytes),
+        "vms" => inspect_dreamcast_vms_payload(&bytes),
+        "dci" => inspect_dreamcast_dci_payload(&bytes),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DreamcastRoot {
+    fat_loc: u16,
+    fat_size: u16,
+    dir_loc: u16,
+    dir_size: u16,
+    user_blocks: u16,
+}
+
+#[derive(Debug, Clone)]
+struct DreamcastDirEntry {
+    file_type: u8,
+    first_block: u16,
+    file_size_blocks: u16,
+    header_offset_blocks: u16,
+}
+
+fn inspect_dreamcast_vmu_image(bytes: &[u8]) -> Option<DreamcastMetadata> {
+    if bytes.len() != DC_VMU_SIZE || bytes.starts_with(DC_NVMEM_MAGIC) {
+        return None;
+    }
+
+    let root = parse_dreamcast_root(bytes)?;
+    let fat = parse_dreamcast_fat(bytes, root)?;
+    let directory_blocks = collect_dreamcast_block_chain(
+        root.dir_loc as usize,
+        root.dir_size as usize,
+        &fat,
+        root.user_blocks as usize + root.dir_size as usize + root.fat_size as usize + 4,
+    )?;
+
+    let mut save_entries = 0usize;
+    let mut icon_frames = 0usize;
+    let mut sample_title: Option<String> = None;
+    let mut sample_app: Option<String> = None;
+
+    for block in directory_blocks {
+        let start = block.checked_mul(DC_BLOCK_SIZE)?;
+        let end = start.checked_add(DC_BLOCK_SIZE)?;
+        if end > bytes.len() {
+            return None;
+        }
+        for chunk in bytes[start..end].chunks_exact(DC_DIR_ENTRY_SIZE) {
+            let entry = parse_dreamcast_dir_entry(chunk)?;
+            if entry.file_type != DC_FILETYPE_DATA && entry.file_type != DC_FILETYPE_GAME {
+                continue;
+            }
+            save_entries += 1;
+            let file_bytes = collect_dreamcast_file_bytes(bytes, &fat, &entry)?;
+            let header_offset = entry.header_offset_blocks as usize * DC_BLOCK_SIZE;
+            if header_offset >= file_bytes.len() {
+                continue;
+            }
+            if let Some(header) = parse_dreamcast_pkg_header(&file_bytes[header_offset..]) {
+                icon_frames += header.icon_count as usize;
+                if sample_title.is_none() && !header.short_desc.is_empty() {
+                    sample_title = Some(header.short_desc);
+                }
+                if sample_app.is_none() && !header.app_id.is_empty() {
+                    sample_app = Some(header.app_id);
+                }
+            }
+        }
+    }
+
+    Some(DreamcastMetadata {
+        container: "vmu-bin",
+        save_entries,
+        icon_frames,
+        sample_title,
+        sample_app,
+    })
+}
+
+fn inspect_dreamcast_vms_payload(bytes: &[u8]) -> Option<DreamcastMetadata> {
+    let header = parse_dreamcast_pkg_header(bytes)?;
+    Some(DreamcastMetadata {
+        container: "vms",
+        save_entries: 1,
+        icon_frames: header.icon_count as usize,
+        sample_title: (!header.short_desc.is_empty()).then_some(header.short_desc),
+        sample_app: (!header.app_id.is_empty()).then_some(header.app_id),
+    })
+}
+
+fn inspect_dreamcast_dci_payload(bytes: &[u8]) -> Option<DreamcastMetadata> {
+    if bytes.len() < DC_DCI_HEADER_SIZE + DC_BLOCK_SIZE {
+        return None;
+    }
+    let dir_entry = parse_dreamcast_dir_entry(&bytes[..DC_DCI_HEADER_SIZE])?;
+    if dir_entry.file_type != DC_FILETYPE_DATA && dir_entry.file_type != DC_FILETYPE_GAME {
+        return None;
+    }
+    let file_blocks = dir_entry.file_size_blocks as usize;
+    if file_blocks == 0 {
+        return None;
+    }
+    let expected_len = DC_DCI_HEADER_SIZE + file_blocks * DC_BLOCK_SIZE;
+    if bytes.len() < expected_len {
+        return None;
+    }
+    let mut file_bytes = Vec::with_capacity(file_blocks * DC_BLOCK_SIZE);
+    for block in bytes[DC_DCI_HEADER_SIZE..expected_len].chunks_exact(DC_BLOCK_SIZE) {
+        file_bytes.extend_from_slice(&dreamcast_unswap_32bit_chunks(block));
+    }
+
+    let header_offset = dir_entry.header_offset_blocks as usize * DC_BLOCK_SIZE;
+    if header_offset >= file_bytes.len() {
+        return None;
+    }
+    let header = parse_dreamcast_pkg_header(&file_bytes[header_offset..])?;
+    Some(DreamcastMetadata {
+        container: "dci",
+        save_entries: 1,
+        icon_frames: header.icon_count as usize,
+        sample_title: (!header.short_desc.is_empty()).then_some(header.short_desc),
+        sample_app: (!header.app_id.is_empty()).then_some(header.app_id),
+    })
+}
+
+fn parse_dreamcast_root(bytes: &[u8]) -> Option<DreamcastRoot> {
+    if bytes.len() != DC_VMU_SIZE {
+        return None;
+    }
+    let root_start = DC_ROOT_BLOCK * DC_BLOCK_SIZE;
+    let root_end = root_start + DC_BLOCK_SIZE;
+    let root = bytes.get(root_start..root_end)?;
+    if !root[..16].iter().all(|value| *value == 0x55) {
+        return None;
+    }
+
+    let fat_loc = le_u16(root, 0x46)?;
+    let fat_size = le_u16(root, 0x48)?;
+    let dir_loc = le_u16(root, 0x4A)?;
+    let dir_size = le_u16(root, 0x4C)?;
+    let user_blocks = le_u16(root, 0x50)?;
+
+    if fat_size == 0 || dir_size == 0 || fat_loc as usize >= DC_VMU_BLOCK_COUNT {
+        return None;
+    }
+    if dir_loc as usize >= DC_VMU_BLOCK_COUNT || user_blocks == 0 || user_blocks > 200 {
+        return None;
+    }
+
+    Some(DreamcastRoot {
+        fat_loc,
+        fat_size,
+        dir_loc,
+        dir_size,
+        user_blocks,
+    })
+}
+
+fn parse_dreamcast_fat(bytes: &[u8], root: DreamcastRoot) -> Option<Vec<u16>> {
+    let fat_start = root.fat_loc as usize * DC_BLOCK_SIZE;
+    let fat_len = root.fat_size as usize * DC_BLOCK_SIZE;
+    let fat_end = fat_start.checked_add(fat_len)?;
+    let fat_bytes = bytes.get(fat_start..fat_end)?;
+    if fat_bytes.len() < DC_VMU_BLOCK_COUNT * 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(DC_VMU_BLOCK_COUNT);
+    for index in 0..DC_VMU_BLOCK_COUNT {
+        out.push(le_u16(fat_bytes, index * 2)?);
+    }
+    Some(out)
+}
+
+fn parse_dreamcast_dir_entry(bytes: &[u8]) -> Option<DreamcastDirEntry> {
+    if bytes.len() != DC_DIR_ENTRY_SIZE {
+        return None;
+    }
+    let file_type = bytes[0];
+    if file_type == 0 {
+        return Some(DreamcastDirEntry {
+            file_type,
+            first_block: 0,
+            file_size_blocks: 0,
+            header_offset_blocks: 0,
+        });
+    }
+
+    let first_block = le_u16(bytes, 0x02)?;
+    let file_size_blocks = le_u16(bytes, 0x18)?;
+    let header_offset_blocks = le_u16(bytes, 0x1A)?;
+    if first_block as usize >= DC_VMU_BLOCK_COUNT || file_size_blocks == 0 {
+        return None;
+    }
+    if header_offset_blocks > file_size_blocks {
+        return None;
+    }
+
+    Some(DreamcastDirEntry {
+        file_type,
+        first_block,
+        file_size_blocks,
+        header_offset_blocks,
+    })
+}
+
+fn collect_dreamcast_file_bytes(
+    bytes: &[u8],
+    fat: &[u16],
+    entry: &DreamcastDirEntry,
+) -> Option<Vec<u8>> {
+    let chain = collect_dreamcast_block_chain(
+        entry.first_block as usize,
+        entry.file_size_blocks as usize,
+        fat,
+        entry.file_size_blocks as usize + 2,
+    )?;
+    if chain.is_empty() || chain.len() > entry.file_size_blocks as usize {
+        return None;
+    }
+
+    let mut file_bytes = Vec::with_capacity(chain.len() * DC_BLOCK_SIZE);
+    for block in chain {
+        if block >= 200 {
+            return None;
+        }
+        let start = block.checked_mul(DC_BLOCK_SIZE)?;
+        let end = start.checked_add(DC_BLOCK_SIZE)?;
+        file_bytes.extend_from_slice(bytes.get(start..end)?);
+    }
+    Some(file_bytes)
+}
+
+fn collect_dreamcast_block_chain(
+    start_block: usize,
+    expected_blocks: usize,
+    fat: &[u16],
+    hard_limit: usize,
+) -> Option<Vec<usize>> {
+    if start_block >= fat.len() || expected_blocks == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(expected_blocks);
+    let mut seen = [false; DC_VMU_BLOCK_COUNT];
+    let mut current = start_block;
+
+    while out.len() < hard_limit && current < fat.len() {
+        if current >= DC_VMU_BLOCK_COUNT || seen[current] {
+            return None;
+        }
+        seen[current] = true;
+        out.push(current);
+        if out.len() >= expected_blocks {
+            break;
+        }
+        let next = fat[current];
+        if next == DC_FAT_END {
+            break;
+        }
+        if next == DC_FAT_FREE {
+            return None;
+        }
+        current = next as usize;
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn parse_dreamcast_pkg_header(bytes: &[u8]) -> Option<DreamcastPkgHeader> {
+    if bytes.len() < 0x80 {
+        return None;
+    }
+    let short_desc = decode_printable_ascii(&bytes[0x00..0x10]);
+    let app_id = decode_printable_ascii(&bytes[0x30..0x40]);
+    let icon_count = le_u16(bytes, 0x40)?;
+    if icon_count > 16 {
+        return None;
+    }
+    let expected_min = 0x80usize.checked_add(icon_count as usize * 512)?;
+    if expected_min > bytes.len() {
+        return None;
+    }
+    Some(DreamcastPkgHeader {
+        short_desc,
+        app_id,
+        icon_count,
+    })
+}
+
+fn dreamcast_unswap_32bit_chunks(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    for chunk in out.chunks_exact_mut(4) {
+        chunk.reverse();
+    }
+    out
+}
+
+fn le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let a = *bytes.get(offset)?;
+    let b = *bytes.get(offset + 1)?;
+    Some(u16::from_le_bytes([a, b]))
+}
+
+fn decode_printable_ascii(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for value in bytes {
+        if *value == 0 {
+            break;
+        }
+        if (0x20..=0x7e).contains(value) {
+            out.push(*value as char);
+        }
+    }
+    out.trim().to_string()
 }
 
 fn validate_psx_container(path: &Path, ext: &str) -> bool {
@@ -1069,6 +1464,68 @@ mod tests {
         file.set_len(8 * 1024 * 1024).unwrap();
     }
 
+    fn build_dreamcast_vmu_with_single_save() -> Vec<u8> {
+        let mut bytes = vec![0u8; DC_VMU_SIZE];
+
+        let root_offset = DC_ROOT_BLOCK * DC_BLOCK_SIZE;
+        bytes[root_offset..root_offset + 16].fill(0x55);
+        bytes[root_offset + 0x46..root_offset + 0x48].copy_from_slice(&(254u16).to_le_bytes());
+        bytes[root_offset + 0x48..root_offset + 0x4A].copy_from_slice(&(1u16).to_le_bytes());
+        bytes[root_offset + 0x4A..root_offset + 0x4C].copy_from_slice(&(253u16).to_le_bytes());
+        bytes[root_offset + 0x4C..root_offset + 0x4E].copy_from_slice(&(13u16).to_le_bytes());
+        bytes[root_offset + 0x50..root_offset + 0x52].copy_from_slice(&(200u16).to_le_bytes());
+
+        let fat_offset = 254 * DC_BLOCK_SIZE;
+        for block in 0..DC_VMU_BLOCK_COUNT {
+            let offset = fat_offset + block * 2;
+            bytes[offset..offset + 2].copy_from_slice(&DC_FAT_FREE.to_le_bytes());
+        }
+
+        for block in (241..=253).rev() {
+            let value = if block == 241 {
+                DC_FAT_END
+            } else {
+                (block - 1) as u16
+            };
+            let offset = fat_offset + block * 2;
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        for block in [254usize, 255] {
+            let offset = fat_offset + block * 2;
+            bytes[offset..offset + 2].copy_from_slice(&DC_FAT_END.to_le_bytes());
+        }
+        let save_block = 10usize;
+        let next_save_block = 11usize;
+        let offset = fat_offset + save_block * 2;
+        bytes[offset..offset + 2].copy_from_slice(&(next_save_block as u16).to_le_bytes());
+        let next_offset = fat_offset + next_save_block * 2;
+        bytes[next_offset..next_offset + 2].copy_from_slice(&DC_FAT_END.to_le_bytes());
+
+        let dir_offset = 253 * DC_BLOCK_SIZE;
+        bytes[dir_offset] = DC_FILETYPE_DATA;
+        bytes[dir_offset + 1] = 0x00;
+        bytes[dir_offset + 2..dir_offset + 4].copy_from_slice(&(save_block as u16).to_le_bytes());
+        let mut filename = [0u8; 12];
+        filename[..9].copy_from_slice(b"SONICADV2");
+        bytes[dir_offset + 4..dir_offset + 16].copy_from_slice(&filename);
+        bytes[dir_offset + 0x18..dir_offset + 0x1A].copy_from_slice(&(2u16).to_le_bytes());
+        bytes[dir_offset + 0x1A..dir_offset + 0x1C].copy_from_slice(&(0u16).to_le_bytes());
+
+        let save_offset = save_block * DC_BLOCK_SIZE;
+        let mut short = [0u8; 16];
+        short[..10].copy_from_slice(b"SONIC ADV2");
+        bytes[save_offset..save_offset + 16].copy_from_slice(&short);
+        let mut app = [0u8; 16];
+        app[..7].copy_from_slice(b"FLYCAST");
+        bytes[save_offset + 0x30..save_offset + 0x40].copy_from_slice(&app);
+        bytes[save_offset + 0x40..save_offset + 0x42].copy_from_slice(&(1u16).to_le_bytes());
+        bytes[save_offset + 0x42..save_offset + 0x44].copy_from_slice(&(8u16).to_le_bytes());
+        bytes[save_offset + 0x44..save_offset + 0x46].copy_from_slice(&(0u16).to_le_bytes());
+        bytes[save_offset + 0x48..save_offset + 0x4C].copy_from_slice(&(64u32).to_le_bytes());
+
+        bytes
+    }
+
     #[test]
     fn scanner_finds_supported_save_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1148,6 +1605,32 @@ mod tests {
             infer_supported_console_slug(&save, None).as_deref(),
             Some("ps2")
         );
+    }
+
+    #[test]
+    fn dreamcast_vmu_path_hints_are_supported_and_enriched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Emulation/saves/dreamcast/Sonic Adventure 2.A1.bin");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, build_dreamcast_vmu_with_single_save()).unwrap();
+
+        let classification = classify_supported_save(&save, None).expect("expected classification");
+        assert_eq!(classification.system_slug, "dreamcast");
+        assert!(classification.evidence.contains("vmu-bin"));
+        assert!(classification.evidence.contains("icons=1"));
+        assert!(classification.evidence.contains("title=SONIC ADV2"));
+    }
+
+    #[test]
+    fn dreamcast_nvmem_blob_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Emulation/saves/dreamcast/dc_nvmem.bin");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let mut bytes = vec![0u8; DC_VMU_SIZE];
+        bytes[..DC_NVMEM_MAGIC.len()].copy_from_slice(DC_NVMEM_MAGIC);
+        fs::write(&save, bytes).unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
     }
 
     #[test]
