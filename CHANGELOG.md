@@ -11,6 +11,10 @@ All notable changes to this project are documented in this file.
 - strict VMU validation (root/FAT/directory chain checks) and NVRAM rejection (`dc_nvmem.bin`)
 - metadata enrichment in detection evidence (container type, entry count, icon frame count, sample title/app)
 - Dreamcast sync identity keys per slot/device (`dc-line:<system>:<device_type>:<slot>`) for deterministic cross-device sync.
+- Sega expansion in strict scanner support:
+- Saturn save detection (`.bkr/.sav/.srm/.ram`) with emulator/path hints (`saturn`, `yabasanshiro`, `beetle saturn`, etc.)
+- Mega-CD and 32X detection with dedicated slugs (`sega-cd`, `sega-32x`)
+- ROM extension mapping for `.32x` in ROM-index assisted classification.
 - New Swiss-startable GameCube helper module at `helpers/gamecube` implemented in C + libogc.
 - Wii Homebrew Launcher compatibility for the same helper module (`PLATFORM=wii` build and HBC package target).
 - GameCube UI flow with server discovery, password prompt, `Save per game`, and `Restore from backend`.
@@ -33,6 +37,8 @@ All notable changes to this project are documented in this file.
 ### Changed
 
 - Dreamcast slot detection now resolves from configured slot or path hints (`A1`..`D4`) with `A1` fallback.
+- Cartridge-style extension policy now also covers `sega-cd` and `sega-32x` profiles (`.sav` on MiSTer profile, `.srm` on RetroArch-like profiles).
+- Saturn keeps native extension by default (no forced restore rewrite), allowing `.bkr`-style workflows to remain stable.
 - N64 extension preference now respects MiSTer-native save types by payload size:
 - `.eep` for 512/2048-byte EEPROM saves
 - `.sra` for 32KB SRAM saves

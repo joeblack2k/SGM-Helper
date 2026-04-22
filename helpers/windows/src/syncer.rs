@@ -995,7 +995,8 @@ fn preferred_extension_for_system(
 ) -> Option<&'static str> {
     match system_slug {
         "nes" | "snes" | "gameboy" | "gba" | "genesis" | "master-system" | "game-gear"
-        | "neogeo" => preferred_extension_for_cartridge(source_profile),
+        | "sega-cd" | "sega-32x" | "neogeo" => preferred_extension_for_cartridge(source_profile),
+        "saturn" => None,
         "n64" => preferred_extension_for_n64(source_kind, source_profile, save_size),
         "nds" | "psp" | "psvita" | "ps3" | "ps4" | "ps5" => Some("sav"),
         "ps2" => Some("ps2"),
@@ -1243,6 +1244,41 @@ mod tests {
                 Some(32_768)
             ),
             Some("sra")
+        );
+    }
+
+    #[test]
+    fn prefers_cartridge_mapping_for_sega_cd_and_32x() {
+        assert_eq!(
+            preferred_extension_for_system(
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                "sega-cd",
+                Some(8192)
+            ),
+            Some("srm")
+        );
+        assert_eq!(
+            preferred_extension_for_system(
+                &SourceKind::MisterFpga,
+                &EmulatorProfile::Mister,
+                "sega-32x",
+                Some(8192)
+            ),
+            Some("sav")
+        );
+    }
+
+    #[test]
+    fn saturn_keeps_native_extension_without_forced_rewrite() {
+        assert_eq!(
+            preferred_extension_for_system(
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                "saturn",
+                Some(32768)
+            ),
+            None
         );
     }
 

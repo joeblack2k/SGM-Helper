@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "dsv", "gme", "mcr", "mc", "mcd",
-    "vmp", "psv", "ps2", "bin", "vms", "dci",
+    "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
 ];
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -55,9 +55,9 @@ const DC_FAT_END: u16 = 0xFFFA;
 const DC_NVMEM_MAGIC: &[u8] = b"KATANA_FLASH____";
 
 const ROM_EXTENSIONS: &[&str] = &[
-    "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "sms",
-    "gg", "cue", "iso", "chd", "gdi", "cdi", "pce", "a26", "a78", "col", "bin", "zip", "7z", "pbp",
-    "cso", "vpk",
+    "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "32x",
+    "sms", "gg", "cue", "iso", "chd", "gdi", "cdi", "pce", "a26", "a78", "col", "bin", "zip", "7z",
+    "pbp", "cso", "vpk",
 ];
 
 #[derive(Debug, Clone)]
@@ -446,6 +446,25 @@ pub fn classify_supported_save(
             "game gear",
             "/gg/",
             "\\gg\\",
+            "sega 32x",
+            "sega-32x",
+            "sega32x",
+            "/32x/",
+            "\\32x\\",
+            "mega cd",
+            "mega-cd",
+            "megacd",
+            "sega cd",
+            "sega-cd",
+            "segacd",
+            "/megacd/",
+            "\\megacd\\",
+            "/mega-cd/",
+            "\\mega-cd\\",
+            "/segacd/",
+            "\\segacd\\",
+            "/sega-cd/",
+            "\\sega-cd\\",
             "genesis",
             "mega drive",
             "megadrive",
@@ -592,6 +611,7 @@ fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
         "gba" => Some("gba"),
         "nds" => Some("nds"),
         "md" | "gen" => Some("genesis"),
+        "32x" => Some("sega-32x"),
         "sms" => Some("master-system"),
         "gg" => Some("game-gear"),
         "gdi" | "cdi" => Some("dreamcast"),
@@ -650,6 +670,49 @@ fn infer_sega_slug(haystack: &str) -> &'static str {
     }
     if contains_any(haystack, &["game gear", "/gg/", "\\gg\\"]) {
         return "game-gear";
+    }
+    if contains_any(
+        haystack,
+        &[
+            "saturn",
+            "/saturn/",
+            "\\saturn\\",
+            "yabause",
+            "yabasanshiro",
+            "kronos",
+            "ssf",
+            "beetle saturn",
+            "mednafen saturn",
+        ],
+    ) {
+        return "saturn";
+    }
+    if contains_any(
+        haystack,
+        &[
+            "mega cd",
+            "mega-cd",
+            "megacd",
+            "sega cd",
+            "sega-cd",
+            "segacd",
+            "/megacd/",
+            "\\megacd\\",
+            "/mega-cd/",
+            "\\mega-cd\\",
+            "/segacd/",
+            "\\segacd\\",
+            "/sega-cd/",
+            "\\sega-cd\\",
+        ],
+    ) {
+        return "sega-cd";
+    }
+    if contains_any(
+        haystack,
+        &["sega 32x", "sega-32x", "sega32x", "32x", "/32x/", "\\32x\\"],
+    ) {
+        return "sega-32x";
     }
     "genesis"
 }
@@ -752,7 +815,10 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "n64" => matches!(ext, "sav" | "eep" | "fla" | "sra"),
         "nds" => matches!(ext, "sav" | "dsv"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
-        "master-system" | "game-gear" => matches!(ext, "sav" | "srm" | "ram"),
+        "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
+            matches!(ext, "sav" | "srm" | "ram")
+        }
+        "saturn" => matches!(ext, "sav" | "srm" | "ram" | "bkr"),
         "dreamcast" => matches!(ext, "bin" | "vms" | "dci"),
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
         "psx" => matches!(
@@ -793,12 +859,29 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             }
         }
         "nds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
-        "genesis" | "master-system" | "game-gear" => {
+        "genesis" | "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
             matches!(
                 size,
                 64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
             )
         }
+        "saturn" => matches!(
+            size,
+            512 | 1024
+                | 2048
+                | 4096
+                | 8192
+                | 16384
+                | 32768
+                | 65536
+                | 131072
+                | 262144
+                | 524288
+                | 1_048_576
+                | 2_097_152
+                | 4_194_304
+                | 8_388_608
+        ),
         "dreamcast" => {
             if ext == "bin" {
                 size as usize == DC_VMU_SIZE
@@ -1544,15 +1627,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let snes = tmp.path().join("saves/SNES/zelda.srm");
         let sega = tmp.path().join("saves/Sega/sonic.srm");
+        let saturn = tmp.path().join("saves/Saturn/nihts.bkr");
+        let megacd = tmp.path().join("saves/Mega-CD/snatcher.srm");
+        let sega32x = tmp.path().join("saves/32X/doom.srm");
         let psx = tmp.path().join("saves/PSX/ff7.mcr");
         fs::create_dir_all(snes.parent().unwrap()).unwrap();
         fs::create_dir_all(sega.parent().unwrap()).unwrap();
+        fs::create_dir_all(saturn.parent().unwrap()).unwrap();
+        fs::create_dir_all(megacd.parent().unwrap()).unwrap();
+        fs::create_dir_all(sega32x.parent().unwrap()).unwrap();
         fs::create_dir_all(psx.parent().unwrap()).unwrap();
         fs::write(&snes, vec![0x00u8; 8192]).unwrap();
         fs::write(&sega, vec![0x00u8; 8192]).unwrap();
+        fs::write(&saturn, vec![0x00u8; 32768]).unwrap();
+        fs::write(&megacd, vec![0x00u8; 8192]).unwrap();
+        fs::write(&sega32x, vec![0x00u8; 8192]).unwrap();
         fs::write(&psx, build_valid_ps1_memcard()).unwrap();
         assert_eq!(infer_system_slug(&snes).as_deref(), Some("snes"));
         assert_eq!(infer_system_slug(&sega).as_deref(), Some("genesis"));
+        assert_eq!(infer_system_slug(&saturn).as_deref(), Some("saturn"));
+        assert_eq!(infer_system_slug(&megacd).as_deref(), Some("sega-cd"));
+        assert_eq!(infer_system_slug(&sega32x).as_deref(), Some("sega-32x"));
         assert_eq!(infer_system_slug(&psx).as_deref(), Some("psx"));
     }
 
@@ -1571,6 +1666,18 @@ mod tests {
         assert_eq!(
             infer_supported_console_slug(&save, Some(&rom)).as_deref(),
             Some("gameboy")
+        );
+    }
+
+    #[test]
+    fn rom_extension_32x_can_classify_supported_console() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("anything.sav");
+        fs::write(&save, vec![0x00u8; 32768]).unwrap();
+        let rom = PathBuf::from("/roms/sega32x/doom.32x");
+        assert_eq!(
+            infer_supported_console_slug(&save, Some(&rom)).as_deref(),
+            Some("sega-32x")
         );
     }
 

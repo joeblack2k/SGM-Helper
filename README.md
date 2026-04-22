@@ -66,8 +66,7 @@ Extension policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
 Supported console families in strict classification:
 
 - Nintendo
-- Sega
-- Dreamcast
+- Sega (Genesis/Mega Drive, Master System, Game Gear, Mega-CD, 32X, Saturn, Dreamcast)
 - NeoGeo
 - Sony (PS1, PS2, PSP, PS3, PS Vita, PS4, PS5)
 
