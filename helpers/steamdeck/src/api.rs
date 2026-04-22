@@ -300,6 +300,7 @@ impl ApiClient {
         slot_name: &str,
         device_type: &str,
         fingerprint: &str,
+        app_password: Option<&str>,
         system_slug: Option<&str>,
     ) -> Result<UploadSaveResponse> {
         let url = self.url("/saves");
@@ -316,6 +317,11 @@ impl ApiClient {
             && !md5.trim().is_empty()
         {
             form = form.text("rom_md5", md5.to_string());
+        }
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            form = form.text("app_password", app_password.to_string());
         }
         if let Some(system_slug) = system_slug
             && !system_slug.trim().is_empty()
@@ -422,18 +428,24 @@ impl ApiClient {
         local_sha256: &str,
         cloud_sha256: &str,
         device_name: &str,
+        app_password: Option<&str>,
     ) -> Result<ConflictReportResponse> {
         let url = self.url("/conflicts/report");
         let part =
             reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name.to_string());
 
-        let form = reqwest::blocking::multipart::Form::new()
+        let mut form = reqwest::blocking::multipart::Form::new()
             .part("file", part)
             .text("romSha1", rom_sha1.to_string())
             .text("slotName", slot_name.to_string())
             .text("localSha256", local_sha256.to_string())
             .text("cloudSha256", cloud_sha256.to_string())
             .text("deviceName", device_name.to_string());
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            form = form.text("app_password", app_password.to_string());
+        }
 
         let response = self
             .client

@@ -103,6 +103,11 @@ pub fn run_sync(
         options.apply_scan,
         verbose,
     )?;
+    let app_password = if config.app_password.trim().is_empty() {
+        None
+    } else {
+        Some(config.app_password.trim())
+    };
 
     let mut report = SyncReport::default();
     let mut rom_hash_cache: HashMap<String, (String, String)> = HashMap::new();
@@ -155,6 +160,7 @@ pub fn run_sync(
                 &source.profile,
                 &rom_index,
                 &mut rom_hash_cache,
+                app_password,
                 options,
                 &mut report,
                 verbose,
@@ -261,6 +267,7 @@ fn process_single_save(
     source_profile: &EmulatorProfile,
     rom_index: &HashMap<String, RomIndexEntry>,
     rom_hash_cache: &mut HashMap<String, (String, String)>,
+    app_password: Option<&str>,
     options: &SyncOptions,
     report: &mut SyncReport,
     verbose: bool,
@@ -396,6 +403,7 @@ fn process_single_save(
             &effective_slot_name,
             device_type,
             fingerprint,
+            app_password,
             Some(&system_slug),
         )?;
 
@@ -466,6 +474,7 @@ fn process_single_save(
             &effective_slot_name,
             device_type,
             fingerprint,
+            app_password,
             Some(&system_slug),
         )?;
         report.uploaded += 1;
@@ -498,6 +507,7 @@ fn process_single_save(
             &conflict,
             source_name,
             source_kind,
+            app_password,
         )?;
         report.conflicts += 1;
         return Ok(Some(processed_entry(
@@ -748,7 +758,7 @@ fn helper_device_type_for_upload(
     }
 
     match source_kind {
-        SourceKind::MisterFpga => "mister-fpga",
+        SourceKind::MisterFpga => "mister",
         SourceKind::RetroArch => "retroarch",
         SourceKind::Custom => "custom",
         SourceKind::OpenEmu => "openemu",
@@ -970,6 +980,7 @@ fn handle_conflict(
     conflict: &ConflictCheckResponse,
     source_name: &str,
     source_kind: &SourceKind,
+    app_password: Option<&str>,
 ) -> Result<()> {
     if dry_run {
         return Ok(());
@@ -994,6 +1005,7 @@ fn handle_conflict(
         local_sha,
         &cloud_sha,
         &device_name,
+        app_password,
     )?;
 
     Ok(())
