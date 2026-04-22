@@ -83,8 +83,8 @@ Manual PS1 container conversion:
 ./sgm-mister-helper convert --input ./card.mcr --output ./card.gme --from raw --to gme
 ```
 
-PS1 shared/per-game auto-handling:
+PlayStation behavior:
 
-- No manual toggle is required.
-- If ROM matching is missing, helper auto-detects PS1 serials from memory cards and uses fallback sync keys.
-- For multi-game cards, helper uploads serial aliases to improve cross-frontend compatibility.
+- Helper always uploads full memory cards (no local entry extraction/merge).
+- PS1 uploads use `device_type=mister`; PS2 uploads use `device_type=pcsx2`.
+- Slot is resolved to `Memory Card 1` or `Memory Card 2` from `--slot-name` or filename/path hints (`memory_card_1`, `Mcd001.ps2`), defaulting to `Memory Card 1`.

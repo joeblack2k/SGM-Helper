@@ -35,7 +35,11 @@ All notable changes to this project are documented in this file.
 - Non-MiSTer sources keep `.sav` preference for N64.
 - Save extension preference is now profile-driven per source (`PROFILE`) instead of only source kind.
 - Added emulator profiles (`mister`, `retroarch`, `snes9x`, `zsnes`, `everdrive`, `generic`) to source config and CLI `source add --profile`.
-- PS1 sync now includes automatic shared-card fallback keys when ROM mapping is missing, plus alias uploads for multi-game cards and a shared-card restore safety guard.
+- PlayStation helper sync now follows backend card contract:
+- full-card upload/download only (no client-side entry extraction/merge)
+- runtime-based `device_type` mapping (`mister`/`retroarch` for PS1, `pcsx2` for PS2)
+- slot resolution to `Memory Card 1/2` from config/path hints
+- deterministic PS line keys (`ps-line:<system>:<device_type>:<slot>`) instead of ROM-lookup fallback
 
 ## [0.3.1] - 2026-04-21
 

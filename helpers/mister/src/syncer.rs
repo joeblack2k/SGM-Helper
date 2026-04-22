@@ -4,13 +4,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::api::{ApiClient, ConflictCheckResponse, LatestSaveResponse};
+use crate::api::{ApiClient, ConflictCheckResponse};
 use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, encode_download_for_local_container, filename_stem,
-    md5_file, normalize_save_for_sync, ps1_detected_serials, ps1_fallback_rom_keys, sha1_file,
-    sha256_bytes,
+    md5_file, normalize_save_for_sync, sha1_file, sha256_bytes,
 };
 use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
@@ -40,12 +39,6 @@ pub struct SyncReport {
 struct ProcessedEntry {
     state_key: String,
     entry: SyncedEntry,
-}
-
-#[derive(Debug, Clone)]
-struct LatestCandidate {
-    rom_sha1: String,
-    latest: LatestSaveResponse,
 }
 
 struct SyncLock {
@@ -305,11 +298,6 @@ fn process_single_save(
         }
     };
     let local_sha = sha256_bytes(&normalized_save.canonical_bytes);
-    let local_ps1_serials = if system_slug == "psx" {
-        ps1_detected_serials(&normalized_save.canonical_bytes)
-    } else {
-        Vec::new()
-    };
     if verbose {
         eprintln!(
             "Detected {} savegame for {} ({}) [adapter={} container={}]",
@@ -321,53 +309,52 @@ fn process_single_save(
         );
     }
 
-    let lookup = api.lookup_rom(&stem).ok();
-    let mut rom_sha1 = lookup
-        .as_ref()
-        .and_then(|value| value.rom.as_ref())
-        .and_then(|value| value.sha1.clone());
-    let mut rom_md5 = lookup
-        .as_ref()
-        .and_then(|value| value.rom.as_ref())
-        .and_then(|value| value.md5.clone());
+    let effective_slot_name =
+        resolve_slot_name_for_sync(&system_slug, save_path, &options.slot_name);
+    let device_type = helper_device_type_for_upload(source_kind, source_profile, &system_slug);
 
-    if rom_sha1.is_none()
-        && let Some(rom_entry) = rom_entry
-    {
-        if let Some((cached_sha1, cached_md5)) = rom_hash_cache.get(&stem_key).cloned() {
-            rom_sha1 = Some(cached_sha1);
-            rom_md5 = Some(cached_md5);
-        } else {
-            let local_rom_sha1 = sha1_file(&rom_entry.path)?;
-            let local_rom_md5 = md5_file(&rom_entry.path)?;
-            rom_hash_cache.insert(
-                stem_key.clone(),
-                (local_rom_sha1.clone(), local_rom_md5.clone()),
-            );
-            rom_sha1 = Some(local_rom_sha1);
-            rom_md5 = Some(local_rom_md5);
+    let mut rom_sha1 = if is_playstation_system(&system_slug) {
+        Some(playstation_line_key(
+            &system_slug,
+            device_type,
+            &effective_slot_name,
+        ))
+    } else {
+        None
+    };
+    let mut rom_md5: Option<String> = None;
+
+    if rom_sha1.is_none() {
+        let lookup = api.lookup_rom(&stem).ok();
+        rom_sha1 = lookup
+            .as_ref()
+            .and_then(|value| value.rom.as_ref())
+            .and_then(|value| value.sha1.clone());
+        rom_md5 = lookup
+            .as_ref()
+            .and_then(|value| value.rom.as_ref())
+            .and_then(|value| value.md5.clone());
+
+        if rom_sha1.is_none()
+            && let Some(rom_entry) = rom_entry
+        {
+            if let Some((cached_sha1, cached_md5)) = rom_hash_cache.get(&stem_key).cloned() {
+                rom_sha1 = Some(cached_sha1);
+                rom_md5 = Some(cached_md5);
+            } else {
+                let local_rom_sha1 = sha1_file(&rom_entry.path)?;
+                let local_rom_md5 = md5_file(&rom_entry.path)?;
+                rom_hash_cache.insert(
+                    stem_key.clone(),
+                    (local_rom_sha1.clone(), local_rom_md5.clone()),
+                );
+                rom_sha1 = Some(local_rom_sha1);
+                rom_md5 = Some(local_rom_md5);
+            }
         }
     }
 
-    let mut rom_keys = Vec::new();
-    if let Some(value) = rom_sha1.clone() {
-        rom_keys.push(value);
-    }
-
-    let mut using_ps1_fallback = false;
-    if rom_keys.is_empty() && system_slug == "psx" {
-        rom_keys = ps1_fallback_rom_keys(&normalized_save.canonical_bytes);
-        using_ps1_fallback = !rom_keys.is_empty();
-        if using_ps1_fallback && verbose {
-            eprintln!(
-                "PS1 shared/per-game fallback mapping active for {} => {}",
-                save_path.display(),
-                rom_keys.join(", ")
-            );
-        }
-    }
-
-    let Some(primary_rom_sha1) = rom_keys.first().cloned() else {
+    let Some(active_rom_sha1) = rom_sha1 else {
         report.skipped += 1;
         if verbose {
             eprintln!("No ROM mapping found for save {}", stem);
@@ -375,44 +362,7 @@ fn process_single_save(
         return Ok(None);
     };
 
-    let latest_candidates = fetch_latest_candidates(api, &rom_keys, &options.slot_name)?;
-    let Some(best_candidate) = select_best_latest_candidate(&latest_candidates) else {
-        report.skipped += 1;
-        if verbose {
-            eprintln!(
-                "No latest candidate available for save {}",
-                save_path.display()
-            );
-        }
-        return Ok(None);
-    };
-    let active_rom_sha1 = best_candidate.rom_sha1.clone();
-    let latest = best_candidate.latest.clone();
-    let upload_keys = if using_ps1_fallback {
-        rom_keys.clone()
-    } else {
-        vec![active_rom_sha1.clone()]
-    };
-
-    if let Some(in_sync_candidate) = latest_candidates
-        .iter()
-        .find(|candidate| candidate.latest.sha256.as_deref() == Some(local_sha.as_str()))
-    {
-        report.in_sync += 1;
-        return Ok(Some(processed_entry(
-            state_key.clone(),
-            synced_entry(
-                local_sha,
-                Some(in_sync_candidate.rom_sha1.clone()),
-                in_sync_candidate.latest.version,
-                Some(&system_slug),
-                Some(normalized_save.local_container),
-                Some(normalized_save.adapter_profile),
-                Some(source_kind),
-                Some(source_name),
-            ),
-        )));
-    }
+    let latest = api.latest_save(&active_rom_sha1, &effective_slot_name)?;
 
     if !latest.exists {
         if options.dry_run {
@@ -421,13 +371,14 @@ fn process_single_save(
                 state_key.clone(),
                 synced_entry(
                     local_sha,
-                    Some(primary_rom_sha1),
+                    Some(active_rom_sha1.clone()),
                     None,
                     Some(&system_slug),
                     Some(normalized_save.local_container),
                     Some(normalized_save.adapter_profile),
                     Some(source_kind),
                     Some(source_name),
+                    Some(&effective_slot_name),
                 ),
             )));
         }
@@ -437,17 +388,16 @@ fn process_single_save(
             .and_then(|value| value.to_str())
             .unwrap_or("save.bin");
 
-        for upload_rom_sha1 in &upload_keys {
-            let _upload = api.upload_save(
-                filename,
-                normalized_save.canonical_bytes.clone(),
-                upload_rom_sha1,
-                rom_md5.as_deref(),
-                &options.slot_name,
-                fingerprint,
-                Some(&system_slug),
-            )?;
-        }
+        let _upload = api.upload_save(
+            filename,
+            normalized_save.canonical_bytes.clone(),
+            &active_rom_sha1,
+            rom_md5.as_deref(),
+            &effective_slot_name,
+            device_type,
+            fingerprint,
+            Some(&system_slug),
+        )?;
 
         report.uploaded += 1;
         return Ok(Some(processed_entry(
@@ -461,6 +411,25 @@ fn process_single_save(
                 Some(normalized_save.adapter_profile),
                 Some(source_kind),
                 Some(source_name),
+                Some(&effective_slot_name),
+            ),
+        )));
+    }
+
+    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
+        report.in_sync += 1;
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(active_rom_sha1.clone()),
+                latest.version,
+                Some(&system_slug),
+                Some(normalized_save.local_container),
+                Some(normalized_save.adapter_profile),
+                Some(source_kind),
+                Some(source_name),
+                Some(&effective_slot_name),
             ),
         )));
     }
@@ -479,6 +448,7 @@ fn process_single_save(
                     Some(normalized_save.adapter_profile),
                     Some(source_kind),
                     Some(source_name),
+                    Some(&effective_slot_name),
                 ),
             )));
         }
@@ -488,17 +458,16 @@ fn process_single_save(
             .and_then(|value| value.to_str())
             .unwrap_or("save.bin");
 
-        for upload_rom_sha1 in &upload_keys {
-            api.upload_save(
-                filename,
-                normalized_save.canonical_bytes.clone(),
-                upload_rom_sha1,
-                rom_md5.as_deref(),
-                &options.slot_name,
-                fingerprint,
-                Some(&system_slug),
-            )?;
-        }
+        api.upload_save(
+            filename,
+            normalized_save.canonical_bytes.clone(),
+            &active_rom_sha1,
+            rom_md5.as_deref(),
+            &effective_slot_name,
+            device_type,
+            fingerprint,
+            Some(&system_slug),
+        )?;
         report.uploaded += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
@@ -511,11 +480,12 @@ fn process_single_save(
                 Some(normalized_save.adapter_profile),
                 Some(source_kind),
                 Some(source_name),
+                Some(&effective_slot_name),
             ),
         )));
     }
 
-    let conflict = api.conflict_check(&active_rom_sha1, &options.slot_name)?;
+    let conflict = api.conflict_check(&active_rom_sha1, &effective_slot_name)?;
     if conflict.exists {
         handle_conflict(
             api,
@@ -523,7 +493,8 @@ fn process_single_save(
             &normalized_save.canonical_bytes,
             &local_sha,
             &active_rom_sha1,
-            options,
+            &effective_slot_name,
+            options.dry_run,
             &conflict,
             source_name,
             source_kind,
@@ -540,6 +511,7 @@ fn process_single_save(
                 Some(normalized_save.adapter_profile),
                 Some(source_kind),
                 Some(source_name),
+                Some(&effective_slot_name),
             ),
         )));
     }
@@ -567,41 +539,12 @@ fn process_single_save(
                     Some(normalized_save.adapter_profile),
                     Some(source_kind),
                     Some(source_name),
+                    Some(&effective_slot_name),
                 ),
             )));
         }
 
         let canonical_bytes = api.download_save(&save_id)?;
-        if system_slug == "psx" {
-            let downloaded_ps1_serials = ps1_detected_serials(&canonical_bytes);
-            if local_ps1_serials.len() > 1
-                && !downloaded_ps1_serials.is_empty()
-                && downloaded_ps1_serials.len() < local_ps1_serials.len()
-            {
-                report.skipped += 1;
-                if verbose {
-                    eprintln!(
-                        "Skipping PS1 restore for {} to avoid shared-card data loss (local serials: {:?}, cloud serials: {:?})",
-                        save_path.display(),
-                        local_ps1_serials,
-                        downloaded_ps1_serials
-                    );
-                }
-                return Ok(Some(processed_entry(
-                    state_key.clone(),
-                    synced_entry(
-                        local_sha,
-                        Some(active_rom_sha1.clone()),
-                        latest.version,
-                        Some(&system_slug),
-                        Some(normalized_save.local_container),
-                        Some(normalized_save.adapter_profile),
-                        Some(source_kind),
-                        Some(source_name),
-                    ),
-                )));
-            }
-        }
         let local_bytes =
             encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
         let target_save_path = preferred_save_path(
@@ -651,6 +594,7 @@ fn process_single_save(
                 Some(normalized_save.adapter_profile),
                 Some(source_kind),
                 Some(source_name),
+                Some(&effective_slot_name),
             ),
         )));
     }
@@ -685,7 +629,12 @@ fn process_missing_save(
         return Ok(None);
     };
 
-    let latest = api.latest_save(rom_sha1, &options.slot_name)?;
+    let system_slug = existing_entry.system_slug.as_deref();
+    let effective_slot_name = existing_entry.slot_name.clone().unwrap_or_else(|| {
+        resolve_slot_name_for_sync(system_slug.unwrap_or(""), save_path, &options.slot_name)
+    });
+
+    let latest = api.latest_save(rom_sha1, &effective_slot_name)?;
     if !latest.exists {
         report.skipped += 1;
         if verbose {
@@ -714,7 +663,6 @@ fn process_missing_save(
     let adapter_profile = existing_entry
         .adapter_profile
         .unwrap_or_else(|| default_adapter_profile_for_container(local_container));
-    let system_slug = existing_entry.system_slug.as_deref();
     let state_key = save_path.to_string_lossy().to_string();
 
     if options.dry_run {
@@ -730,6 +678,7 @@ fn process_missing_save(
                 Some(adapter_profile),
                 Some(source_kind),
                 Some(source_name),
+                Some(&effective_slot_name),
             ),
         )));
     }
@@ -767,6 +716,7 @@ fn process_missing_save(
             Some(adapter_profile),
             Some(source_kind),
             Some(source_name),
+            Some(&effective_slot_name),
         ),
     )))
 }
@@ -775,33 +725,104 @@ fn processed_entry(state_key: String, entry: SyncedEntry) -> ProcessedEntry {
     ProcessedEntry { state_key, entry }
 }
 
-fn fetch_latest_candidates(
-    api: &ApiClient,
-    rom_keys: &[String],
-    slot_name: &str,
-) -> Result<Vec<LatestCandidate>> {
-    let mut out = Vec::new();
-    for rom_sha1 in rom_keys {
-        let latest = api.latest_save(rom_sha1, slot_name)?;
-        out.push(LatestCandidate {
-            rom_sha1: rom_sha1.clone(),
-            latest,
-        });
-    }
-    Ok(out)
+fn is_playstation_system(system_slug: &str) -> bool {
+    matches!(system_slug, "psx" | "ps2")
 }
 
-fn select_best_latest_candidate(candidates: &[LatestCandidate]) -> Option<&LatestCandidate> {
-    candidates.iter().max_by(|left, right| {
-        let left_exists = left.latest.exists;
-        let right_exists = right.latest.exists;
-        let left_version = left.latest.version.unwrap_or(-1);
-        let right_version = right.latest.version.unwrap_or(-1);
+fn helper_device_type_for_upload(
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+) -> &'static str {
+    if system_slug == "psx" {
+        return if matches!(source_profile, EmulatorProfile::Mister)
+            || matches!(source_kind, SourceKind::MisterFpga)
+        {
+            "mister"
+        } else {
+            "retroarch"
+        };
+    }
+    if system_slug == "ps2" {
+        return "pcsx2";
+    }
 
-        left_exists
-            .cmp(&right_exists)
-            .then(left_version.cmp(&right_version))
-    })
+    match source_kind {
+        SourceKind::MisterFpga => "mister-fpga",
+        SourceKind::RetroArch => "retroarch",
+        SourceKind::Custom => "custom",
+        SourceKind::OpenEmu => "openemu",
+        SourceKind::AnaloguePocket => "analogue-pocket",
+        SourceKind::Windows => "windows",
+        SourceKind::SteamDeck => "steamdeck",
+    }
+}
+
+fn resolve_slot_name_for_sync(
+    system_slug: &str,
+    save_path: &Path,
+    configured_slot: &str,
+) -> String {
+    if !is_playstation_system(system_slug) {
+        return configured_slot.to_string();
+    }
+
+    if let Some(slot) = parse_playstation_slot(configured_slot) {
+        return slot;
+    }
+    infer_playstation_slot_from_path(save_path)
+}
+
+fn parse_playstation_slot(value: &str) -> Option<String> {
+    let text = value.trim().to_ascii_lowercase();
+    if text.is_empty() || text == "default" {
+        return None;
+    }
+
+    if text.contains("memory card 1")
+        || text.contains("memory_card_1")
+        || text.contains("slot 1")
+        || text.contains("slot1")
+        || text.contains("card 1")
+        || text.contains("card1")
+    {
+        return Some("Memory Card 1".to_string());
+    }
+    if text.contains("memory card 2")
+        || text.contains("memory_card_2")
+        || text.contains("slot 2")
+        || text.contains("slot2")
+        || text.contains("card 2")
+        || text.contains("card2")
+    {
+        return Some("Memory Card 2".to_string());
+    }
+
+    if text.contains("mcd001") || text.contains("mcd1") {
+        return Some("Memory Card 1".to_string());
+    }
+    if text.contains("mcd002") || text.contains("mcd2") {
+        return Some("Memory Card 2".to_string());
+    }
+
+    None
+}
+
+fn infer_playstation_slot_from_path(path: &Path) -> String {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    parse_playstation_slot(&text).unwrap_or_else(|| "Memory Card 1".to_string())
+}
+
+fn playstation_line_key(system_slug: &str, device_type: &str, slot_name: &str) -> String {
+    let normalized_slot = slot_name
+        .trim()
+        .to_ascii_lowercase()
+        .replace("memory card", "memory-card")
+        .replace(' ', "-");
+    format!(
+        "ps-line:{}:{}:{}",
+        system_slug, device_type, normalized_slot
+    )
 }
 
 fn select_preferred_save_per_stem(
@@ -944,12 +965,13 @@ fn handle_conflict(
     canonical_bytes: &[u8],
     local_sha: &str,
     rom_sha1: &str,
-    options: &SyncOptions,
+    slot_name: &str,
+    dry_run: bool,
     conflict: &ConflictCheckResponse,
     source_name: &str,
     source_kind: &SourceKind,
 ) -> Result<()> {
-    if options.dry_run {
+    if dry_run {
         return Ok(());
     }
 
@@ -968,7 +990,7 @@ fn handle_conflict(
         file_name,
         canonical_bytes.to_vec(),
         rom_sha1,
-        &options.slot_name,
+        slot_name,
         local_sha,
         &cloud_sha,
         &device_name,
@@ -996,6 +1018,7 @@ fn synced_entry(
     adapter_profile: Option<SaveAdapterProfile>,
     source_kind: Option<&SourceKind>,
     source_name: Option<&str>,
+    slot_name: Option<&str>,
 ) -> SyncedEntry {
     SyncedEntry {
         sha256,
@@ -1006,6 +1029,7 @@ fn synced_entry(
         adapter_profile,
         source_kind: source_kind.map(|kind| kind.as_str().to_string()),
         source_name: source_name.map(ToString::to_string),
+        slot_name: slot_name.map(ToString::to_string),
         updated_at: now_rfc3339(),
     }
 }
@@ -1129,6 +1153,38 @@ mod tests {
                 Some(32_768)
             ),
             Some("sra")
+        );
+    }
+
+    #[test]
+    fn parses_playstation_slot_aliases() {
+        assert_eq!(
+            parse_playstation_slot("memory_card_1"),
+            Some("Memory Card 1".to_string())
+        );
+        assert_eq!(
+            parse_playstation_slot("memory card 2"),
+            Some("Memory Card 2".to_string())
+        );
+        assert_eq!(
+            parse_playstation_slot("Mcd001.ps2"),
+            Some("Memory Card 1".to_string())
+        );
+        assert_eq!(
+            parse_playstation_slot("Mcd002.ps2"),
+            Some("Memory Card 2".to_string())
+        );
+    }
+
+    #[test]
+    fn infers_playstation_slot_from_path_with_default() {
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/games/psx/memory_card_2.mcd")),
+            "Memory Card 2".to_string()
+        );
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/games/ps2/custom.ps2")),
+            "Memory Card 1".to_string()
         );
     }
 }

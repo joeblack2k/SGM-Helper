@@ -79,8 +79,8 @@ For PS1 formats, sync uses canonical normalization:
 
 - `.gme` and `.vmp` are validated and converted to canonical raw memory card bytes for hash/upload
 - on download, saves are written back in the original local container format where supported
-- if ROM matching is missing, helper auto-detects PS1 serials from the card and falls back to deterministic PS1 sync keys
-- for multi-game cards, helper uploads serial aliases to improve compatibility with per-game card frontends
+- PS1 uploads use `device_type=retroarch`; PS2 uploads use `device_type=pcsx2`
+- slot is resolved to `Memory Card 1` or `Memory Card 2` from `--slot-name` or filename/path hints (`memory_card_1`, `Mcd001.ps2`), defaulting to `Memory Card 1`
 
 Watch mode:
 

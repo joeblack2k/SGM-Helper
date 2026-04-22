@@ -298,6 +298,7 @@ impl ApiClient {
         rom_sha1: &str,
         rom_md5: Option<&str>,
         slot_name: &str,
+        device_type: &str,
         fingerprint: &str,
         system_slug: Option<&str>,
     ) -> Result<UploadSaveResponse> {
@@ -308,7 +309,7 @@ impl ApiClient {
             .part("file", part)
             .text("rom_sha1", rom_sha1.to_string())
             .text("slotName", slot_name.to_string())
-            .text("device_type", "windows".to_string())
+            .text("device_type", device_type.to_string())
             .text("fingerprint", fingerprint.to_string());
 
         if let Some(md5) = rom_md5

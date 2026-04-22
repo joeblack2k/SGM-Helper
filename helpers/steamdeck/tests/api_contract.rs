@@ -304,6 +304,7 @@ fn sync_reports_conflict_when_backend_marks_conflict() {
 
 #[test]
 fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
+    let expected_line = "ps-line:psx:retroarch:memory-card-1";
     let server = MockServer::start();
     let _token = server.mock(|when, then| {
         when.method(POST).path("/auth/token/app-password");
@@ -324,13 +325,23 @@ fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
             .body(r#"{"success":true,"count":1,"rom":{"sha1":"ps1sha","md5":"ps1md5"}}"#);
     });
     let save_latest = server.mock(|when, then| {
-        when.method(GET).path("/save/latest");
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("romSha1", expected_line)
+            .query_param("slotName", "Memory Card 1");
         then.status(200)
             .header("content-type", "application/json")
             .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
     });
     let upload = server.mock(|when, then| {
-        when.method(POST).path("/saves");
+        when.method(POST)
+            .path("/saves")
+            .body_includes("name=\"rom_sha1\"")
+            .body_includes(expected_line)
+            .body_includes("name=\"slotName\"")
+            .body_includes("Memory Card 1")
+            .body_includes("name=\"device_type\"")
+            .body_includes("retroarch");
         then.status(200)
             .header("content-type", "application/json")
             .body(r#"{"success":true,"save":{"id":"save-ps1","sha256":"sha-up"}}"#);
@@ -365,7 +376,7 @@ fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
         .assert()
         .success();
 
-    assert_eq!(rom_lookup.calls(), 1);
+    assert_eq!(rom_lookup.calls(), 0);
     assert_eq!(save_latest.calls(), 1);
     assert_eq!(upload.calls(), 1);
 }

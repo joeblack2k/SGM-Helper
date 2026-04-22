@@ -43,12 +43,15 @@ Validation is strict. Files are not accepted by extension alone. Scanner checks 
 - PS1 container validation and conversion (`raw`, `.gme`, `.vmp`)
 - PS2 memory card header validation
 
-PS1 automatic shared-card fallback:
+PlayStation helper contract:
 
-- If no ROM mapping is found for a PS1 memory card, helper auto-detects PS1 serial IDs from the card directory.
-- Helper generates deterministic fallback backend keys (`psx-shared:*` and `psx-serial:*`) and syncs without user input.
-- For multi-game cards, helper adds serial aliases on upload to improve compatibility with per-game card setups.
-- Safety guard: helper skips destructive restore if cloud payload looks like a smaller single-game card while local card contains multiple PS1 serials.
+- Helpers upload full memory-card images only (`.mcr/.mcd/.mc/.gme/.vmp/.psv` for PS1, `.ps2` for PS2).
+- Helpers do not extract/merge logical saves client-side; backend parsing/projection is authoritative.
+- PlayStation sync identity is runtime profile + slot, not ROM lookup.
+- PS1 runtime `device_type`: `mister` (MiSTer profile) or `retroarch` (other PS1 profiles).
+- PS2 runtime `device_type`: `pcsx2`.
+- Slot is always resolved to `Memory Card 1` or `Memory Card 2` from `--slot-name` or filename/path hints (`memory_card_1`, `Mcd001.ps2`), with default `Memory Card 1`.
+- For PlayStation lines helpers use deterministic backend keys: `ps-line:<system>:<device_type>:<slot>`.
 
 Extension policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
 

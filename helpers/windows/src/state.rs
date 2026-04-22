@@ -60,6 +60,8 @@ pub struct SyncedEntry {
     pub source_kind: Option<String>,
     #[serde(default)]
     pub source_name: Option<String>,
+    #[serde(default)]
+    pub slot_name: Option<String>,
     pub updated_at: String,
 }
 
