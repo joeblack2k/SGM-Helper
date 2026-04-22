@@ -132,6 +132,11 @@ pub fn run_sync(
             .ok()
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| source.kind.as_str().to_string());
+        let app_password = if config.app_password.trim().is_empty() {
+            None
+        } else {
+            Some(config.app_password.as_str())
+        };
 
         for save_path in save_files {
             let stem_key = filename_stem(&save_path).to_ascii_lowercase();
@@ -215,6 +220,7 @@ pub fn run_sync(
             let restore = process_missing_save(
                 &api,
                 &save_path,
+                &fingerprint,
                 &entry,
                 &source.name,
                 &source.kind,
@@ -620,6 +626,7 @@ fn process_single_save(
 fn process_missing_save(
     api: &ApiClient,
     save_path: &Path,
+    fingerprint: &str,
     existing_entry: &SyncedEntry,
     source_name: &str,
     source_kind: &SourceKind,
@@ -693,7 +700,7 @@ fn process_missing_save(
         )));
     }
 
-    let canonical_bytes = api.download_save(save_id)?;
+    let canonical_bytes = api.download_save(save_id, device_type, fingerprint, app_password)?;
     let local_bytes = encode_download_for_local_container(&canonical_bytes, local_container)?;
     if let Some(parent) = save_path.parent() {
         fs::create_dir_all(parent)
@@ -1009,6 +1016,38 @@ fn handle_conflict(
     )?;
 
     Ok(())
+}
+
+fn resolved_slot_name_for_system(requested_slot_name: &str, system_slug: &str) -> String {
+    if system_slug.eq_ignore_ascii_case("psx")
+        && requested_slot_name.eq_ignore_ascii_case("default")
+    {
+        "Memory Card 1".to_string()
+    } else {
+        requested_slot_name.to_string()
+    }
+}
+
+fn source_kind_device_type_for_system(kind: &SourceKind, system_slug: &str) -> &'static str {
+    if system_slug.eq_ignore_ascii_case("ps2") {
+        return "pcsx2";
+    }
+    if system_slug.eq_ignore_ascii_case("psx") {
+        return match kind {
+            SourceKind::MisterFpga => "mister",
+            _ => "retroarch",
+        };
+    }
+
+    match kind {
+        SourceKind::MisterFpga => "mister-fpga",
+        SourceKind::RetroArch => "retroarch",
+        SourceKind::Windows => "windows",
+        SourceKind::SteamDeck => "steamdeck",
+        SourceKind::OpenEmu => "openemu",
+        SourceKind::AnaloguePocket => "analogue-pocket",
+        SourceKind::Custom => "custom",
+    }
 }
 
 fn default_adapter_profile_for_container(container: SaveContainerFormat) -> SaveAdapterProfile {

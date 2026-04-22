@@ -279,14 +279,30 @@ impl ApiClient {
         parse_json_response(response)
     }
 
-    pub fn latest_save(&self, rom_sha1: &str, slot_name: &str) -> Result<LatestSaveResponse> {
+    pub fn latest_save(
+        &self,
+        rom_sha1: &str,
+        slot_name: &str,
+        device_type: &str,
+        fingerprint: &str,
+        app_password: Option<&str>,
+    ) -> Result<LatestSaveResponse> {
         let url = self.url("/save/latest");
-        let response = self
+        let mut request = self
             .client
             .get(url)
-            .query(&[("romSha1", rom_sha1), ("slotName", slot_name)])
-            .send()
-            .context("request naar /save/latest faalde")?;
+            .query(&[
+                ("romSha1", rom_sha1),
+                ("slotName", slot_name),
+                ("device_type", device_type),
+                ("fingerprint", fingerprint),
+            ]);
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let response = request.send().context("request naar /save/latest faalde")?;
         parse_json_response(response)
     }
 
@@ -381,12 +397,28 @@ impl ApiClient {
         );
     }
 
-    pub fn download_save(&self, save_id: &str) -> Result<Vec<u8>> {
+    pub fn download_save(
+        &self,
+        save_id: &str,
+        device_type: &str,
+        fingerprint: &str,
+        app_password: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let url = self.url("/saves/download");
-        let mut response = self
+        let mut request = self
             .client
             .get(url)
-            .query(&[("id", save_id)])
+            .query(&[
+                ("id", save_id),
+                ("device_type", device_type),
+                ("fingerprint", fingerprint),
+            ]);
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let mut response = request
             .send()
             .context("request naar /saves/download faalde")?;
 
@@ -407,12 +439,30 @@ impl ApiClient {
         Ok(body)
     }
 
-    pub fn conflict_check(&self, rom_sha1: &str, slot_name: &str) -> Result<ConflictCheckResponse> {
+    pub fn conflict_check(
+        &self,
+        rom_sha1: &str,
+        slot_name: &str,
+        device_type: &str,
+        fingerprint: &str,
+        app_password: Option<&str>,
+    ) -> Result<ConflictCheckResponse> {
         let url = self.url("/conflicts/check");
-        let response = self
+        let mut request = self
             .client
             .get(url)
-            .query(&[("romSha1", rom_sha1), ("slotName", slot_name)])
+            .query(&[
+                ("romSha1", rom_sha1),
+                ("slotName", slot_name),
+                ("device_type", device_type),
+                ("fingerprint", fingerprint),
+            ]);
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let response = request
             .send()
             .context("request naar /conflicts/check faalde")?;
         parse_json_response(response)
