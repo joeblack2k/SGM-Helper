@@ -478,6 +478,8 @@ impl ApiClient {
         local_sha256: &str,
         cloud_sha256: &str,
         device_name: &str,
+        device_type: &str,
+        fingerprint: &str,
         app_password: Option<&str>,
     ) -> Result<ConflictReportResponse> {
         let url = self.url("/conflicts/report");
@@ -490,7 +492,9 @@ impl ApiClient {
             .text("slotName", slot_name.to_string())
             .text("localSha256", local_sha256.to_string())
             .text("cloudSha256", cloud_sha256.to_string())
-            .text("deviceName", device_name.to_string());
+            .text("deviceName", device_name.to_string())
+            .text("device_type", device_type.to_string())
+            .text("fingerprint", fingerprint.to_string());
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
         {

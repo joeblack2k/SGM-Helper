@@ -132,11 +132,6 @@ pub fn run_sync(
             .ok()
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| source.kind.as_str().to_string());
-        let app_password = if config.app_password.trim().is_empty() {
-            None
-        } else {
-            Some(config.app_password.as_str())
-        };
 
         for save_path in save_files {
             let stem_key = filename_stem(&save_path).to_ascii_lowercase();
@@ -225,6 +220,7 @@ pub fn run_sync(
                 &source.name,
                 &source.kind,
                 &source.profile,
+                app_password,
                 options,
                 &mut report,
                 verbose,
@@ -375,7 +371,13 @@ fn process_single_save(
         return Ok(None);
     };
 
-    let latest = api.latest_save(&active_rom_sha1, &effective_slot_name)?;
+    let latest = api.latest_save(
+        &active_rom_sha1,
+        &effective_slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+    )?;
 
     if !latest.exists {
         if options.dry_run {
@@ -500,7 +502,13 @@ fn process_single_save(
         )));
     }
 
-    let conflict = api.conflict_check(&active_rom_sha1, &effective_slot_name)?;
+    let conflict = api.conflict_check(
+        &active_rom_sha1,
+        &effective_slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+    )?;
     if conflict.exists {
         handle_conflict(
             api,
@@ -510,6 +518,8 @@ fn process_single_save(
             &active_rom_sha1,
             &effective_slot_name,
             options.dry_run,
+            device_type,
+            fingerprint,
             &conflict,
             source_name,
             source_kind,
@@ -560,7 +570,7 @@ fn process_single_save(
             )));
         }
 
-        let canonical_bytes = api.download_save(&save_id)?;
+        let canonical_bytes = api.download_save(&save_id, device_type, fingerprint, app_password)?;
         let local_bytes =
             encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
         let target_save_path = preferred_save_path(
@@ -630,7 +640,8 @@ fn process_missing_save(
     existing_entry: &SyncedEntry,
     source_name: &str,
     source_kind: &SourceKind,
-    _source_profile: &EmulatorProfile,
+    source_profile: &EmulatorProfile,
+    app_password: Option<&str>,
     options: &SyncOptions,
     report: &mut SyncReport,
     verbose: bool,
@@ -650,8 +661,16 @@ fn process_missing_save(
     let effective_slot_name = existing_entry.slot_name.clone().unwrap_or_else(|| {
         resolve_slot_name_for_sync(system_slug.unwrap_or(""), save_path, &options.slot_name)
     });
+    let device_type =
+        helper_device_type_for_upload(source_kind, source_profile, system_slug.unwrap_or(""));
 
-    let latest = api.latest_save(rom_sha1, &effective_slot_name)?;
+    let latest = api.latest_save(
+        rom_sha1,
+        &effective_slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+    )?;
     if !latest.exists {
         report.skipped += 1;
         if verbose {
@@ -984,6 +1003,8 @@ fn handle_conflict(
     rom_sha1: &str,
     slot_name: &str,
     dry_run: bool,
+    device_type: &str,
+    fingerprint: &str,
     conflict: &ConflictCheckResponse,
     source_name: &str,
     source_kind: &SourceKind,
@@ -1012,42 +1033,12 @@ fn handle_conflict(
         local_sha,
         &cloud_sha,
         &device_name,
+        device_type,
+        fingerprint,
         app_password,
     )?;
 
     Ok(())
-}
-
-fn resolved_slot_name_for_system(requested_slot_name: &str, system_slug: &str) -> String {
-    if system_slug.eq_ignore_ascii_case("psx")
-        && requested_slot_name.eq_ignore_ascii_case("default")
-    {
-        "Memory Card 1".to_string()
-    } else {
-        requested_slot_name.to_string()
-    }
-}
-
-fn source_kind_device_type_for_system(kind: &SourceKind, system_slug: &str) -> &'static str {
-    if system_slug.eq_ignore_ascii_case("ps2") {
-        return "pcsx2";
-    }
-    if system_slug.eq_ignore_ascii_case("psx") {
-        return match kind {
-            SourceKind::MisterFpga => "mister",
-            _ => "retroarch",
-        };
-    }
-
-    match kind {
-        SourceKind::MisterFpga => "mister-fpga",
-        SourceKind::RetroArch => "retroarch",
-        SourceKind::Windows => "windows",
-        SourceKind::SteamDeck => "steamdeck",
-        SourceKind::OpenEmu => "openemu",
-        SourceKind::AnaloguePocket => "analogue-pocket",
-        SourceKind::Custom => "custom",
-    }
 }
 
 fn default_adapter_profile_for_container(container: SaveContainerFormat) -> SaveAdapterProfile {
