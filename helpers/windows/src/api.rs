@@ -288,15 +288,12 @@ impl ApiClient {
         app_password: Option<&str>,
     ) -> Result<LatestSaveResponse> {
         let url = self.url("/save/latest");
-        let mut request = self
-            .client
-            .get(url)
-            .query(&[
-                ("romSha1", rom_sha1),
-                ("slotName", slot_name),
-                ("device_type", device_type),
-                ("fingerprint", fingerprint),
-            ]);
+        let mut request = self.client.get(url).query(&[
+            ("romSha1", rom_sha1),
+            ("slotName", slot_name),
+            ("device_type", device_type),
+            ("fingerprint", fingerprint),
+        ]);
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
         {
@@ -405,14 +402,11 @@ impl ApiClient {
         app_password: Option<&str>,
     ) -> Result<Vec<u8>> {
         let url = self.url("/saves/download");
-        let mut request = self
-            .client
-            .get(url)
-            .query(&[
-                ("id", save_id),
-                ("device_type", device_type),
-                ("fingerprint", fingerprint),
-            ]);
+        let mut request = self.client.get(url).query(&[
+            ("id", save_id),
+            ("device_type", device_type),
+            ("fingerprint", fingerprint),
+        ]);
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
         {
@@ -448,15 +442,12 @@ impl ApiClient {
         app_password: Option<&str>,
     ) -> Result<ConflictCheckResponse> {
         let url = self.url("/conflicts/check");
-        let mut request = self
-            .client
-            .get(url)
-            .query(&[
-                ("romSha1", rom_sha1),
-                ("slotName", slot_name),
-                ("device_type", device_type),
-                ("fingerprint", fingerprint),
-            ]);
+        let mut request = self.client.get(url).query(&[
+            ("romSha1", rom_sha1),
+            ("slotName", slot_name),
+            ("device_type", device_type),
+            ("fingerprint", fingerprint),
+        ]);
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
         {

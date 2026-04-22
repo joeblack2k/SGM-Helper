@@ -1610,7 +1610,9 @@ mod tests {
     #[test]
     fn dreamcast_vmu_path_hints_are_supported_and_enriched() {
         let tmp = tempfile::tempdir().unwrap();
-        let save = tmp.path().join("Emulation/saves/dreamcast/Sonic Adventure 2.A1.bin");
+        let save = tmp
+            .path()
+            .join("Emulation/saves/dreamcast/Sonic Adventure 2.A1.bin");
         fs::create_dir_all(save.parent().unwrap()).unwrap();
         fs::write(&save, build_dreamcast_vmu_with_single_save()).unwrap();
 

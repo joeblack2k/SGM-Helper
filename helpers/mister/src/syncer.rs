@@ -576,7 +576,8 @@ fn process_single_save(
             )));
         }
 
-        let canonical_bytes = api.download_save(&save_id, device_type, fingerprint, app_password)?;
+        let canonical_bytes =
+            api.download_save(&save_id, device_type, fingerprint, app_password)?;
         let local_bytes =
             encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
         let target_save_path = preferred_save_path(
