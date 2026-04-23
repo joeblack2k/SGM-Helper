@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-04-23
+
+### Added
+
+- Auto-enroll startup flow for all Rust helpers (MiSTer, Steam Deck, Windows):
+- `sync` and `watch` now check `GET /auth/app-passwords/auto-enroll` when no local auth token exists.
+- If the gate is active, helpers self-register via `POST /auth/token/app-password` using stable helper identity and runtime metadata.
+- Provisioned token is saved to `STATE_DIR/auth.json` and reused in normal sync flow.
+- New API client support for:
+- auto-enroll status endpoint
+- auto-provision token response parsing (`token` / `plainTextKey` / `plainTextToken`)
+
+### Changed
+
+- `sync` / `watch` no longer hard-fail immediately on missing token; they now attempt auto-enroll first and give explicit guidance to press `Add helper` when gate is closed.
+- Helper metadata now reports current binary version `0.4.3` during auto-provision.
+
+### Tests
+
+- Added cross-helper contract tests for gate-open onboarding:
+- `sync` succeeds without prior `login`
+- helper requests auto-enroll status and auto-provision token endpoints
+- token persistence is verified in local state
+
 ### Added
 
 - Dreamcast scanner support across MiSTer, Steam Deck, and Windows helpers:

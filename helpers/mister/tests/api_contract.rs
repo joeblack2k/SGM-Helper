@@ -380,3 +380,68 @@ fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
     assert_eq!(save_latest.calls(), 1);
     assert_eq!(upload.calls(), 1);
 }
+
+#[test]
+fn sync_auto_enrolls_when_gate_is_open_without_login() {
+    let server = MockServer::start();
+    let auto_status = server.mock(|when, then| {
+        when.method(GET).path("/auth/app-passwords/auto-enroll");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"active":true}"#);
+    });
+    let auto_token = server.mock(|when, then| {
+        when.method(POST)
+            .path("/auth/token/app-password")
+            .body_includes("\"deviceType\":\"mister-fpga\"")
+            .body_includes("\"helperName\":\"sgm-mister-helper\"");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"RSM-AAAA-BBBB","plainTextKey":"RSM-AAAA-BBBB"}"#);
+    });
+    let rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"abc123","md5":"md5v"}}"#);
+    });
+    let save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-1","sha256":"sha-up"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(root.join("Nintendo/wario.sav"), vec![0x00u8; 32768]).unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-mister-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(config)
+        .arg("sync")
+        .assert()
+        .success();
+
+    assert_eq!(auto_status.calls(), 1);
+    assert_eq!(auto_token.calls(), 1);
+    assert_eq!(rom_lookup.calls(), 1);
+    assert_eq!(save_latest.calls(), 1);
+    assert_eq!(upload.calls(), 1);
+
+    let auth_path = state_dir.join("auth.json");
+    assert!(auth_path.exists());
+    let auth: Value = serde_json::from_str(&fs::read_to_string(auth_path).unwrap()).unwrap();
+    assert_eq!(auth["token"], "RSM-AAAA-BBBB");
+}

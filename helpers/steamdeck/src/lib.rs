@@ -8,6 +8,7 @@ pub mod state;
 pub mod syncer;
 pub mod watcher;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -16,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
-use crate::api::{ApiClient, DeviceTokenPoll};
+use crate::api::{ApiClient, AutoProvisionRequest, DeviceTokenPoll};
 use crate::cli::{
     Cli, Commands, ConfigCommand, ScheduleCommand, SourceAddCommand, SourceCommand, StateCommand,
 };
@@ -27,7 +28,8 @@ use crate::scanner::{
 use crate::scheduler::{SchedulerBackend, install_schedule, scheduler_status, uninstall_schedule};
 use crate::sources::{
     EmulatorProfile, Source, SourceKind, load_source_store, migrate_legacy_sources_if_needed,
-    remove_source, save_source_store, steamdeck_autodetect_note, upsert_source,
+    remove_source, resolved_sources_or_default, save_source_store, steamdeck_autodetect_note,
+    upsert_source,
 };
 use crate::state::{
     AuthState, clear_auth_state_for_base_url, load_auth_state, load_auth_state_for_base_url,
@@ -216,14 +218,12 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
 
             print_steamdeck_autodetect_note_if_needed(&cfg, cli.quiet)?;
 
-            let auth = load_active_auth_state(&cfg)?.context(format!(
-                "geen auth-token gevonden voor {}; run eerst `login`",
-                cfg.base_url()
-            ))?;
+            let auth =
+                ensure_auth_or_auto_enroll(&cfg, cli.verbose, cli.quiet, SourceKind::SteamDeck)?;
 
             let report = run_sync(
                 &cfg,
-                Some(&auth),
+                auth.as_ref(),
                 &SyncOptions {
                     force_upload: cfg.force_upload,
                     dry_run: cfg.dry_run,
@@ -303,14 +303,12 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
 
             print_steamdeck_autodetect_note_if_needed(&cfg, cli.quiet)?;
 
-            let auth = load_active_auth_state(&cfg)?.context(format!(
-                "geen auth-token gevonden voor {}; run eerst `login`",
-                cfg.base_url()
-            ))?;
+            let auth =
+                ensure_auth_or_auto_enroll(&cfg, cli.verbose, cli.quiet, SourceKind::SteamDeck)?;
 
             run_watch(
                 &cfg,
-                Some(&auth),
+                auth.as_ref(),
                 WatchOptions {
                     interval_secs: cfg.watch_interval,
                     force_upload: cfg.force_upload,
@@ -608,6 +606,131 @@ fn load_active_auth_state(cfg: &AppConfig) -> Result<Option<AuthState>> {
         return Ok(Some(auth));
     }
     load_auth_state(&state_dir)
+}
+
+fn ensure_auth_or_auto_enroll(
+    cfg: &AppConfig,
+    verbose: bool,
+    quiet: bool,
+    default_source_kind: SourceKind,
+) -> Result<Option<AuthState>> {
+    if let Some(auth) = load_active_auth_state(cfg)? {
+        return Ok(Some(auth));
+    }
+
+    let state_dir = cfg.resolved_state_dir()?;
+    fs::create_dir_all(&state_dir)
+        .with_context(|| format!("kan state map niet maken: {}", state_dir.display()))?;
+
+    let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
+    let gate_status = match api.auto_enroll_status() {
+        Ok(value) => value,
+        Err(err) => {
+            if verbose {
+                eprintln!("Auto-enroll gate check mislukt: {}", err);
+            }
+            bail!(
+                "geen auth-token gevonden voor {}; klik in de backend op 'Add helper' en probeer opnieuw, of gebruik `login`",
+                cfg.base_url()
+            );
+        }
+    };
+
+    if !gate_status.active {
+        bail!(
+            "geen auth-token gevonden voor {}; klik in de backend op 'Add helper' en probeer opnieuw, of gebruik `login`",
+            cfg.base_url()
+        );
+    }
+
+    let hostname = helper_hostname();
+    let fingerprint = hostname.clone();
+    let sync_paths = collect_auto_enroll_sync_paths(cfg, default_source_kind.clone())?;
+    let request = AutoProvisionRequest {
+        name: format!(
+            "{} ({})",
+            helper_display_name(&default_source_kind),
+            hostname
+        ),
+        device_type: default_source_kind.as_str().to_string(),
+        fingerprint,
+        hostname,
+        helper_name: env!("CARGO_PKG_NAME").to_string(),
+        helper_version: env!("CARGO_PKG_VERSION").to_string(),
+        platform: helper_platform_name(&default_source_kind).to_string(),
+        sync_paths,
+        systems: Vec::new(),
+    };
+
+    let token_response = api
+        .token_app_password_auto_provision(&request)
+        .context("auto-enroll provisioning faalde")?;
+    let auth_email = if cfg.email.trim().is_empty() {
+        format!("{}@local", default_source_kind.as_str())
+    } else {
+        cfg.email.clone()
+    };
+
+    let auth_state = AuthState::new(token_response.token, auth_email, cfg.base_url());
+    save_auth_state_for_base_url(&state_dir, &auth_state)?;
+
+    if !quiet {
+        println!(
+            "Auto-enroll succesvol. Helper geregistreerd en token opgeslagen in {}",
+            state_dir.join("auth.json").display()
+        );
+    } else if verbose {
+        eprintln!("Auto-enroll succesvol; token opgeslagen.");
+    }
+
+    Ok(Some(auth_state))
+}
+
+fn collect_auto_enroll_sync_paths(
+    cfg: &AppConfig,
+    default_source_kind: SourceKind,
+) -> Result<Vec<String>> {
+    migrate_legacy_sources_if_needed(cfg, false)?;
+    let store = load_source_store(&cfg.config_path)?;
+    let sources = resolved_sources_or_default(&store, cfg, default_source_kind)?;
+    let mut paths = BTreeSet::new();
+    for source in sources {
+        for root in source.save_roots {
+            paths.insert(root.display().to_string());
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn helper_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| "helper".to_string())
+}
+
+fn helper_display_name(kind: &SourceKind) -> &'static str {
+    match kind {
+        SourceKind::MisterFpga => "SGM MiSTer Helper",
+        SourceKind::SteamDeck => "SGM SteamDeck Helper",
+        SourceKind::Windows => "SGM Windows Helper",
+        SourceKind::RetroArch => "SGM RetroArch Helper",
+        SourceKind::OpenEmu => "SGM OpenEmu Helper",
+        SourceKind::AnaloguePocket => "SGM Analogue Pocket Helper",
+        SourceKind::Custom => "SGM Custom Helper",
+    }
+}
+
+fn helper_platform_name(kind: &SourceKind) -> &'static str {
+    match kind {
+        SourceKind::MisterFpga => "MiSTer",
+        SourceKind::SteamDeck => "SteamDeck",
+        SourceKind::Windows => "Windows",
+        SourceKind::RetroArch => "RetroArch",
+        SourceKind::OpenEmu => "OpenEmu",
+        SourceKind::AnaloguePocket => "Analogue Pocket",
+        SourceKind::Custom => "Custom",
+    }
 }
 
 fn print_steamdeck_autodetect_note_if_needed(cfg: &AppConfig, quiet: bool) -> Result<()> {

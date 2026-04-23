@@ -102,6 +102,12 @@ Example first run:
 .\sgm-windows-helper.exe sync
 ```
 
+Auto-enroll first run (no manual login):
+
+1. Start backend UI and click `Add helper` (opens 15-minute enroll window).
+2. Start helper with `sync` or `watch`.
+3. Helper auto-detects gate status, self-registers, stores token in `STATE_DIR/auth.json`, and continues syncing.
+
 GameCube/Wii quick flow:
 
 1. Launch helper from Swiss (GameCube) or Homebrew Launcher (Wii).

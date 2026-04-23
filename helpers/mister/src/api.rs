@@ -35,6 +35,38 @@ pub struct AuthUser {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct AutoEnrollStatusResponse {
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoProvisionAppPasswordResponse {
+    pub token: Option<String>,
+    #[serde(rename = "plainTextKey")]
+    pub plain_text_key: Option<String>,
+    #[serde(rename = "plainTextToken")]
+    pub plain_text_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoProvisionRequest {
+    pub name: String,
+    #[serde(rename = "deviceType")]
+    pub device_type: String,
+    pub fingerprint: String,
+    pub hostname: String,
+    #[serde(rename = "helperName")]
+    pub helper_name: String,
+    #[serde(rename = "helperVersion")]
+    pub helper_version: String,
+    pub platform: String,
+    #[serde(rename = "syncPaths", skip_serializing_if = "Vec::is_empty")]
+    pub sync_paths: Vec<String>,
+    #[serde(rename = "systems", skip_serializing_if = "Vec::is_empty")]
+    pub systems: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LatestSaveResponse {
     pub exists: bool,
     pub sha256: Option<String>,
@@ -185,6 +217,40 @@ impl ApiClient {
             .context("request naar /auth/token/app-password faalde")?;
 
         parse_json_response(response)
+    }
+
+    pub fn auto_enroll_status(&self) -> Result<AutoEnrollStatusResponse> {
+        let url = self.url("/auth/app-passwords/auto-enroll");
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .context("request naar /auth/app-passwords/auto-enroll faalde")?;
+        parse_json_response(response)
+    }
+
+    pub fn token_app_password_auto_provision(
+        &self,
+        payload: &AutoProvisionRequest,
+    ) -> Result<TokenResponse> {
+        let url = self.url("/auth/token/app-password");
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(payload)
+            .send()
+            .context("request naar /auth/token/app-password (auto-provision) faalde")?;
+
+        let payload: AutoProvisionAppPasswordResponse = parse_json_response(response)?;
+        let token = payload
+            .token
+            .or(payload.plain_text_key)
+            .or(payload.plain_text_token)
+            .filter(|value| !value.trim().is_empty())
+            .context("/auth/token/app-password response bevat geen token/plainTextKey")?;
+
+        Ok(TokenResponse { token })
     }
 
     pub fn login_password(
