@@ -278,6 +278,71 @@ pub fn saturn_skip_reason(save_path: &Path, rom_path: Option<&Path>) -> Option<S
     }
 }
 
+pub fn dreamcast_skip_reason(save_path: &Path, rom_path: Option<&Path>) -> Option<String> {
+    let ext = path_extension(save_path)?;
+    if !matches!(ext.as_str(), "bin" | "vms" | "dci") {
+        return None;
+    }
+
+    let save_size = save_path.metadata().ok()?.len();
+    let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
+    let rom_lower = rom_path
+        .map(|path| path.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let combined = format!("{} {}", save_lower, rom_lower);
+    let dreamcast_hint = contains_any(
+        &combined,
+        &[
+            "dreamcast",
+            "/dreamcast/",
+            "\\dreamcast\\",
+            "flycast",
+            "reicast",
+            "vmu",
+            ".a1.bin",
+            ".a2.bin",
+            ".a3.bin",
+            ".a4.bin",
+            ".b1.bin",
+            ".b2.bin",
+            ".b3.bin",
+            ".b4.bin",
+            ".c1.bin",
+            ".c2.bin",
+            ".c3.bin",
+            ".c4.bin",
+            ".d1.bin",
+            ".d2.bin",
+            ".d3.bin",
+            ".d4.bin",
+        ],
+    );
+    let dreamcast_rom_hint = rom_path
+        .and_then(path_extension)
+        .map(|rom_ext| matches!(rom_ext.as_str(), "gdi" | "cdi" | "chd" | "cue" | "iso"))
+        .unwrap_or(false);
+    if ext == "bin" && !dreamcast_hint && !dreamcast_rom_hint {
+        return None;
+    }
+
+    if looks_plain_text(save_path) || looks_like_executable_or_archive(save_path) {
+        return Some("skip_invalid_dreamcast_container".to_string());
+    }
+
+    if !is_plausible_save_for_system(&ext, save_size, "dreamcast") {
+        return Some(format!(
+            "skip_dreamcast_without_structural_evidence(size={})",
+            save_size
+        ));
+    }
+
+    match inspect_dreamcast_metadata(save_path, &ext) {
+        Some(metadata) if metadata.save_entries > 0 => None,
+        Some(_) => Some("skip_empty_dreamcast_vmu".to_string()),
+        None => Some("skip_invalid_dreamcast_container".to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveClassification {
     pub system_slug: String,
@@ -1071,7 +1136,9 @@ fn validate_ps2_memory_card_image(path: &Path) -> bool {
 }
 
 fn validate_dreamcast_container(path: &Path, ext: &str) -> bool {
-    inspect_dreamcast_metadata(path, ext).is_some()
+    inspect_dreamcast_metadata(path, ext)
+        .map(|metadata| metadata.save_entries > 0)
+        .unwrap_or(false)
 }
 
 fn validate_saturn_backup_ram(path: &Path) -> bool {
@@ -1952,7 +2019,7 @@ mod tests {
         file.set_len(8 * 1024 * 1024).unwrap();
     }
 
-    fn build_dreamcast_vmu_with_single_save() -> Vec<u8> {
+    fn build_empty_dreamcast_vmu() -> Vec<u8> {
         let mut bytes = vec![0u8; DC_VMU_SIZE];
 
         let root_offset = DC_ROOT_BLOCK * DC_BLOCK_SIZE;
@@ -1982,6 +2049,12 @@ mod tests {
             let offset = fat_offset + block * 2;
             bytes[offset..offset + 2].copy_from_slice(&DC_FAT_END.to_le_bytes());
         }
+        bytes
+    }
+
+    fn build_dreamcast_vmu_with_single_save() -> Vec<u8> {
+        let mut bytes = build_empty_dreamcast_vmu();
+        let fat_offset = 254 * DC_BLOCK_SIZE;
         let save_block = 10usize;
         let next_save_block = 11usize;
         let offset = fat_offset + save_block * 2;
@@ -2163,6 +2236,45 @@ mod tests {
         assert!(classification.evidence.contains("vmu-bin"));
         assert!(classification.evidence.contains("icons=1"));
         assert!(classification.evidence.contains("title=SONIC ADV2"));
+    }
+
+    #[test]
+    fn empty_dreamcast_vmu_is_not_classified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp
+            .path()
+            .join("Emulation/saves/dreamcast/Sonic Adventure 2.A1.bin");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, build_empty_dreamcast_vmu()).unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn empty_dreamcast_vmu_reports_skip_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp
+            .path()
+            .join("Emulation/saves/dreamcast/Sonic Adventure 2.A1.bin");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, build_empty_dreamcast_vmu()).unwrap();
+
+        assert_eq!(
+            dreamcast_skip_reason(&save, None).as_deref(),
+            Some("skip_empty_dreamcast_vmu")
+        );
+    }
+
+    #[test]
+    fn valid_dreamcast_vmu_has_no_skip_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp
+            .path()
+            .join("Emulation/saves/dreamcast/Sonic Adventure 2.A1.bin");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, build_dreamcast_vmu_with_single_save()).unwrap();
+
+        assert!(dreamcast_skip_reason(&save, None).is_none());
     }
 
     #[test]
