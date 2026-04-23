@@ -455,7 +455,7 @@ fn process_single_save(
 
         let filename = upload_filename_for_sync(save_path, &system_slug);
 
-        let _upload = api.upload_save(
+        let upload_result = api.upload_save(
             &filename,
             normalized_save.canonical_bytes.clone(),
             &active_rom_sha1,
@@ -466,7 +466,21 @@ fn process_single_save(
             app_password,
             Some(&system_slug),
             Some(&runtime_target),
-        )?;
+        );
+        if let Err(err) = upload_result {
+            if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
+                report.skipped += 1;
+                if verbose {
+                    eprintln!(
+                        "Skipping empty N64 controller pak {}: {}",
+                        save_path.display(),
+                        err
+                    );
+                }
+                return Ok(None);
+            }
+            return Err(err);
+        }
 
         report.uploaded += 1;
         return Ok(Some(processed_entry(
@@ -506,7 +520,7 @@ fn process_single_save(
 
         let filename = upload_filename_for_sync(save_path, &system_slug);
 
-        api.upload_save(
+        let upload_result = api.upload_save(
             &filename,
             normalized_save.canonical_bytes.clone(),
             &active_rom_sha1,
@@ -517,7 +531,21 @@ fn process_single_save(
             app_password,
             Some(&system_slug),
             Some(&runtime_target),
-        )?;
+        );
+        if let Err(err) = upload_result {
+            if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
+                report.skipped += 1;
+                if verbose {
+                    eprintln!(
+                        "Skipping empty N64 controller pak {}: {}",
+                        save_path.display(),
+                        err
+                    );
+                }
+                return Ok(None);
+            }
+            return Err(err);
+        }
         report.uploaded += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
@@ -1414,6 +1442,20 @@ fn is_missing_cloud_payload_reference(err: &anyhow::Error) -> bool {
     payload_hint && missing_hint
 }
 
+fn is_empty_n64_controller_pak_rejection(err: &anyhow::Error, system_slug: &str) -> bool {
+    if system_slug != "n64" {
+        return false;
+    }
+    let message = format!("{err:#}").to_ascii_lowercase();
+    let status_match = message.contains("status=422 unprocessable entity")
+        || message.contains("status=400 bad request");
+    let controller_pak_hint = message.contains("controller-pak") || message.contains("cpk");
+    let empty_hint = message.contains("does not contain any save entries")
+        || message.contains("no save entries")
+        || message.contains("empty controller pak");
+    status_match && controller_pak_hint && empty_hint
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_conflict(
     api: &ApiClient,
@@ -1849,6 +1891,15 @@ mod tests {
             "HTTP request faalde: status=500 Internal Server Error body={\"error\":\"Internal Server Error\",\"message\":\"database unavailable\",\"statusCode\":500}",
         );
         assert!(!is_missing_cloud_payload_reference(&not_missing));
+    }
+
+    #[test]
+    fn detects_empty_n64_controller_pak_rejection() {
+        let err = anyhow::Error::msg(
+            "HTTP request faalde: status=422 Unprocessable Entity body={\"error\":\"Unprocessable Entity\",\"message\":\"unsupported\",\"reason\":\"n64 controller-pak does not contain any save entries\",\"statusCode\":422}",
+        );
+        assert!(is_empty_n64_controller_pak_rejection(&err, "n64"));
+        assert!(!is_empty_n64_controller_pak_rejection(&err, "snes"));
     }
 
     #[test]
