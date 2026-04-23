@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -908,7 +908,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "snes" => matches!(ext, "srm" | "sav" | "sa1"),
         "gameboy" => matches!(ext, "sav" | "srm" | "gme" | "rtc" | "ram"),
         "gba" => matches!(ext, "sav" | "srm" | "sa1"),
-        "n64" => matches!(ext, "sav" | "eep" | "fla" | "sra"),
+        "n64" => matches!(ext, "eep" | "fla" | "sra"),
         "nds" => matches!(ext, "sav" | "dsv"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
@@ -998,18 +998,41 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
     }
 }
 
-fn passes_binary_validation(save_path: &Path, save_ext: &str, _save_size: u64, slug: &str) -> bool {
+fn passes_binary_validation(save_path: &Path, save_ext: &str, save_size: u64, slug: &str) -> bool {
     if looks_like_executable_or_archive(save_path) {
         return false;
     }
 
     match slug {
+        "n64" => validate_n64_save_media(save_path, save_ext, save_size),
         "dreamcast" => validate_dreamcast_container(save_path, save_ext),
         "saturn" => validate_saturn_backup_ram(save_path),
         "psx" => validate_psx_container(save_path, save_ext),
         "ps2" => validate_ps2_memory_card_image(save_path),
         _ => true,
     }
+}
+
+fn validate_n64_save_media(path: &Path, ext: &str, size: u64) -> bool {
+    let expected_size_ok = match ext {
+        "eep" => matches!(size, 512 | 2048),
+        "sra" => size == 32 * 1024,
+        "fla" => size == 128 * 1024,
+        _ => false,
+    };
+    if !expected_size_ok {
+        return false;
+    }
+
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return false;
+    }
+    let all_zero = bytes.iter().all(|value| *value == 0x00);
+    let all_ff = bytes.iter().all(|value| *value == 0xFF);
+    !(all_zero || all_ff)
 }
 
 fn looks_like_executable_or_archive(path: &Path) -> bool {
@@ -2152,6 +2175,43 @@ mod tests {
         fs::write(&save, bytes).unwrap();
 
         assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn n64_blank_eeprom_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/N64/Wave Race 64 (USA).eep");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, vec![0u8; 512]).unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn n64_blank_flashram_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/N64/Paper Mario (USA).fla");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, vec![0xFFu8; 131072]).unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn n64_non_blank_native_media_is_supported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/N64/Super Mario 64 (USA).eep");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let mut payload = vec![0u8; 512];
+        payload[0] = 0x11;
+        payload[127] = 0x22;
+        payload[511] = 0x33;
+        fs::write(&save, payload).unwrap();
+
+        assert_eq!(
+            infer_supported_console_slug(&save, None).as_deref(),
+            Some("n64")
+        );
     }
 
     #[test]
