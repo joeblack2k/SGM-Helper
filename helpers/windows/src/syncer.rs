@@ -1361,18 +1361,9 @@ fn upload_filename_for_sync(save_path: &Path, system_slug: &str) -> String {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("save.bin");
-    if system_slug != "n64" {
-        return file_name.to_string();
-    }
-    if save_extension(save_path).as_deref() != Some("cpk") {
-        return file_name.to_string();
-    }
-    let stem = Path::new(file_name)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("save");
-    format!("{stem}.mpk")
+    let _ = system_slug;
+    let _ = save_path;
+    file_name.to_string()
 }
 
 fn is_legacy_n64_latest_mismatch(err: &anyhow::Error, system_slug: &str) -> bool {
@@ -1778,11 +1769,11 @@ mod tests {
     }
 
     #[test]
-    fn n64_cpk_upload_filename_maps_to_mpk() {
+    fn n64_cpk_upload_filename_keeps_cpk() {
         let file = PathBuf::from("/media/fat/saves/N64/Mario Kart 64 (USA)_1.cpk");
         assert_eq!(
             upload_filename_for_sync(&file, "n64"),
-            "Mario Kart 64 (USA)_1.mpk"
+            "Mario Kart 64 (USA)_1.cpk"
         );
     }
 
