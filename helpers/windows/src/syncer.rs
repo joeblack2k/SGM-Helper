@@ -417,6 +417,20 @@ fn process_single_save(
                 id: None,
             }
         }
+        Err(err) if is_missing_cloud_payload_reference(&err) => {
+            if verbose {
+                eprintln!(
+                    "Cloud latest points to missing payload for {}; forcing repair upload",
+                    save_path.display()
+                );
+            }
+            LatestSaveResponse {
+                exists: false,
+                sha256: None,
+                version: None,
+                id: None,
+            }
+        }
         Err(err) => return Err(err),
     };
 
@@ -721,14 +735,23 @@ fn process_missing_save(
         device_type,
     );
 
-    let latest = api.latest_save(
+    let latest = match api.latest_save(
         rom_sha1,
         &effective_slot_name,
         device_type,
         fingerprint,
         app_password,
         Some(&runtime_target),
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(err) if is_missing_cloud_payload_reference(&err) => LatestSaveResponse {
+            exists: false,
+            sha256: None,
+            version: None,
+            id: None,
+        },
+        Err(err) => return Err(err),
+    };
     if !latest.exists {
         report.skipped += 1;
         if verbose {
@@ -1376,6 +1399,21 @@ fn is_legacy_n64_latest_mismatch(err: &anyhow::Error, system_slug: &str) -> bool
         && message.contains("for eeprom")
 }
 
+fn is_missing_cloud_payload_reference(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    let status_match = message.contains("status=500 internal server error")
+        || message.contains("status=404 not found");
+    if !status_match {
+        return false;
+    }
+    let payload_hint = message.contains("payload")
+        || message.contains("save payload file is missing on server")
+        || message.contains("missing payload");
+    let missing_hint =
+        message.contains("no such file or directory") || message.contains("missing on server");
+    payload_hint && missing_hint
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_conflict(
     api: &ApiClient,
@@ -1794,10 +1832,23 @@ mod tests {
     #[test]
     fn detects_legacy_n64_latest_payload_mismatch() {
         let err = anyhow::Error::msg(
-            "HTTP request faalde: status=400 Bad Request body={\"error\":\"Bad Request\",\"message\":\"N64 canonical payload size 512 does not match expected 2048 for eeprom\",\"statusCode\":400}"
+            "HTTP request faalde: status=400 Bad Request body={\"error\":\"Bad Request\",\"message\":\"N64 canonical payload size 512 does not match expected 2048 for eeprom\",\"statusCode\":400}",
         );
         assert!(is_legacy_n64_latest_mismatch(&err, "n64"));
         assert!(!is_legacy_n64_latest_mismatch(&err, "snes"));
+    }
+
+    #[test]
+    fn detects_missing_cloud_payload_reference() {
+        let err = anyhow::Error::msg(
+            "HTTP request faalde: status=500 Internal Server Error body={\"error\":\"Internal Server Error\",\"message\":\"open /saves/Nintendo 64/Test/payload.mpk: no such file or directory\",\"statusCode\":500}",
+        );
+        assert!(is_missing_cloud_payload_reference(&err));
+
+        let not_missing = anyhow::Error::msg(
+            "HTTP request faalde: status=500 Internal Server Error body={\"error\":\"Internal Server Error\",\"message\":\"database unavailable\",\"statusCode\":500}",
+        );
+        assert!(!is_missing_cloud_payload_reference(&not_missing));
     }
 
     #[test]
