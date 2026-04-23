@@ -12,8 +12,8 @@ use sha2::Sha256;
 use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
-    "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "dsv", "gme", "mcr", "mc", "mcd",
-    "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
+    "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "dsv", "gme", "mcr", "mc",
+    "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
 ];
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -950,7 +950,7 @@ fn infer_sony_slug(haystack: &str) -> &'static str {
 
 fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
     match ext {
-        "eep" | "fla" | "sra" => Some("n64"),
+        "eep" | "fla" | "sra" | "mpk" => Some("n64"),
         "dsv" => Some("nds"),
         "mcr" | "mc" | "mcd" | "vmp" | "psv" => Some("psx"),
         "ps2" | "bin" => Some("ps2"),
@@ -973,7 +973,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "snes" => matches!(ext, "srm" | "sav" | "sa1"),
         "gameboy" => matches!(ext, "sav" | "srm" | "gme" | "rtc" | "ram"),
         "gba" => matches!(ext, "sav" | "srm" | "sa1"),
-        "n64" => matches!(ext, "eep" | "fla" | "sra"),
+        "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk"),
         "nds" => matches!(ext, "sav" | "dsv"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
@@ -1013,10 +1013,12 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
                 size == 512 || size == 2048
             } else if ext == "sra" {
                 size == 32 * 1024
+            } else if ext == "mpk" {
+                size == 32 * 1024
             } else if ext == "fla" {
                 size == 128 * 1024
             } else {
-                matches!(size, 512 | 2048 | 32_768 | 131_072 | 786_432)
+                false
             }
         }
         "nds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
@@ -1082,6 +1084,7 @@ fn validate_n64_save_media(path: &Path, ext: &str, size: u64) -> bool {
     let expected_size_ok = match ext {
         "eep" => matches!(size, 512 | 2048),
         "sra" => size == 32 * 1024,
+        "mpk" => size == 32 * 1024,
         "fla" => size == 128 * 1024,
         _ => false,
     };
@@ -2310,6 +2313,16 @@ mod tests {
     }
 
     #[test]
+    fn n64_blank_controller_pak_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/N64/Mario Kart 64 (USA).mpk");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, vec![0u8; 32768]).unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
     fn n64_non_blank_native_media_is_supported() {
         let tmp = tempfile::tempdir().unwrap();
         let save = tmp.path().join("MiSTer/N64/Super Mario 64 (USA).eep");
@@ -2318,6 +2331,23 @@ mod tests {
         payload[0] = 0x11;
         payload[127] = 0x22;
         payload[511] = 0x33;
+        fs::write(&save, payload).unwrap();
+
+        assert_eq!(
+            infer_supported_console_slug(&save, None).as_deref(),
+            Some("n64")
+        );
+    }
+
+    #[test]
+    fn n64_non_blank_controller_pak_is_supported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/N64/Mario Kart 64 (USA).mpk");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let mut payload = vec![0u8; 32768];
+        payload[0] = 0x5A;
+        payload[4096] = 0x01;
+        payload[32767] = 0xA5;
         fs::write(&save, payload).unwrap();
 
         assert_eq!(

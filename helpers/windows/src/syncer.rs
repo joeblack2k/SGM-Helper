@@ -946,7 +946,10 @@ fn select_preferred_save_per_stem(
             save_size,
         )
         .map(|preferred| {
-            if extension.as_deref() == Some(preferred) {
+            if classification.system_slug == "n64" && is_native_n64_extension(extension.as_deref())
+            {
+                2
+            } else if extension.as_deref() == Some(preferred) {
                 2
             } else {
                 1
@@ -987,12 +990,16 @@ fn preferred_save_path(
     let Some(system_slug) = system_slug else {
         return save_path.to_path_buf();
     };
+    let current_extension = save_extension(save_path);
+    if system_slug == "n64" && is_native_n64_extension(current_extension.as_deref()) {
+        return save_path.to_path_buf();
+    }
     let Some(preferred_extension) =
         preferred_extension_for_system(source_kind, source_profile, system_slug, canonical_size)
     else {
         return save_path.to_path_buf();
     };
-    if save_extension(save_path).as_deref() == Some(preferred_extension) {
+    if current_extension.as_deref() == Some(preferred_extension) {
         return save_path.to_path_buf();
     }
     let mut target = save_path.to_path_buf();
@@ -1029,23 +1036,14 @@ fn preferred_extension_for_cartridge(source_profile: &EmulatorProfile) -> Option
 }
 
 fn preferred_extension_for_n64(
-    source_kind: &SourceKind,
-    source_profile: &EmulatorProfile,
+    _source_kind: &SourceKind,
+    _source_profile: &EmulatorProfile,
     save_size: Option<u64>,
 ) -> Option<&'static str> {
-    if !matches!(
-        source_profile,
-        EmulatorProfile::Mister | EmulatorProfile::EverDrive
-    ) && !matches!(source_kind, SourceKind::MisterFpga)
-    {
-        return Some("sav");
-    }
-
     match save_size {
         Some(512) | Some(2_048) => Some("eep"),
         Some(32_768) => Some("sra"),
         Some(131_072) => Some("fla"),
-        Some(786_432) => Some("sav"),
         _ => None,
     }
 }
@@ -1054,6 +1052,10 @@ fn save_extension(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase())
+}
+
+fn is_native_n64_extension(extension: Option<&str>) -> bool {
+    matches!(extension, Some("eep" | "fla" | "sra" | "mpk"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1235,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_n64_sav_for_non_mister_sources() {
+    fn prefers_n64_native_extension_for_non_mister_sources() {
         assert_eq!(
             preferred_extension_for_system(
                 &SourceKind::RetroArch,
@@ -1243,7 +1245,7 @@ mod tests {
                 "n64",
                 Some(32_768)
             ),
-            Some("sav")
+            Some("sra")
         );
     }
 
@@ -1293,6 +1295,33 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn n64_unknown_size_has_no_forced_extension() {
+        assert_eq!(
+            preferred_extension_for_system(
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                "n64",
+                Some(786_432)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_native_n64_mpk_extension_on_download_path() {
+        let path = PathBuf::from("/userdata/saves/n64/Mario Kart 64.mpk");
+        let target = preferred_save_path(
+            &path,
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            Some("n64"),
+            SaveContainerFormat::Native,
+            Some(32_768),
+        );
+        assert_eq!(target, path);
     }
 
     #[test]
