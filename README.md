@@ -1,250 +1,183 @@
 # SGM-Helper
 
-Open-source helper binaries for self-hosted retro save sync.
+Open-source helper apps for self-hosted retro save sync.
 
-This repository is a multi-helper monorepo. Every helper keeps the same CLI contract, while
-platform defaults differ for MiSTer, Steam Deck, and Windows.
+This repo is built for homelab emulator users. You run a helper on each device (MiSTer, Steam Deck, Windows, and more), and each helper syncs local saves with your self-hosted backend.
 
-## Repository Layout
+## What You Need
 
-- `helpers/mister` - MiSTer FPGA helper (`sgm-mister-helper`)
-- `helpers/steamdeck` - Steam Deck helper (`sgm-steamdeck-helper`)
-- `helpers/windows` - Windows helper (`sgm-windows-helper.exe`)
-- `helpers/gamecube` - Swiss-startable GameCube helper with Wii Homebrew Launcher support (`sgm-gamecube-helper.dol`, `sgm-wii-helper.dol`)
-- `helpers/anbernic` - reserved subfolder for future Anbernic helper
-- `docs/mister` - MiSTer install + protocol notes
-- `docs/steamdeck` - Steam Deck install + protocol notes
-- `docs/windows` - Windows install + protocol notes
-- `docs/gamecube` - GameCube install + protocol + backend worker notes
+1. A running Save Game Manager backend reachable on your LAN.
+2. A device helper binary from [Releases](https://github.com/joeblack2k/SGM-Helper/releases).
+3. A `config.ini` file next to the helper binary.
+4. One auth method:
+   - App password (`login --email --app-password`), or
+   - Backend "Add helper" enroll flow.
 
-## Release Artifacts
+If backend auth is disabled, you can usually run `sync` directly.
 
-- MiSTer ARMv7: `sgm-mister-helper-armv7.tar.gz`
-- Steam Deck Linux x86_64: `sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz`
-- Windows x86_64: `sgm-windows-helper-x86_64-pc-windows-gnu.zip`
-- GameCube DOL: `sgm-gamecube-helper.dol`
+## Supported Helpers and Release Files
+
+- MiSTer: `sgm-mister-helper-armv7.tar.gz`
+- Steam Deck: `sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz`
+- Windows: `sgm-windows-helper-x86_64-pc-windows-gnu.zip`
+- GameCube/Wii: `sgm-gamecube-helper.dol`
+- Nintendo 3DS: `sgm-3ds-helper.3dsx`
 - Checksums: `sha256.txt`
 
-## Supported Sync Model
+## Minimal First Setup (MiSTer)
 
-The helpers sync through a canonical backend representation:
-
-1. Local save candidates are scanned and validated.
-2. Local emulator/container data is normalized to canonical raw bytes.
-3. Backend stores canonical/raw bytes.
-4. Download restores to the local format when possible.
-5. Adapter metadata is persisted in `state/sync_state.json` for deterministic restore.
-
-Validation is strict. Files are not accepted by extension alone. Scanner checks include:
-
-- binary payload verification (rejects obvious text/junk)
-- size/profile checks where known
-- console/path hints
-- Saturn backup RAM validation (real header + entry parsing, empty images skipped)
-- PS1 container validation and conversion (`raw`, `.gme`, `.vmp`)
-- PS2 memory card header validation
-- Dreamcast VMU/DCI/VMS validation and metadata extraction (entries/icons/title/app)
-- Dreamcast NVRAM blob rejection (`dc_nvmem.bin`)
-
-Saturn helper policy:
-
-- `saturn` classification requires structural backup RAM validation, not only path or extension hints
-- accepted Saturn payloads must contain at least one active save entry
-- empty backup RAM images are skipped and should not be uploaded
-- supported Saturn backup RAM sizes are `32768`, `65536`, `524288`, `1048576`, `557056`, `1114112`, `4194304`, and `8388608` bytes
-- helper diagnostics now emit explicit Saturn skip reasons such as `skip_empty_saturn_backup_ram`, `skip_invalid_saturn_backup_ram`, and `skip_saturn_without_structural_evidence(...)`
-
-PlayStation helper contract:
-
-- Helpers upload full memory-card images only (`.mcr/.mcd/.mc/.gme/.vmp/.psv` for PS1, `.ps2` for PS2).
-- Helpers do not extract/merge logical saves client-side; backend parsing/projection is authoritative.
-- PlayStation sync identity is runtime profile + slot, not ROM lookup.
-- PS1 runtime `device_type`: `mister` (MiSTer profile) or `retroarch` (other PS1 profiles).
-- PS2 runtime `device_type`: `pcsx2`.
-- Slot is always resolved to `Memory Card 1` or `Memory Card 2` from `--slot-name` or filename/path hints (`memory_card_1`, `Mcd001.ps2`), with default `Memory Card 1`.
-- For PlayStation lines helpers use deterministic backend keys: `ps-line:<system>:<device_type>:<slot>`.
-
-Extension policy for cartridge-style systems (Nintendo/Sega/NeoGeo):
-
-- Decision is now based on per-source `PROFILE` (not only `KIND`)
-- `PROFILE="mister"` prefers `.sav`
-- `PROFILE="retroarch"`, `PROFILE="snes9x"`, `PROFILE="zsnes"`, `PROFILE="everdrive"`, `PROFILE="generic"` prefer `.srm`
-- If both variants exist for the same ROM stem, sync prioritizes the preferred extension per source profile
-- N64 exception: `PROFILE="mister"` and `PROFILE="everdrive"` preserve/target native save types by size (`.eep`, `.sra`, `.fla`)
-
-Supported console families in strict classification:
-
-- Nintendo
-- Sega (Genesis/Mega Drive, Master System, Game Gear, Mega-CD, 32X, Saturn, Dreamcast)
-- NeoGeo
-- Sony (PS1, PS2, PSP, PS3, PS Vita, PS4, PS5)
-
-## Quick Start
-
-1. Download the correct artifact for your platform.
-2. Put binary and `config.ini` in the same folder.
-3. Configure backend host and port.
-4. Login once.
-5. Run sync.
-
-Example `config.ini` minimum:
+1. Copy `sgm-mister-helper` to your MiSTer (for example `/media/fat/`).
+2. Create `/media/fat/config.ini`:
 
 ```ini
-URL="192.168.1.1"
-PORT="9096"
+URL="192.168.2.10"
+PORT="80"
 ```
 
-Example first run:
+3. First sync:
 
 ```bash
-./sgm-mister-helper login --email you@example.com --app-password your-app-password
+cd /media/fat
 ./sgm-mister-helper sync
 ```
 
+4. If auth is enabled, do one of these first:
+
 ```bash
-./sgm-steamdeck-helper login --email you@example.com --app-password your-app-password
+./sgm-mister-helper login --email you@example.com --app-password YOUR_APP_PASSWORD
+./sgm-mister-helper sync
+```
+
+Or:
+
+1. Open backend UI.
+2. Click `Add helper`.
+3. Run `./sgm-mister-helper sync` within 15 minutes.
+
+### MiSTer Minimal Options Explained
+
+- `URL`: backend IP or hostname, no `http://`.
+- `PORT`: backend port.
+
+That is enough for first run. The helper will auto-scan known save locations on first sync when no sources are configured.
+
+## Minimal First Setup (Steam Deck / EmuDeck)
+
+1. Copy `sgm-steamdeck-helper` to a folder, for example `/home/deck/SGM-Helper/`.
+2. Create `/home/deck/SGM-Helper/config.ini`:
+
+```ini
+URL="192.168.2.10"
+PORT="80"
+```
+
+3. First sync:
+
+```bash
+cd /home/deck/SGM-Helper
 ./sgm-steamdeck-helper sync
 ```
 
-```powershell
-.\sgm-windows-helper.exe login --email you@example.com --app-password your-app-password
-.\sgm-windows-helper.exe sync
+4. If needed, login once:
+
+```bash
+./sgm-steamdeck-helper login --email you@example.com --app-password YOUR_APP_PASSWORD
+./sgm-steamdeck-helper sync
 ```
 
-Auto-enroll first run (no manual login):
+### Steam Deck Minimal Options Explained
 
-1. Start backend UI and click `Add helper` (opens 15-minute enroll window).
-2. Start helper with `sync` or `watch`.
-3. Helper auto-detects gate status, self-registers, stores token in `STATE_DIR/auth.json`, and continues syncing.
+- `URL`: backend IP or hostname, no `http://`.
+- `PORT`: backend port.
 
-GameCube/Wii quick flow:
+On first run, the helper tries known paths (including common EmuDeck-style save locations), then stores sources in `config.ini`.
 
-1. Launch helper from Swiss (GameCube) or Homebrew Launcher (Wii).
-2. Select discovered `Save Game Manager` server.
-3. Enter 6-character device password from web UI.
-4. Choose `Save per game` or `Restore from backend`.
+## First-Run Behavior and Save Discovery
 
-## Config Contract (`config.ini`)
+When you run `sync` or `watch` for the first time and no `[source.*]` sections exist:
 
-Default location is the same folder as the executable:
+1. The helper runs a known-path scan.
+2. Found sources are written into `config.ini` as `MANAGED="true"`.
+3. Next runs use those stored sources.
 
-- `./config.ini`
+Use these scan controls:
 
-Precedence order:
+- `--scan`: rescan known emulator paths and refresh only `MANAGED="true"` sources.
+- `--deep-scan`: broad scan, write candidates to `STATE_DIR/scan_report.json` (review only).
+- `--deep-scan --apply-scan`: write deep-scan candidates into `config.ini`.
 
-- CLI flags
-- environment variables
-- `config.ini`
-- internal defaults
+## `config.ini` Reference
 
-Environment variable aliases are supported as both `SGM_<KEY>` and `<KEY>`:
+Default path: same folder as the binary (`./config.ini`).
 
-- `SGM_URL` or `URL`
-- `SGM_PORT` or `PORT`
-- `SGM_EMAIL` or `EMAIL`
-- `SGM_APP_PASSWORD` or `APP_PASSWORD`
-- `SGM_ROOT` or `ROOT`
-- `SGM_STATE_DIR` or `STATE_DIR`
-- `SGM_WATCH` or `WATCH`
-- `SGM_WATCH_INTERVAL` or `WATCH_INTERVAL`
-- `SGM_FORCE_UPLOAD` or `FORCE_UPLOAD`
-- `SGM_DRY_RUN` or `DRY_RUN`
-- `SGM_ROUTE_PREFIX` or `ROUTE_PREFIX`
-- `ONE_RETRO_API_URL` (host:port override)
-- `API_URL` (host:port override)
+Precedence: `CLI flags > ENV > config.ini > defaults`.
 
-Global keys:
+### Global Keys
 
-- `URL` required host/IP without schema
-- `PORT` required backend port
-- `EMAIL` optional default email
-- `APP_PASSWORD` optional default app-password
-- `ROOT` optional scan root (platform default differs)
-- `STATE_DIR` optional state directory (default `./state`)
-- `WATCH` optional bool default `false`
-- `WATCH_INTERVAL` optional seconds default `30`
-- `FORCE_UPLOAD` optional bool default `false`
-- `DRY_RUN` optional bool default `false`
-- `ROUTE_PREFIX` optional API prefix, for example `v1`
+```ini
+URL="192.168.2.10"
+PORT="80"
+EMAIL=""
+APP_PASSWORD=""
+ROOT="/media/fat"
+STATE_DIR="./state"
+WATCH="false"
+WATCH_INTERVAL="30"
+FORCE_UPLOAD="false"
+DRY_RUN="false"
+ROUTE_PREFIX=""
+```
 
-Platform default `ROOT` values:
+### Global Keys Explained
+
+- `URL`: backend host/IP without scheme.
+- `PORT`: backend port.
+- `EMAIL`: optional default email for auth commands.
+- `APP_PASSWORD`: optional default app password.
+- `ROOT`: optional scan root.
+- `STATE_DIR`: helper state folder (`auth.json`, sync state, lockfile).
+- `WATCH`: default watch mode.
+- `WATCH_INTERVAL`: polling interval in seconds for watch mode.
+- `FORCE_UPLOAD`: force upload preference.
+- `DRY_RUN`: dry-run preference.
+- `ROUTE_PREFIX`: optional API prefix, for example `v1`.
+
+### Platform Default `ROOT`
 
 - MiSTer: `/media/fat`
 - Steam Deck: `/home/deck/.steam/steam/steamapps/compatdata`
 - Windows: `./saves`
 
-## Source Sections (`[source.<id>]`)
+### Source Sections
 
-Sources are stored in `config.ini` as first-class config:
+The helper stores save source mappings in `config.ini`:
 
 ```ini
 [source.super_nintendo]
 LABEL="Super Nintendo"
 KIND="retroarch"
 PROFILE="snes9x"
-SAVE_PATH="/home/snes9x/save"
-ROM_PATH="/home/roms/snes"
+SAVE_PATH="/home/deck/Emulation/saves/snes"
+ROM_PATH="/home/deck/Emulation/roms/snes"
 RECURSIVE="true"
 MANAGED="false"
 ORIGIN="manual"
 ```
 
-Source keys:
+Each key:
 
-- `LABEL` display name
-- `KIND` platform/source kind
-- `PROFILE` emulator profile used for save-extension mapping (`mister`, `retroarch`, `snes9x`, `zsnes`, `everdrive`, `generic`)
-- `SAVE_PATH` save directory
-- `ROM_PATH` ROM directory (optional but recommended)
-- `RECURSIVE` include nested directories
-- `MANAGED` `true` for autoscan-managed entries
-- `ORIGIN` metadata (`manual`, `scan`, `deep-scan`, `first-run`, ...)
+- `LABEL`: display name.
+- `KIND`: runtime/source kind (`mister-fpga`, `retroarch`, `custom`, ...).
+- `PROFILE`: emulator profile mapping (for extension behavior).
+- `SAVE_PATH`: save folder path.
+- `ROM_PATH`: ROM folder path (optional, recommended).
+- `RECURSIVE`: include subfolders.
+- `MANAGED`: `true` if helper manages this source during scans.
+- `ORIGIN`: metadata (`manual`, `scan`, `deep-scan`, `first-run`).
 
-Legacy migration:
+## CLI Commands
 
-- If no `[source.*]` exists but `state/sources.json` exists, helper migrates once to `config.ini`.
-- Old file is renamed to `sources.migrated.<timestamp>.json`.
-
-## Scan Modes
-
-First-run behavior:
-
-- If no source sections exist, `sync` and `watch` trigger known-path autoscan.
-
-Command flags:
-
-- `--scan` reruns known-path scan and replaces only `MANAGED=true` sources.
-- `--deep-scan` scans broader disk locations and writes review output.
-- `--apply-scan` applies deep-scan candidates to config (only valid with `--deep-scan`).
-
-Deep-scan review report:
-
-- `STATE_DIR/scan_report.json`
-
-## Scheduler
-
-Built-in schedule management:
-
-- `schedule install --every-minutes <n>`
-- `schedule status`
-- `schedule uninstall`
-
-Behavior:
-
-- Linux uses `crontab` entries with a stable marker.
-- Windows uses Task Scheduler (`schtasks`).
-- Installed job executes `sync --quiet` with explicit `--config`.
-- Sync overlap is prevented by lockfile `STATE_DIR/sync.lock`.
-
-Note for Linux cron:
-
-- `--every-minutes` must be between `1` and `59`.
-
-## Command Reference (All Helpers)
-
-The command set below is shared by MiSTer, Steam Deck, and Windows helpers.
-
-Top-level:
+The MiSTer, Steam Deck, and Windows helpers share the same command set.
 
 - `signup`
 - `login`
@@ -252,161 +185,111 @@ Top-level:
 - `logout`
 - `token`
 - `sync`
-- `convert`
 - `watch`
-- `source`
-- `state`
-- `config`
-- `schedule`
+- `convert`
+- `source list`
+- `source add custom|mister-fpga|retroarch|openemu|analogue-pocket`
+- `source remove --name <id>`
+- `state list`
+- `state clean --missing|--all`
+- `config show`
+- `schedule install|status|uninstall`
 - `device-auth`
 
-Global options:
+## CLI Flags (Global)
+
+Use these before any command:
 
 - `--config <path>`
 - `--url <host>`
-- `--api-url <http://host:port>`
-- `--port <u16>`
+- `--api-url <host:port or url>`
+- `--port <port>`
 - `--email <email>`
-- `--app-password <secret>`
+- `--app-password <password>`
 - `--root <path>`
 - `--state-dir <path>`
 - `--route-prefix <prefix>`
 - `--verbose`
 - `--quiet`
 
-### `signup`
+## CLI Flags (`sync` and `watch`)
 
-Create account (when backend supports signup).
+- `--force-upload[=true|false]`
+- `--dry-run[=true|false]`
+- `--scan`
+- `--deep-scan`
+- `--apply-scan` (used with `--deep-scan`)
+- `--slot-name <name>` (PlayStation slot hint)
+- `watch` only: `--watch-interval <seconds>`
 
-- `signup --email <email> --display-name <name>`
-- Optional `--password <password>`
-- Optional `--skip-verification`
+## How to Run Automatically (Recommended)
 
-### `login`
+Use built-in scheduler commands. This is the easiest option.
 
-Supported login modes:
-
-- `login --email <email> --app-password <password>`
-- `login --email <email> --password <password>`
-- `login --device`
-
-### `resend-verification`
-
-- `resend-verification --email <email>`
-
-### `logout`
-
-- `logout`
-
-### `token`
-
-- `token`
-- `token --details`
-
-### `sync`
-
-Run one synchronization cycle.
-
-- `sync`
-- Optional `--force-upload[=true|false]`
-- Optional `--dry-run[=true|false]`
-- Optional `--scan`
-- Optional `--deep-scan`
-- Optional `--apply-scan`
-- Optional `--slot-name <name>`
-
-### `convert`
-
-Manual conversion helper for PS1 save containers.
-
-- `convert --input <path> --output <path> --from auto|raw|gme|vmp --to raw|gme|vmp`
-
-### `watch`
-
-Long-running sync loop with optional polling interval.
-
-- `watch`
-- Optional `--watch-interval <seconds>`
-- Optional `--force-upload[=true|false]`
-- Optional `--dry-run[=true|false]`
-- Optional `--scan`
-- Optional `--deep-scan`
-- Optional `--apply-scan`
-- Optional `--slot-name <name>`
-
-### `source`
-
-Source management commands:
-
-- `source list`
-- `source remove --name <source-id>`
-- `source add custom --name <id> [--profile <mister|retroarch|snes9x|zsnes|everdrive|generic>] --saves <path>... [--roms <path>...] [--recursive[=true|false]]`
-- `source add mister-fpga --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
-- `source add retroarch --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
-- `source add openemu --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
-- `source add analogue-pocket --name <id> [--profile <...>] --root <path> [--recursive[=true|false]]`
-
-### `state`
-
-State maintenance:
-
-- `state list`
-- `state clean --missing`
-- `state clean --all`
-
-### `config`
-
-- `config show`
-
-### `schedule`
-
-- `schedule install --every-minutes <n>`
-- `schedule status`
-- `schedule uninstall`
-
-### `device-auth`
-
-- `device-auth --poll-interval <seconds>`
-
-## End-to-End User Flow
-
-Recommended onboarding flow for new users:
-
-1. Download helper binary for platform.
-2. Place `config.ini` next to the binary.
-3. Set `URL` and `PORT`.
-4. Run `login`.
-5. Run `sync` once.
-6. Inspect `source list`.
-7. If needed run `sync --scan` to refresh known paths.
-8. Optional: run `sync --deep-scan` and review `scan_report.json`.
-9. Optional: apply deep results with `sync --deep-scan --apply-scan`.
-10. Enable recurring sync with `schedule install --every-minutes 30`.
-
-## Build From Source
+### MiSTer
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+cd /media/fat
+./sgm-mister-helper schedule install --every-minutes 30
+./sgm-mister-helper schedule status
 ```
 
-Build helper binaries:
+### Steam Deck
 
 ```bash
-cargo build -p sgm-mister-helper --release
-cargo build -p sgm-steamdeck-helper --release
-cargo build -p sgm-windows-helper --release --target x86_64-pc-windows-gnu
+cd /home/deck/SGM-Helper
+./sgm-steamdeck-helper schedule install --every-minutes 30
+./sgm-steamdeck-helper schedule status
 ```
 
-## Per-Helper Guides
+Remove schedule:
 
-- MiSTer: `helpers/mister/README.md` and `docs/mister/install.md`
-- Steam Deck: `helpers/steamdeck/README.md` and `docs/steamdeck/install.md`
-- Windows: `helpers/windows/README.md` and `docs/windows/install.md`
+```bash
+./sgm-mister-helper schedule uninstall
+./sgm-steamdeck-helper schedule uninstall
+```
 
-## Roadmap
+Notes:
 
-- Anbernic helper in `helpers/anbernic`
-- Additional converter adapters
-- Expanded emulator auto-discovery profiles
+- Linux helpers use cron entries.
+- Windows helper uses Task Scheduler.
+- Scheduled runs execute `sync --quiet`.
+- Overlapping runs are prevented via `STATE_DIR/sync.lock`.
+
+## Optional: Continuous Watch as a Systemd Service (Linux)
+
+If you prefer always-on watch mode instead of interval scheduler:
+
+```ini
+[Unit]
+Description=SGM SteamDeck Helper Watch
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/deck/SGM-Helper
+ExecStart=/home/deck/SGM-Helper/sgm-steamdeck-helper watch --watch-interval 30 --quiet
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now sgm-steamdeck-helper.service
+systemctl status sgm-steamdeck-helper.service
+```
+
+## Documentation
+
+- MiSTer: [`docs/mister/install.md`](docs/mister/install.md)
+- Steam Deck: [`docs/steamdeck/install.md`](docs/steamdeck/install.md)
+- Windows: [`docs/windows/install.md`](docs/windows/install.md)
+- GameCube: [`docs/gamecube/install.md`](docs/gamecube/install.md)
+- 3DS: [`docs/3ds/install.md`](docs/3ds/install.md)
+
