@@ -946,10 +946,10 @@ fn select_preferred_save_per_stem(
             save_size,
         )
         .map(|preferred| {
-            if classification.system_slug == "n64" && is_native_n64_extension(extension.as_deref())
+            if (classification.system_slug == "n64"
+                && is_native_n64_extension(extension.as_deref()))
+                || extension.as_deref() == Some(preferred)
             {
-                2
-            } else if extension.as_deref() == Some(preferred) {
                 2
             } else {
                 1

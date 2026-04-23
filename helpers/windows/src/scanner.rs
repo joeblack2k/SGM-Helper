@@ -1008,19 +1008,12 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536
         ),
         "gba" => matches!(size, 512 | 8192 | 32768 | 65536 | 131072),
-        "n64" => {
-            if ext == "eep" {
-                size == 512 || size == 2048
-            } else if ext == "sra" {
-                size == 32 * 1024
-            } else if ext == "mpk" {
-                size == 32 * 1024
-            } else if ext == "fla" {
-                size == 128 * 1024
-            } else {
-                false
-            }
-        }
+        "n64" => match ext {
+            "eep" => size == 512 || size == 2048,
+            "sra" | "mpk" => size == 32 * 1024,
+            "fla" => size == 128 * 1024,
+            _ => false,
+        },
         "nds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
         "genesis" | "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
             matches!(
