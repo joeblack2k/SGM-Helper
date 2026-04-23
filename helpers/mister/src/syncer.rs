@@ -9,7 +9,7 @@ use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, encode_download_for_local_container, filename_stem,
-    md5_file, normalize_save_for_sync, sha1_file, sha256_bytes,
+    md5_file, normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes,
 };
 use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
@@ -282,7 +282,11 @@ fn process_single_save(
         classify_supported_save(save_path, rom_entry.map(|entry| entry.path.as_path()))
     else {
         report.skipped += 1;
-        if verbose {
+        if let Some(reason) =
+            saturn_skip_reason(save_path, rom_entry.map(|entry| entry.path.as_path()))
+        {
+            eprintln!("Skipping Saturn save {}: {}", save_path.display(), reason);
+        } else if verbose {
             eprintln!(
                 "Skipping non-supported save (outside allowed console families): {}",
                 save_path.display()

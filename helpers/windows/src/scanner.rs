@@ -53,6 +53,20 @@ const DC_FILETYPE_GAME: u8 = 0xCC;
 const DC_FAT_FREE: u16 = 0xFFFC;
 const DC_FAT_END: u16 = 0xFFFA;
 const DC_NVMEM_MAGIC: &[u8] = b"KATANA_FLASH____";
+const SATURN_HEADER_MAGIC: &[u8] = b"BackUpRam Format";
+const SATURN_MIN_MAGIC_BYTES: usize = 0x40;
+const SATURN_INTERNAL_RAW_SIZE: usize = 0x8000;
+const SATURN_INTERNAL_INTERLEAVED_SIZE: usize = SATURN_INTERNAL_RAW_SIZE * 2;
+const SATURN_CARTRIDGE_RAW_SIZE: usize = 0x80000;
+const SATURN_CARTRIDGE_INTERLEAVED_SIZE: usize = SATURN_CARTRIDGE_RAW_SIZE * 2;
+const SATURN_YABASANSHIRO_RAW_SIZE: usize = 0x400000;
+const SATURN_YABASANSHIRO_INTERLEAVED_SIZE: usize = SATURN_YABASANSHIRO_RAW_SIZE * 2;
+const SATURN_COMBINED_RAW_SIZE: usize = SATURN_INTERNAL_RAW_SIZE + SATURN_CARTRIDGE_RAW_SIZE;
+const SATURN_COMBINED_INTERLEAVED_SIZE: usize =
+    SATURN_INTERNAL_INTERLEAVED_SIZE + SATURN_CARTRIDGE_INTERLEAVED_SIZE;
+const SATURN_INTERNAL_BLOCK_SIZE: usize = 0x40;
+const SATURN_CARTRIDGE_BLOCK_SIZE: usize = 0x200;
+const SATURN_ARCHIVE_ENTRY_MARKER: u32 = 0x8000_0000;
 
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "32x",
@@ -202,6 +216,68 @@ pub fn infer_supported_console_slug(save_path: &Path, rom_path: Option<&Path>) -
     classify_supported_save(save_path, rom_path).map(|value| value.system_slug)
 }
 
+pub fn saturn_skip_reason(save_path: &Path, rom_path: Option<&Path>) -> Option<String> {
+    let ext = path_extension(save_path)?;
+    if !matches!(ext.as_str(), "sav" | "srm" | "ram" | "bkr") {
+        return None;
+    }
+
+    let save_size = save_path.metadata().ok()?.len();
+    let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
+    let rom_lower = rom_path
+        .map(|path| path.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let combined = format!("{} {}", save_lower, rom_lower);
+    let saturn_hint = contains_any(
+        &combined,
+        &[
+            "saturn",
+            "/saturn/",
+            "\\saturn\\",
+            "yabause",
+            "yabasanshiro",
+            "kronos",
+            "ssf",
+            "beetle saturn",
+            "mednafen saturn",
+        ],
+    );
+    let saturn_rom_hint = rom_path
+        .and_then(path_extension)
+        .map(|rom_ext| matches!(rom_ext.as_str(), "cue" | "iso" | "chd"))
+        .unwrap_or(false);
+    if !saturn_hint && !saturn_rom_hint {
+        return None;
+    }
+
+    if looks_plain_text(save_path) || looks_like_executable_or_archive(save_path) {
+        return Some("skip_invalid_saturn_backup_ram".to_string());
+    }
+
+    let expected_sizes = [
+        SATURN_INTERNAL_RAW_SIZE,
+        SATURN_INTERNAL_INTERLEAVED_SIZE,
+        SATURN_CARTRIDGE_RAW_SIZE,
+        SATURN_CARTRIDGE_INTERLEAVED_SIZE,
+        SATURN_COMBINED_RAW_SIZE,
+        SATURN_COMBINED_INTERLEAVED_SIZE,
+        SATURN_YABASANSHIRO_RAW_SIZE,
+        SATURN_YABASANSHIRO_INTERLEAVED_SIZE,
+    ];
+    if !expected_sizes.contains(&(save_size as usize)) {
+        return Some(format!(
+            "skip_saturn_without_structural_evidence(size={})",
+            save_size
+        ));
+    }
+
+    match inspect_saturn_metadata(save_path) {
+        Some(metadata) if metadata.save_entries > 0 => None,
+        Some(_) => Some("skip_empty_saturn_backup_ram".to_string()),
+        None => Some("skip_invalid_saturn_backup_ram".to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveClassification {
     pub system_slug: String,
@@ -222,6 +298,14 @@ struct DreamcastMetadata {
     icon_frames: usize,
     sample_title: Option<String>,
     sample_app: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SaturnMetadata {
+    format: &'static str,
+    save_entries: usize,
+    has_internal: bool,
+    has_cartridge: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,6 +674,18 @@ fn classify_if_valid(
             evidence, metadata.container, metadata.save_entries, metadata.icon_frames, title, app
         );
     }
+    if slug == "saturn"
+        && let Some(metadata) = inspect_saturn_metadata(save_path)
+    {
+        evidence = format!(
+            "{} [{} entries={} internal={} cartridge={}]",
+            evidence,
+            metadata.format,
+            metadata.save_entries,
+            metadata.has_internal,
+            metadata.has_cartridge
+        );
+    }
     Some(SaveClassification {
         system_slug: slug.to_string(),
         evidence,
@@ -866,21 +962,15 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             )
         }
         "saturn" => matches!(
-            size,
-            512 | 1024
-                | 2048
-                | 4096
-                | 8192
-                | 16384
-                | 32768
-                | 65536
-                | 131072
-                | 262144
-                | 524288
-                | 1_048_576
-                | 2_097_152
-                | 4_194_304
-                | 8_388_608
+            size as usize,
+            SATURN_INTERNAL_RAW_SIZE
+                | SATURN_INTERNAL_INTERLEAVED_SIZE
+                | SATURN_CARTRIDGE_RAW_SIZE
+                | SATURN_CARTRIDGE_INTERLEAVED_SIZE
+                | SATURN_COMBINED_RAW_SIZE
+                | SATURN_COMBINED_INTERLEAVED_SIZE
+                | SATURN_YABASANSHIRO_RAW_SIZE
+                | SATURN_YABASANSHIRO_INTERLEAVED_SIZE
         ),
         "dreamcast" => {
             if ext == "bin" {
@@ -915,6 +1005,7 @@ fn passes_binary_validation(save_path: &Path, save_ext: &str, _save_size: u64, s
 
     match slug {
         "dreamcast" => validate_dreamcast_container(save_path, save_ext),
+        "saturn" => validate_saturn_backup_ram(save_path),
         "psx" => validate_psx_container(save_path, save_ext),
         "ps2" => validate_ps2_memory_card_image(save_path),
         _ => true,
@@ -958,6 +1049,270 @@ fn validate_ps2_memory_card_image(path: &Path) -> bool {
 
 fn validate_dreamcast_container(path: &Path, ext: &str) -> bool {
     inspect_dreamcast_metadata(path, ext).is_some()
+}
+
+fn validate_saturn_backup_ram(path: &Path) -> bool {
+    inspect_saturn_metadata(path)
+        .map(|metadata| metadata.save_entries > 0)
+        .unwrap_or(false)
+}
+
+fn inspect_saturn_metadata(path: &Path) -> Option<SaturnMetadata> {
+    let bytes = std::fs::read(path).ok()?;
+    inspect_saturn_bytes(&bytes)
+}
+
+fn inspect_saturn_bytes(bytes: &[u8]) -> Option<SaturnMetadata> {
+    match bytes.len() {
+        SATURN_INTERNAL_RAW_SIZE => {
+            let internal_entries = inspect_saturn_volume(bytes, SATURN_INTERNAL_BLOCK_SIZE)?;
+            Some(SaturnMetadata {
+                format: "internal-raw",
+                save_entries: internal_entries,
+                has_internal: true,
+                has_cartridge: false,
+            })
+        }
+        SATURN_CARTRIDGE_RAW_SIZE => {
+            let cart_entries = inspect_saturn_volume(bytes, SATURN_CARTRIDGE_BLOCK_SIZE)?;
+            Some(SaturnMetadata {
+                format: "cartridge-raw",
+                save_entries: cart_entries,
+                has_internal: false,
+                has_cartridge: true,
+            })
+        }
+        SATURN_INTERNAL_INTERLEAVED_SIZE => {
+            let collapsed = collapse_saturn_byte_expanded(bytes)?;
+            let internal_entries = inspect_saturn_volume(&collapsed, SATURN_INTERNAL_BLOCK_SIZE)?;
+            Some(SaturnMetadata {
+                format: "mister-internal-interleaved",
+                save_entries: internal_entries,
+                has_internal: true,
+                has_cartridge: false,
+            })
+        }
+        SATURN_CARTRIDGE_INTERLEAVED_SIZE => {
+            let collapsed = collapse_saturn_byte_expanded(bytes)?;
+            let cart_entries = inspect_saturn_volume(&collapsed, SATURN_CARTRIDGE_BLOCK_SIZE)?;
+            Some(SaturnMetadata {
+                format: "cartridge-interleaved",
+                save_entries: cart_entries,
+                has_internal: false,
+                has_cartridge: true,
+            })
+        }
+        SATURN_COMBINED_RAW_SIZE => {
+            let internal_entries = inspect_saturn_volume(
+                &bytes[..SATURN_INTERNAL_RAW_SIZE],
+                SATURN_INTERNAL_BLOCK_SIZE,
+            )?;
+            let cart_entries = inspect_optional_saturn_volume(
+                &bytes[SATURN_INTERNAL_RAW_SIZE..],
+                SATURN_CARTRIDGE_BLOCK_SIZE,
+            )?;
+            Some(SaturnMetadata {
+                format: "combined-raw",
+                save_entries: internal_entries + cart_entries,
+                has_internal: true,
+                has_cartridge: true,
+            })
+        }
+        SATURN_COMBINED_INTERLEAVED_SIZE => {
+            let internal =
+                collapse_saturn_byte_expanded(&bytes[..SATURN_INTERNAL_INTERLEAVED_SIZE])?;
+            let cart = collapse_saturn_byte_expanded(&bytes[SATURN_INTERNAL_INTERLEAVED_SIZE..])?;
+            let internal_entries = inspect_saturn_volume(&internal, SATURN_INTERNAL_BLOCK_SIZE)?;
+            let cart_entries = inspect_optional_saturn_volume(&cart, SATURN_CARTRIDGE_BLOCK_SIZE)?;
+            Some(SaturnMetadata {
+                format: "mister-combined-interleaved",
+                save_entries: internal_entries + cart_entries,
+                has_internal: true,
+                has_cartridge: true,
+            })
+        }
+        SATURN_YABASANSHIRO_RAW_SIZE => {
+            let internal_entries = inspect_saturn_volume(bytes, SATURN_INTERNAL_BLOCK_SIZE)?;
+            Some(SaturnMetadata {
+                format: "yabasanshiro-raw",
+                save_entries: internal_entries,
+                has_internal: true,
+                has_cartridge: false,
+            })
+        }
+        SATURN_YABASANSHIRO_INTERLEAVED_SIZE => {
+            let collapsed = collapse_saturn_byte_expanded(bytes)?;
+            let internal_entries = inspect_saturn_volume(&collapsed, SATURN_INTERNAL_BLOCK_SIZE)?;
+            Some(SaturnMetadata {
+                format: "yabasanshiro-interleaved",
+                save_entries: internal_entries,
+                has_internal: true,
+                has_cartridge: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn inspect_optional_saturn_volume(raw: &[u8], block_size: usize) -> Option<usize> {
+    if raw.is_empty() || raw.iter().all(|value| *value == 0) {
+        return Some(0);
+    }
+    inspect_saturn_volume(raw, block_size)
+}
+
+fn inspect_saturn_volume(raw: &[u8], block_size: usize) -> Option<usize> {
+    if block_size == 0 || raw.len() < block_size * 2 || !saturn_header_valid(raw, block_size) {
+        return None;
+    }
+
+    let total_blocks = raw.len() / block_size;
+    let mut save_entries = 0usize;
+    for block in 2..total_blocks {
+        let offset = block.checked_mul(block_size)?;
+        let marker = be_u32(raw, offset)?;
+        if marker != SATURN_ARCHIVE_ENTRY_MARKER {
+            continue;
+        }
+        if validate_saturn_archive_entry(raw, block_size, total_blocks, block) {
+            save_entries += 1;
+        }
+    }
+    Some(save_entries)
+}
+
+fn validate_saturn_archive_entry(
+    raw: &[u8],
+    block_size: usize,
+    total_blocks: usize,
+    first_block: usize,
+) -> bool {
+    let offset = match first_block.checked_mul(block_size) {
+        Some(value) => value,
+        None => return false,
+    };
+    if offset + 0x22 > raw.len() {
+        return false;
+    }
+    if raw[offset + 0x0F] > 5 {
+        return false;
+    }
+    let save_size = match be_u32(raw, offset + 0x1E) {
+        Some(value) => value as usize,
+        None => return false,
+    };
+    if save_size > raw.len() {
+        return false;
+    }
+    let blocks = match saturn_read_block_list(raw, block_size, total_blocks, first_block) {
+        Some(value) if !value.is_empty() => value,
+        _ => return false,
+    };
+    saturn_entry_data_present(raw, block_size, &blocks, save_size)
+}
+
+fn saturn_read_block_list(
+    raw: &[u8],
+    block_size: usize,
+    total_blocks: usize,
+    first_block: usize,
+) -> Option<Vec<usize>> {
+    let mut offset = first_block.checked_mul(block_size)?.checked_add(0x22)?;
+    let mut blocks = vec![first_block];
+    let mut list_index = 1usize;
+    loop {
+        let next_block = be_u16(raw, offset)? as usize;
+        if next_block == 0 {
+            break;
+        }
+        if next_block >= total_blocks {
+            return None;
+        }
+        blocks.push(next_block);
+        offset = offset.checked_add(2)?;
+        if offset % block_size == 0 {
+            let next_list_block = *blocks.get(list_index)?;
+            offset = next_list_block.checked_mul(block_size)?.checked_add(4)?;
+            list_index += 1;
+        }
+    }
+    Some(blocks)
+}
+
+fn saturn_entry_data_present(raw: &[u8], block_size: usize, blocks: &[usize], size: usize) -> bool {
+    let mut block_list_remaining = blocks.len().saturating_mul(2);
+    let mut remaining = size;
+    for (index, block) in blocks.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let block_offset = match block.checked_mul(block_size) {
+            Some(value) => value,
+            None => return false,
+        };
+        let mut inner_offset = if index == 0 { 0x22 } else { 0x04 };
+        let mut available = block_size.saturating_sub(inner_offset);
+        if block_list_remaining >= available {
+            block_list_remaining -= available;
+            continue;
+        }
+        if block_list_remaining > 0 {
+            inner_offset += block_list_remaining;
+            available = available.saturating_sub(block_list_remaining);
+            block_list_remaining = 0;
+        }
+        if block_offset
+            .checked_add(inner_offset)
+            .and_then(|value| value.checked_add(available))
+            .filter(|value| *value <= raw.len())
+            .is_none()
+        {
+            return false;
+        }
+        let take = available.min(remaining);
+        remaining -= take;
+    }
+    remaining == 0
+}
+
+fn saturn_header_valid(raw: &[u8], block_size: usize) -> bool {
+    if raw.len() < block_size * 2 {
+        return false;
+    }
+    let limit = SATURN_MIN_MAGIC_BYTES.min(block_size);
+    for index in 0..limit {
+        if raw[index] != SATURN_HEADER_MAGIC[index % SATURN_HEADER_MAGIC.len()] {
+            return false;
+        }
+    }
+    raw[block_size..block_size * 2]
+        .iter()
+        .all(|value| *value == 0)
+}
+
+fn collapse_saturn_byte_expanded(bytes: &[u8]) -> Option<Vec<u8>> {
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = vec![0u8; bytes.len() / 2];
+    for (index, value) in out.iter_mut().enumerate() {
+        *value = bytes[index * 2 + 1];
+    }
+    Some(out)
+}
+
+fn be_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let a = *bytes.get(offset)?;
+    let b = *bytes.get(offset + 1)?;
+    Some(u16::from_be_bytes([a, b]))
+}
+
+fn be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let a = *bytes.get(offset)?;
+    let b = *bytes.get(offset + 1)?;
+    let c = *bytes.get(offset + 2)?;
+    let d = *bytes.get(offset + 3)?;
+    Some(u32::from_be_bytes([a, b, c, d]))
 }
 
 fn inspect_dreamcast_metadata(path: &Path, ext: &str) -> Option<DreamcastMetadata> {
@@ -1541,6 +1896,33 @@ mod tests {
         bytes
     }
 
+    fn build_empty_saturn_internal_backup_ram() -> Vec<u8> {
+        let mut bytes = vec![0u8; SATURN_INTERNAL_RAW_SIZE];
+        for index in 0..SATURN_INTERNAL_BLOCK_SIZE {
+            bytes[index] = SATURN_HEADER_MAGIC[index % SATURN_HEADER_MAGIC.len()];
+        }
+        bytes
+    }
+
+    fn build_valid_saturn_internal_backup_ram() -> Vec<u8> {
+        let mut bytes = build_empty_saturn_internal_backup_ram();
+        let offset = 2 * SATURN_INTERNAL_BLOCK_SIZE;
+        bytes[offset..offset + 4].copy_from_slice(&SATURN_ARCHIVE_ENTRY_MARKER.to_be_bytes());
+        let mut filename = [0u8; 11];
+        filename[..8].copy_from_slice(b"TESTSAVE");
+        bytes[offset + 0x04..offset + 0x0F].copy_from_slice(&filename);
+        bytes[offset + 0x0F] = 1;
+        let mut comment = [0u8; 10];
+        comment[..9].copy_from_slice(b"test save");
+        bytes[offset + 0x10..offset + 0x1A].copy_from_slice(&comment);
+        bytes[offset + 0x1A..offset + 0x1E].copy_from_slice(&12345u32.to_be_bytes());
+        let payload = b"SATURN-OK";
+        bytes[offset + 0x1E..offset + 0x22].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes[offset + 0x22..offset + 0x24].copy_from_slice(&0u16.to_be_bytes());
+        bytes[offset + 0x24..offset + 0x24 + payload.len()].copy_from_slice(payload);
+        bytes
+    }
+
     fn write_ps2_memory_card(path: &Path) {
         let mut file = fs::File::create(path).unwrap();
         file.write_all(PS2_MEMCARD_MAGIC).unwrap();
@@ -1639,7 +2021,7 @@ mod tests {
         fs::create_dir_all(psx.parent().unwrap()).unwrap();
         fs::write(&snes, vec![0x00u8; 8192]).unwrap();
         fs::write(&sega, vec![0x00u8; 8192]).unwrap();
-        fs::write(&saturn, vec![0x00u8; 32768]).unwrap();
+        fs::write(&saturn, build_valid_saturn_internal_backup_ram()).unwrap();
         fs::write(&megacd, vec![0x00u8; 8192]).unwrap();
         fs::write(&sega32x, vec![0x00u8; 8192]).unwrap();
         fs::write(&psx, build_valid_ps1_memcard()).unwrap();
@@ -1655,6 +2037,36 @@ mod tests {
     fn unsupported_paths_are_not_classified() {
         let path = PathBuf::from("/home/deck/.steam/steam/steamapps/compatdata/242550/icudtl.dat");
         assert!(infer_supported_console_slug(&path, None).is_none());
+    }
+
+    #[test]
+    fn empty_saturn_backup_ram_is_not_classified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("saves/Saturn/Fighting Vipers (USA).bkr");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, build_empty_saturn_internal_backup_ram()).unwrap();
+        assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn empty_saturn_backup_ram_reports_skip_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("saves/Saturn/Fighting Vipers (USA).bkr");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, build_empty_saturn_internal_backup_ram()).unwrap();
+        assert_eq!(
+            saturn_skip_reason(&save, None).as_deref(),
+            Some("skip_empty_saturn_backup_ram")
+        );
+    }
+
+    #[test]
+    fn valid_saturn_backup_ram_has_no_skip_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("saves/Saturn/Quake (USA).bkr");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, build_valid_saturn_internal_backup_ram()).unwrap();
+        assert!(saturn_skip_reason(&save, None).is_none());
     }
 
     #[test]

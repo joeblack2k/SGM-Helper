@@ -40,10 +40,19 @@ Validation is strict. Files are not accepted by extension alone. Scanner checks 
 - binary payload verification (rejects obvious text/junk)
 - size/profile checks where known
 - console/path hints
+- Saturn backup RAM validation (real header + entry parsing, empty images skipped)
 - PS1 container validation and conversion (`raw`, `.gme`, `.vmp`)
 - PS2 memory card header validation
 - Dreamcast VMU/DCI/VMS validation and metadata extraction (entries/icons/title/app)
 - Dreamcast NVRAM blob rejection (`dc_nvmem.bin`)
+
+Saturn helper policy:
+
+- `saturn` classification requires structural backup RAM validation, not only path or extension hints
+- accepted Saturn payloads must contain at least one active save entry
+- empty backup RAM images are skipped and should not be uploaded
+- supported Saturn backup RAM sizes are `32768`, `65536`, `524288`, `1048576`, `557056`, `1114112`, `4194304`, and `8388608` bytes
+- helper diagnostics now emit explicit Saturn skip reasons such as `skip_empty_saturn_backup_ram`, `skip_invalid_saturn_backup_ram`, and `skip_saturn_without_structural_evidence(...)`
 
 PlayStation helper contract:
 
