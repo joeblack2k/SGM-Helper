@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::api::{ApiClient, ConflictCheckResponse};
+use crate::api::{ApiClient, ConflictCheckResponse, RuntimeTarget};
 use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
@@ -334,6 +334,8 @@ fn process_single_save(
     let effective_slot_name =
         resolve_slot_name_for_sync(&system_slug, save_path, &options.slot_name);
     let device_type = helper_device_type_for_upload(source_kind, source_profile, &system_slug);
+    let runtime_target =
+        runtime_target_for_system(source_kind, source_profile, &system_slug, device_type);
 
     let mut rom_sha1 = if is_playstation_system(&system_slug) {
         Some(playstation_line_key(
@@ -396,6 +398,7 @@ fn process_single_save(
         device_type,
         fingerprint,
         app_password,
+        Some(&runtime_target),
     )?;
 
     if !latest.exists {
@@ -432,6 +435,7 @@ fn process_single_save(
             fingerprint,
             app_password,
             Some(&system_slug),
+            Some(&runtime_target),
         )?;
 
         report.uploaded += 1;
@@ -503,6 +507,7 @@ fn process_single_save(
             fingerprint,
             app_password,
             Some(&system_slug),
+            Some(&runtime_target),
         )?;
         report.uploaded += 1;
         return Ok(Some(processed_entry(
@@ -527,6 +532,7 @@ fn process_single_save(
         device_type,
         fingerprint,
         app_password,
+        Some(&runtime_target),
     )?;
     if conflict.exists {
         handle_conflict(
@@ -543,6 +549,7 @@ fn process_single_save(
             source_name,
             source_kind,
             app_password,
+            &runtime_target,
         )?;
         report.conflicts += 1;
         return Ok(Some(processed_entry(
@@ -589,8 +596,13 @@ fn process_single_save(
             )));
         }
 
-        let canonical_bytes =
-            api.download_save(&save_id, device_type, fingerprint, app_password)?;
+        let canonical_bytes = api.download_save(
+            &save_id,
+            device_type,
+            fingerprint,
+            app_password,
+            Some(&runtime_target),
+        )?;
         let local_bytes =
             encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
         let target_save_path = preferred_save_path(
@@ -683,6 +695,12 @@ fn process_missing_save(
     });
     let device_type =
         helper_device_type_for_upload(source_kind, source_profile, system_slug.unwrap_or(""));
+    let runtime_target = runtime_target_for_system(
+        source_kind,
+        source_profile,
+        system_slug.unwrap_or(""),
+        device_type,
+    );
 
     let latest = api.latest_save(
         rom_sha1,
@@ -690,6 +708,7 @@ fn process_missing_save(
         device_type,
         fingerprint,
         app_password,
+        Some(&runtime_target),
     )?;
     if !latest.exists {
         report.skipped += 1;
@@ -739,7 +758,13 @@ fn process_missing_save(
         )));
     }
 
-    let canonical_bytes = api.download_save(save_id, device_type, fingerprint, app_password)?;
+    let canonical_bytes = api.download_save(
+        save_id,
+        device_type,
+        fingerprint,
+        app_password,
+        Some(&runtime_target),
+    )?;
     let local_bytes = encode_download_for_local_container(&canonical_bytes, local_container)?;
     if let Some(parent) = save_path.parent() {
         fs::create_dir_all(parent)
@@ -815,6 +840,83 @@ fn helper_device_type_for_upload(
         SourceKind::AnaloguePocket => "analogue-pocket",
         SourceKind::Windows => "windows",
         SourceKind::SteamDeck => "steamdeck",
+    }
+}
+
+fn runtime_target_for_system(
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    device_type: &str,
+) -> RuntimeTarget {
+    let clean_system = system_slug.trim().to_ascii_lowercase();
+    if clean_system.is_empty() {
+        return RuntimeTarget::default();
+    }
+
+    let runtime_name = helper_runtime_name(source_kind, source_profile, &clean_system, device_type);
+    RuntimeTarget {
+        runtime_profile: Some(format!("{}/{}", clean_system, runtime_name)),
+        emulator_profile: Some(runtime_name.clone()),
+        system_profile_key: Some(system_profile_field_key(&clean_system)),
+        system_profile_value: Some(runtime_name),
+    }
+}
+
+fn helper_runtime_name(
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    device_type: &str,
+) -> String {
+    if matches!(system_slug, "psx" | "ps2") {
+        return device_type.trim().to_ascii_lowercase();
+    }
+
+    let from_profile = match source_profile {
+        EmulatorProfile::Mister => Some("mister"),
+        EmulatorProfile::RetroArch => Some("retroarch"),
+        EmulatorProfile::Snes9x => Some("snes9x"),
+        EmulatorProfile::Zsnes => Some("zsnes"),
+        EmulatorProfile::EverDrive => Some("everdrive"),
+        EmulatorProfile::Generic => None,
+    };
+    if let Some(value) = from_profile {
+        return value.to_string();
+    }
+
+    match source_kind {
+        SourceKind::MisterFpga => "mister".to_string(),
+        SourceKind::RetroArch => "retroarch".to_string(),
+        SourceKind::OpenEmu => "openemu".to_string(),
+        SourceKind::AnaloguePocket => "analogue-pocket".to_string(),
+        SourceKind::Custom | SourceKind::Windows | SourceKind::SteamDeck => "generic".to_string(),
+    }
+}
+
+fn system_profile_field_key(system_slug: &str) -> String {
+    let mut out = String::new();
+    let mut uppercase_next = false;
+    for ch in system_slug.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if out.is_empty() {
+                out.push(ch.to_ascii_lowercase());
+                uppercase_next = false;
+            } else if uppercase_next {
+                out.push(ch.to_ascii_uppercase());
+                uppercase_next = false;
+            } else {
+                out.push(ch.to_ascii_lowercase());
+            }
+        } else {
+            uppercase_next = true;
+        }
+    }
+    if out.is_empty() {
+        "runtimeProfile".to_string()
+    } else {
+        out.push_str("Profile");
+        out
     }
 }
 
@@ -1073,6 +1175,7 @@ fn handle_conflict(
     source_name: &str,
     source_kind: &SourceKind,
     app_password: Option<&str>,
+    runtime_target: &RuntimeTarget,
 ) -> Result<()> {
     if dry_run {
         return Ok(());
@@ -1100,6 +1203,7 @@ fn handle_conflict(
         device_type,
         fingerprint,
         app_password,
+        Some(runtime_target),
     )?;
 
     Ok(())
@@ -1143,6 +1247,43 @@ fn synced_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_target_uses_explicit_n64_profile_key() {
+        let target = runtime_target_for_system(
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            "n64",
+            "mister",
+        );
+        assert_eq!(target.runtime_profile.as_deref(), Some("n64/mister"));
+        assert_eq!(target.emulator_profile.as_deref(), Some("mister"));
+        assert_eq!(target.system_profile_key.as_deref(), Some("n64Profile"));
+        assert_eq!(target.system_profile_value.as_deref(), Some("mister"));
+    }
+
+    #[test]
+    fn runtime_target_uses_profile_based_runtime_for_snes() {
+        let target = runtime_target_for_system(
+            &SourceKind::Custom,
+            &EmulatorProfile::Snes9x,
+            "snes",
+            "custom",
+        );
+        assert_eq!(target.runtime_profile.as_deref(), Some("snes/snes9x"));
+        assert_eq!(target.emulator_profile.as_deref(), Some("snes9x"));
+        assert_eq!(target.system_profile_key.as_deref(), Some("snesProfile"));
+        assert_eq!(target.system_profile_value.as_deref(), Some("snes9x"));
+    }
+
+    #[test]
+    fn system_profile_key_handles_hyphenated_slugs() {
+        assert_eq!(system_profile_field_key("sega-cd"), "segaCdProfile");
+        assert_eq!(
+            system_profile_field_key("master-system"),
+            "masterSystemProfile"
+        );
+    }
 
     #[test]
     fn prefers_sav_for_mister_snes() {

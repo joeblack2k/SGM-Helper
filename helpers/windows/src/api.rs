@@ -2,7 +2,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +115,58 @@ pub struct ConflictReportResponse {
     pub success: Option<bool>,
     #[serde(rename = "conflictId")]
     pub conflict_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeTarget {
+    pub runtime_profile: Option<String>,
+    pub emulator_profile: Option<String>,
+    pub system_profile_key: Option<String>,
+    pub system_profile_value: Option<String>,
+}
+
+impl RuntimeTarget {
+    fn query_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+
+        if let Some(runtime_profile) = self.runtime_profile.as_deref() {
+            push_runtime_pair(&mut pairs, "runtimeProfile", runtime_profile);
+            push_runtime_pair(&mut pairs, "runtime_profile", runtime_profile);
+        }
+        if let Some(emulator_profile) = self.emulator_profile.as_deref() {
+            push_runtime_pair(&mut pairs, "emulatorProfile", emulator_profile);
+            push_runtime_pair(&mut pairs, "emulator_profile", emulator_profile);
+        }
+        if let (Some(system_key), Some(system_value)) = (
+            self.system_profile_key.as_deref(),
+            self.system_profile_value.as_deref(),
+        ) {
+            push_runtime_pair(&mut pairs, system_key, system_value);
+            let snake_key = camel_case_to_snake_case(system_key);
+            push_runtime_pair(&mut pairs, &snake_key, system_value);
+        }
+
+        pairs
+    }
+
+    fn apply_query(&self, request: RequestBuilder) -> RequestBuilder {
+        let pairs = self.query_pairs();
+        if pairs.is_empty() {
+            request
+        } else {
+            request.query(&pairs)
+        }
+    }
+
+    fn apply_multipart_form(
+        &self,
+        mut form: reqwest::blocking::multipart::Form,
+    ) -> reqwest::blocking::multipart::Form {
+        for (key, value) in self.query_pairs() {
+            form = form.text(key, value);
+        }
+        form
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -352,6 +404,7 @@ impl ApiClient {
         device_type: &str,
         fingerprint: &str,
         app_password: Option<&str>,
+        runtime_target: Option<&RuntimeTarget>,
     ) -> Result<LatestSaveResponse> {
         let url = self.url("/save/latest");
         let mut request = self.client.get(url).query(&[
@@ -360,6 +413,9 @@ impl ApiClient {
             ("device_type", device_type),
             ("fingerprint", fingerprint),
         ]);
+        if let Some(runtime_target) = runtime_target {
+            request = runtime_target.apply_query(request);
+        }
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
         {
@@ -381,6 +437,7 @@ impl ApiClient {
         fingerprint: &str,
         app_password: Option<&str>,
         system_slug: Option<&str>,
+        runtime_target: Option<&RuntimeTarget>,
     ) -> Result<UploadSaveResponse> {
         let url = self.url("/saves");
         let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(filename.to_string());
@@ -406,6 +463,9 @@ impl ApiClient {
             && !system_slug.trim().is_empty()
         {
             form = form.text("system", system_slug.to_string());
+        }
+        if let Some(runtime_target) = runtime_target {
+            form = runtime_target.apply_multipart_form(form);
         }
 
         let response = self
@@ -466,6 +526,7 @@ impl ApiClient {
         device_type: &str,
         fingerprint: &str,
         app_password: Option<&str>,
+        runtime_target: Option<&RuntimeTarget>,
     ) -> Result<Vec<u8>> {
         let url = self.url("/saves/download");
         let mut request = self.client.get(url).query(&[
@@ -473,6 +534,9 @@ impl ApiClient {
             ("device_type", device_type),
             ("fingerprint", fingerprint),
         ]);
+        if let Some(runtime_target) = runtime_target {
+            request = runtime_target.apply_query(request);
+        }
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
         {
@@ -506,6 +570,7 @@ impl ApiClient {
         device_type: &str,
         fingerprint: &str,
         app_password: Option<&str>,
+        runtime_target: Option<&RuntimeTarget>,
     ) -> Result<ConflictCheckResponse> {
         let url = self.url("/conflicts/check");
         let mut request = self.client.get(url).query(&[
@@ -514,6 +579,9 @@ impl ApiClient {
             ("device_type", device_type),
             ("fingerprint", fingerprint),
         ]);
+        if let Some(runtime_target) = runtime_target {
+            request = runtime_target.apply_query(request);
+        }
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
         {
@@ -538,6 +606,7 @@ impl ApiClient {
         device_type: &str,
         fingerprint: &str,
         app_password: Option<&str>,
+        runtime_target: Option<&RuntimeTarget>,
     ) -> Result<ConflictReportResponse> {
         let url = self.url("/conflicts/report");
         let part =
@@ -556,6 +625,9 @@ impl ApiClient {
             && !app_password.trim().is_empty()
         {
             form = form.text("app_password", app_password.to_string());
+        }
+        if let Some(runtime_target) = runtime_target {
+            form = runtime_target.apply_multipart_form(form);
         }
 
         let response = self
@@ -625,6 +697,33 @@ where
     response
         .json::<T>()
         .context("kan JSON response niet deserializen")
+}
+
+fn push_runtime_pair(pairs: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if key.trim().is_empty() || value.trim().is_empty() {
+        return;
+    }
+    if pairs.iter().any(|(k, v)| k == key && v == value) {
+        return;
+    }
+    pairs.push((key.to_string(), value.to_string()));
+}
+
+fn camel_case_to_snake_case(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    for (index, ch) in value.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == ' ' {
+            out.push('_');
+        } else {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
 }
 
 fn truncate(value: &str, max: usize) -> String {
