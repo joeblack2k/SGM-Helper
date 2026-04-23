@@ -471,24 +471,6 @@ fn process_single_save(
         )));
     }
 
-    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
-        report.in_sync += 1;
-        return Ok(Some(processed_entry(
-            state_key.clone(),
-            synced_entry(
-                local_sha,
-                Some(active_rom_sha1.clone()),
-                latest.version,
-                Some(&system_slug),
-                Some(normalized_save.local_container),
-                Some(normalized_save.adapter_profile),
-                Some(source_kind),
-                Some(source_name),
-                Some(&effective_slot_name),
-            ),
-        )));
-    }
-
     if options.force_upload {
         if options.dry_run {
             report.uploaded += 1;
@@ -523,6 +505,24 @@ fn process_single_save(
             Some(&runtime_target),
         )?;
         report.uploaded += 1;
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(active_rom_sha1.clone()),
+                latest.version,
+                Some(&system_slug),
+                Some(normalized_save.local_container),
+                Some(normalized_save.adapter_profile),
+                Some(source_kind),
+                Some(source_name),
+                Some(&effective_slot_name),
+            ),
+        )));
+    }
+
+    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
+        report.in_sync += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
