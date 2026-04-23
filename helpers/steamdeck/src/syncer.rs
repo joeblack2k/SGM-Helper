@@ -854,49 +854,159 @@ fn runtime_target_for_system(
         return RuntimeTarget::default();
     }
 
-    let runtime_name = helper_runtime_name(source_kind, source_profile, &clean_system, device_type);
+    let Some(runtime_profile) = projection_runtime_profile_for_system(
+        source_kind,
+        source_profile,
+        &clean_system,
+        device_type,
+    ) else {
+        return RuntimeTarget::default();
+    };
+
+    let profile_name = runtime_profile
+        .split_once('/')
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_else(|| runtime_profile.clone());
+
     RuntimeTarget {
-        runtime_profile: Some(format!("{}/{}", clean_system, runtime_name)),
-        emulator_profile: Some(runtime_name.clone()),
+        runtime_profile: Some(runtime_profile.clone()),
+        emulator_profile: Some(profile_name),
         system_profile_key: Some(system_profile_field_key(&clean_system)),
-        system_profile_value: Some(runtime_name),
+        system_profile_value: Some(runtime_profile),
     }
 }
 
-fn helper_runtime_name(
+fn projection_runtime_profile_for_system(
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
     system_slug: &str,
     device_type: &str,
-) -> String {
-    if matches!(system_slug, "psx" | "ps2") {
-        return device_type.trim().to_ascii_lowercase();
-    }
-
-    let from_profile = match source_profile {
-        EmulatorProfile::Mister => Some("mister"),
-        EmulatorProfile::RetroArch => Some("retroarch"),
-        EmulatorProfile::Snes9x => Some("snes9x"),
-        EmulatorProfile::Zsnes => Some("zsnes"),
-        EmulatorProfile::EverDrive => Some("everdrive"),
-        EmulatorProfile::Project64 => Some("project64"),
-        EmulatorProfile::MupenFamily => Some("mupen-family"),
-        EmulatorProfile::Generic => None,
+) -> Option<String> {
+    let fallback_from_kind = match source_kind {
+        SourceKind::MisterFpga => "mister",
+        SourceKind::RetroArch => "retroarch",
+        SourceKind::Custom | SourceKind::OpenEmu | SourceKind::AnaloguePocket => "generic",
+        SourceKind::Windows | SourceKind::SteamDeck => "generic",
     };
-    if let Some(value) = from_profile {
-        return value.to_string();
-    }
 
-    match source_kind {
-        SourceKind::MisterFpga => "mister".to_string(),
-        SourceKind::RetroArch => "retroarch".to_string(),
-        SourceKind::OpenEmu => "openemu".to_string(),
-        SourceKind::AnaloguePocket => "analogue-pocket".to_string(),
-        SourceKind::Custom | SourceKind::Windows | SourceKind::SteamDeck => "generic".to_string(),
+    match system_slug {
+        "psx" => {
+            let clean = device_type.trim().to_ascii_lowercase();
+            if clean == "mister" {
+                Some("psx/mister".to_string())
+            } else {
+                Some("psx/retroarch".to_string())
+            }
+        }
+        "ps2" => Some("ps2/pcsx2".to_string()),
+        "n64" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "n64/mister",
+                EmulatorProfile::RetroArch => "n64/retroarch",
+                EmulatorProfile::EverDrive => "n64/everdrive",
+                EmulatorProfile::Project64 => "n64/project64",
+                EmulatorProfile::MupenFamily => "n64/mupen-family",
+                EmulatorProfile::Snes9x | EmulatorProfile::Zsnes | EmulatorProfile::Generic => {
+                    match fallback_from_kind {
+                        "mister" => "n64/mister",
+                        "retroarch" => "n64/retroarch",
+                        _ => "n64/mupen-family",
+                    }
+                }
+            }
+            .to_string(),
+        ),
+        "saturn" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "saturn/mister",
+                EmulatorProfile::RetroArch => "saturn/mednafen",
+                EmulatorProfile::Snes9x
+                | EmulatorProfile::Zsnes
+                | EmulatorProfile::EverDrive
+                | EmulatorProfile::Project64
+                | EmulatorProfile::MupenFamily
+                | EmulatorProfile::Generic => match fallback_from_kind {
+                    "retroarch" => "saturn/mednafen",
+                    _ => "saturn/mister",
+                },
+            }
+            .to_string(),
+        ),
+        "snes" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "snes/retroarch-snes9x",
+                EmulatorProfile::Snes9x => "snes/snes9x",
+                EmulatorProfile::Mister
+                | EmulatorProfile::Zsnes
+                | EmulatorProfile::EverDrive
+                | EmulatorProfile::Project64
+                | EmulatorProfile::MupenFamily
+                | EmulatorProfile::Generic => match fallback_from_kind {
+                    "retroarch" => "snes/retroarch-snes9x",
+                    _ => "snes/snes9x",
+                },
+            }
+            .to_string(),
+        ),
+        "nes" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "nes/retroarch-nestopia",
+                _ => "nes/fceux",
+            }
+            .to_string(),
+        ),
+        "gba" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "gba/retroarch-mgba",
+                _ => "gba/mgba",
+            }
+            .to_string(),
+        ),
+        "master-system" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sms/retroarch-genesis-plus-gx",
+                _ => "sms/genesis-plus-gx",
+            }
+            .to_string(),
+        ),
+        "genesis" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "genesis/retroarch-genesis-plus-gx",
+                _ => "genesis/genesis-plus-gx",
+            }
+            .to_string(),
+        ),
+        "game-gear" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "gamegear/retroarch-genesis-plus-gx",
+                _ => "gamegear/genesis-plus-gx",
+            }
+            .to_string(),
+        ),
+        "dreamcast" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "dreamcast/mister",
+                EmulatorProfile::RetroArch => "dreamcast/retroarch-flycast",
+                _ => match fallback_from_kind {
+                    "mister" => "dreamcast/mister",
+                    "retroarch" => "dreamcast/retroarch-flycast",
+                    _ => "dreamcast/flycast",
+                },
+            }
+            .to_string(),
+        ),
+        _ => None,
     }
 }
 
 fn system_profile_field_key(system_slug: &str) -> String {
+    if system_slug == "n64" {
+        return "n64Profile".to_string();
+    }
+    if system_slug == "saturn" {
+        return "saturnFormat".to_string();
+    }
+
     let mut out = String::new();
     let mut uppercase_next = false;
     for ch in system_slug.chars() {
@@ -1263,7 +1373,7 @@ mod tests {
         assert_eq!(target.runtime_profile.as_deref(), Some("n64/mister"));
         assert_eq!(target.emulator_profile.as_deref(), Some("mister"));
         assert_eq!(target.system_profile_key.as_deref(), Some("n64Profile"));
-        assert_eq!(target.system_profile_value.as_deref(), Some("mister"));
+        assert_eq!(target.system_profile_value.as_deref(), Some("n64/mister"));
     }
 
     #[test]
@@ -1276,7 +1386,10 @@ mod tests {
         );
         assert_eq!(target.runtime_profile.as_deref(), Some("n64/project64"));
         assert_eq!(target.system_profile_key.as_deref(), Some("n64Profile"));
-        assert_eq!(target.system_profile_value.as_deref(), Some("project64"));
+        assert_eq!(
+            target.system_profile_value.as_deref(),
+            Some("n64/project64")
+        );
     }
 
     #[test]
@@ -1289,7 +1402,10 @@ mod tests {
         );
         assert_eq!(target.runtime_profile.as_deref(), Some("n64/mupen-family"));
         assert_eq!(target.system_profile_key.as_deref(), Some("n64Profile"));
-        assert_eq!(target.system_profile_value.as_deref(), Some("mupen-family"));
+        assert_eq!(
+            target.system_profile_value.as_deref(),
+            Some("n64/mupen-family")
+        );
     }
 
     #[test]
@@ -1303,12 +1419,53 @@ mod tests {
         assert_eq!(target.runtime_profile.as_deref(), Some("snes/snes9x"));
         assert_eq!(target.emulator_profile.as_deref(), Some("snes9x"));
         assert_eq!(target.system_profile_key.as_deref(), Some("snesProfile"));
-        assert_eq!(target.system_profile_value.as_deref(), Some("snes9x"));
+        assert_eq!(target.system_profile_value.as_deref(), Some("snes/snes9x"));
+    }
+
+    #[test]
+    fn runtime_target_returns_empty_for_non_projection_systems() {
+        let target = runtime_target_for_system(
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "nds",
+            "retroarch",
+        );
+        assert!(target.runtime_profile.is_none());
+        assert!(target.system_profile_key.is_none());
+        assert!(target.system_profile_value.is_none());
+    }
+
+    #[test]
+    fn runtime_target_maps_retroarch_snes_to_backend_profile_id() {
+        let target = runtime_target_for_system(
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "snes",
+            "retroarch",
+        );
+        assert_eq!(
+            target.runtime_profile.as_deref(),
+            Some("snes/retroarch-snes9x")
+        );
+    }
+
+    #[test]
+    fn runtime_target_maps_saturn_to_saturn_format_alias() {
+        let target = runtime_target_for_system(
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "saturn",
+            "retroarch",
+        );
+        assert_eq!(target.runtime_profile.as_deref(), Some("saturn/mednafen"));
+        assert_eq!(target.system_profile_key.as_deref(), Some("saturnFormat"));
     }
 
     #[test]
     fn system_profile_key_handles_hyphenated_slugs() {
         assert_eq!(system_profile_field_key("sega-cd"), "segaCdProfile");
+        assert_eq!(system_profile_field_key("saturn"), "saturnFormat");
+        assert_eq!(system_profile_field_key("n64"), "n64Profile");
         assert_eq!(
             system_profile_field_key("master-system"),
             "masterSystemProfile"
