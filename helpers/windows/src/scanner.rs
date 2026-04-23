@@ -12,8 +12,8 @@ use sha2::Sha256;
 use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
-    "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "dsv", "gme", "mcr", "mc",
-    "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
+    "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "cpk", "dsv", "gme", "mcr",
+    "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
 ];
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -950,7 +950,7 @@ fn infer_sony_slug(haystack: &str) -> &'static str {
 
 fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
     match ext {
-        "eep" | "fla" | "sra" | "mpk" => Some("n64"),
+        "eep" | "fla" | "sra" | "mpk" | "cpk" => Some("n64"),
         "dsv" => Some("nds"),
         "mcr" | "mc" | "mcd" | "vmp" | "psv" => Some("psx"),
         "ps2" | "bin" => Some("ps2"),
@@ -973,7 +973,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "snes" => matches!(ext, "srm" | "sav" | "sa1"),
         "gameboy" => matches!(ext, "sav" | "srm" | "gme" | "rtc" | "ram"),
         "gba" => matches!(ext, "sav" | "srm" | "sa1"),
-        "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk"),
+        "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk" | "cpk"),
         "nds" => matches!(ext, "sav" | "dsv"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
@@ -1010,7 +1010,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "gba" => matches!(size, 512 | 8192 | 32768 | 65536 | 131072),
         "n64" => match ext {
             "eep" => size == 512 || size == 2048,
-            "sra" | "mpk" => size == 32 * 1024,
+            "sra" | "mpk" | "cpk" => size == 32 * 1024,
             "fla" => size == 128 * 1024,
             _ => false,
         },
@@ -1077,7 +1077,7 @@ fn validate_n64_save_media(path: &Path, ext: &str, size: u64) -> bool {
     let expected_size_ok = match ext {
         "eep" => matches!(size, 512 | 2048),
         "sra" => size == 32 * 1024,
-        "mpk" => size == 32 * 1024,
+        "mpk" | "cpk" => size == 32 * 1024,
         "fla" => size == 128 * 1024,
         _ => false,
     };
@@ -2336,6 +2336,23 @@ mod tests {
     fn n64_non_blank_controller_pak_is_supported() {
         let tmp = tempfile::tempdir().unwrap();
         let save = tmp.path().join("MiSTer/N64/Mario Kart 64 (USA).mpk");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let mut payload = vec![0u8; 32768];
+        payload[0] = 0x5A;
+        payload[4096] = 0x01;
+        payload[32767] = 0xA5;
+        fs::write(&save, payload).unwrap();
+
+        assert_eq!(
+            infer_supported_console_slug(&save, None).as_deref(),
+            Some("n64")
+        );
+    }
+
+    #[test]
+    fn n64_non_blank_cpk_controller_pak_is_supported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/N64/Mario Kart 64 (USA)_1.cpk");
         fs::create_dir_all(save.parent().unwrap()).unwrap();
         let mut payload = vec![0u8; 32768];
         payload[0] = 0x5A;

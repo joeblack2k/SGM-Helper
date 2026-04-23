@@ -331,11 +331,13 @@ fn process_single_save(
         );
     }
 
+    let effective_profile =
+        effective_profile_for_save(source_kind, source_profile, &system_slug, save_path);
     let effective_slot_name =
         resolve_slot_name_for_sync(&system_slug, save_path, &options.slot_name);
-    let device_type = helper_device_type_for_upload(source_kind, source_profile, &system_slug);
+    let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
     let runtime_target =
-        runtime_target_for_system(source_kind, source_profile, &system_slug, device_type);
+        runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
 
     let mut rom_sha1 = if is_playstation_system(&system_slug) {
         Some(playstation_line_key(
@@ -420,13 +422,10 @@ fn process_single_save(
             )));
         }
 
-        let filename = save_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("save.bin");
+        let filename = upload_filename_for_sync(save_path, &system_slug);
 
         let _upload = api.upload_save(
-            filename,
+            &filename,
             normalized_save.canonical_bytes.clone(),
             &active_rom_sha1,
             rom_md5.as_deref(),
@@ -492,13 +491,10 @@ fn process_single_save(
             )));
         }
 
-        let filename = save_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("save.bin");
+        let filename = upload_filename_for_sync(save_path, &system_slug);
 
         api.upload_save(
-            filename,
+            &filename,
             normalized_save.canonical_bytes.clone(),
             &active_rom_sha1,
             rom_md5.as_deref(),
@@ -693,11 +689,17 @@ fn process_missing_save(
     let effective_slot_name = existing_entry.slot_name.clone().unwrap_or_else(|| {
         resolve_slot_name_for_sync(system_slug.unwrap_or(""), save_path, &options.slot_name)
     });
-    let device_type =
-        helper_device_type_for_upload(source_kind, source_profile, system_slug.unwrap_or(""));
-    let runtime_target = runtime_target_for_system(
+    let effective_profile = effective_profile_for_save(
         source_kind,
         source_profile,
+        system_slug.unwrap_or(""),
+        save_path,
+    );
+    let device_type =
+        helper_device_type_for_upload(source_kind, &effective_profile, system_slug.unwrap_or(""));
+    let runtime_target = runtime_target_for_system(
+        source_kind,
+        &effective_profile,
         system_slug.unwrap_or(""),
         device_type,
     );
@@ -999,6 +1001,69 @@ fn projection_runtime_profile_for_system(
     }
 }
 
+fn effective_profile_for_save(
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    save_path: &Path,
+) -> EmulatorProfile {
+    match source_kind {
+        SourceKind::MisterFpga => return EmulatorProfile::Mister,
+        SourceKind::RetroArch => return EmulatorProfile::RetroArch,
+        SourceKind::Custom
+        | SourceKind::OpenEmu
+        | SourceKind::AnaloguePocket
+        | SourceKind::Windows
+        | SourceKind::SteamDeck => {}
+    }
+
+    if !matches!(source_profile, EmulatorProfile::Generic) {
+        return source_profile.clone();
+    }
+
+    infer_profile_from_path(system_slug, save_path).unwrap_or_else(|| source_profile.clone())
+}
+
+fn infer_profile_from_path(system_slug: &str, save_path: &Path) -> Option<EmulatorProfile> {
+    let path_lower = save_path.to_string_lossy().to_ascii_lowercase();
+    let has_token = |tokens: &[&str]| tokens.iter().any(|token| path_lower.contains(token));
+
+    if system_slug == "n64" {
+        if has_token(&["project64", "project-64", "pj64"]) {
+            return Some(EmulatorProfile::Project64);
+        }
+        if has_token(&["mupen", "mupen64plus", "rmg", "rosalie"]) {
+            return Some(EmulatorProfile::MupenFamily);
+        }
+        if has_token(&["everdrive", "ever-drive"]) {
+            return Some(EmulatorProfile::EverDrive);
+        }
+    } else if system_slug == "snes" {
+        if has_token(&["zsnes"]) {
+            return Some(EmulatorProfile::Zsnes);
+        }
+        if has_token(&["snes9x"]) {
+            return Some(EmulatorProfile::Snes9x);
+        }
+    }
+
+    if has_token(&[
+        "retroarch",
+        "/retroarch/",
+        "\\retroarch\\",
+        "/emulation/saves/",
+        "\\emulation\\saves\\",
+    ]) {
+        return Some(EmulatorProfile::RetroArch);
+    }
+
+    if has_token(&["/media/fat/", "\\media\\fat\\", "/mister/", "\\mister\\"]) {
+        return Some(EmulatorProfile::Mister);
+    }
+
+    None
+}
+
 fn system_profile_field_key(system_slug: &str) -> String {
     if system_slug == "n64" {
         return "n64Profile".to_string();
@@ -1271,7 +1336,26 @@ fn save_extension(path: &Path) -> Option<String> {
 }
 
 fn is_native_n64_extension(extension: Option<&str>) -> bool {
-    matches!(extension, Some("eep" | "fla" | "sra" | "mpk"))
+    matches!(extension, Some("eep" | "fla" | "sra" | "mpk" | "cpk"))
+}
+
+fn upload_filename_for_sync(save_path: &Path, system_slug: &str) -> String {
+    let file_name = save_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("save.bin");
+    if system_slug != "n64" {
+        return file_name.to_string();
+    }
+    if save_extension(save_path).as_deref() != Some("cpk") {
+        return file_name.to_string();
+    }
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("save");
+    format!("{stem}.mpk")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1650,6 +1734,43 @@ mod tests {
             Some(32_768),
         );
         assert_eq!(target, path);
+    }
+
+    #[test]
+    fn keeps_native_n64_cpk_extension_on_download_path() {
+        let path = PathBuf::from("/media/fat/saves/N64/Mario Kart 64 (USA)_1.cpk");
+        let target = preferred_save_path(
+            &path,
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            Some("n64"),
+            SaveContainerFormat::Native,
+            Some(32_768),
+        );
+        assert_eq!(target, path);
+    }
+
+    #[test]
+    fn n64_cpk_upload_filename_maps_to_mpk() {
+        let file = PathBuf::from("/media/fat/saves/N64/Mario Kart 64 (USA)_1.cpk");
+        assert_eq!(
+            upload_filename_for_sync(&file, "n64"),
+            "Mario Kart 64 (USA)_1.mpk"
+        );
+    }
+
+    #[test]
+    fn infers_n64_project64_profile_from_path() {
+        let file = PathBuf::from(
+            "/home/deck/Emulation/saves/project64/N64/The Legend of Zelda - Ocarina of Time.sra",
+        );
+        let profile = effective_profile_for_save(
+            &SourceKind::Custom,
+            &EmulatorProfile::Generic,
+            "n64",
+            &file,
+        );
+        assert_eq!(profile, EmulatorProfile::Project64);
     }
 
     #[test]
