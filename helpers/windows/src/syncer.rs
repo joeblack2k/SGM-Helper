@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::api::{ApiClient, ConflictCheckResponse, RuntimeTarget};
+use crate::api::{ApiClient, ConflictCheckResponse, LatestSaveResponse, RuntimeTarget};
 use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
@@ -394,14 +394,31 @@ fn process_single_save(
         return Ok(None);
     };
 
-    let latest = api.latest_save(
+    let latest = match api.latest_save(
         &active_rom_sha1,
         &effective_slot_name,
         device_type,
         fingerprint,
         app_password,
         Some(&runtime_target),
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(err) if is_legacy_n64_latest_mismatch(&err, &system_slug) => {
+            if verbose {
+                eprintln!(
+                    "Legacy N64 EEPROM cloud payload mismatch for {}; forcing repair upload",
+                    save_path.display()
+                );
+            }
+            LatestSaveResponse {
+                exists: false,
+                sha256: None,
+                version: None,
+                id: None,
+            }
+        }
+        Err(err) => return Err(err),
+    };
 
     if !latest.exists {
         if options.dry_run {
@@ -1358,6 +1375,16 @@ fn upload_filename_for_sync(save_path: &Path, system_slug: &str) -> String {
     format!("{stem}.mpk")
 }
 
+fn is_legacy_n64_latest_mismatch(err: &anyhow::Error, system_slug: &str) -> bool {
+    if system_slug != "n64" {
+        return false;
+    }
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("n64 canonical payload size")
+        && message.contains("does not match expected 2048")
+        && message.contains("for eeprom")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_conflict(
     api: &ApiClient,
@@ -1771,6 +1798,15 @@ mod tests {
             &file,
         );
         assert_eq!(profile, EmulatorProfile::Project64);
+    }
+
+    #[test]
+    fn detects_legacy_n64_latest_payload_mismatch() {
+        let err = anyhow::Error::msg(
+            "HTTP request faalde: status=400 Bad Request body={\"error\":\"Bad Request\",\"message\":\"N64 canonical payload size 512 does not match expected 2048 for eeprom\",\"statusCode\":400}"
+        );
+        assert!(is_legacy_n64_latest_mismatch(&err, "n64"));
+        assert!(!is_legacy_n64_latest_mismatch(&err, "snes"));
     }
 
     #[test]
