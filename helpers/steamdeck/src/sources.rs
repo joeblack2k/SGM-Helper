@@ -58,6 +58,8 @@ pub enum EmulatorProfile {
     Snes9x,
     Zsnes,
     EverDrive,
+    Project64,
+    MupenFamily,
     Generic,
 }
 
@@ -69,6 +71,8 @@ impl EmulatorProfile {
             Self::Snes9x => "snes9x",
             Self::Zsnes => "zsnes",
             Self::EverDrive => "everdrive",
+            Self::Project64 => "project64",
+            Self::MupenFamily => "mupen-family",
             Self::Generic => "generic",
         }
     }
@@ -80,6 +84,8 @@ impl EmulatorProfile {
             "snes9x" => Some(Self::Snes9x),
             "zsnes" => Some(Self::Zsnes),
             "everdrive" | "ever-drive" => Some(Self::EverDrive),
+            "project64" | "project-64" | "pj64" => Some(Self::Project64),
+            "mupen-family" | "mupen_family" | "mupen64plus" | "mupen" => Some(Self::MupenFamily),
             "generic" | "custom" => Some(Self::Generic),
             _ => None,
         }

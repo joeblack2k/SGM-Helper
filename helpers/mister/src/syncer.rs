@@ -879,6 +879,8 @@ fn helper_runtime_name(
         EmulatorProfile::Snes9x => Some("snes9x"),
         EmulatorProfile::Zsnes => Some("zsnes"),
         EmulatorProfile::EverDrive => Some("everdrive"),
+        EmulatorProfile::Project64 => Some("project64"),
+        EmulatorProfile::MupenFamily => Some("mupen-family"),
         EmulatorProfile::Generic => None,
     };
     if let Some(value) = from_profile {
@@ -1133,6 +1135,8 @@ fn preferred_extension_for_cartridge(source_profile: &EmulatorProfile) -> Option
         | EmulatorProfile::Snes9x
         | EmulatorProfile::Zsnes
         | EmulatorProfile::EverDrive
+        | EmulatorProfile::Project64
+        | EmulatorProfile::MupenFamily
         | EmulatorProfile::Generic => Some("srm"),
     }
 }
@@ -1260,6 +1264,32 @@ mod tests {
         assert_eq!(target.emulator_profile.as_deref(), Some("mister"));
         assert_eq!(target.system_profile_key.as_deref(), Some("n64Profile"));
         assert_eq!(target.system_profile_value.as_deref(), Some("mister"));
+    }
+
+    #[test]
+    fn runtime_target_supports_n64_project64_profile() {
+        let target = runtime_target_for_system(
+            &SourceKind::Custom,
+            &EmulatorProfile::Project64,
+            "n64",
+            "custom",
+        );
+        assert_eq!(target.runtime_profile.as_deref(), Some("n64/project64"));
+        assert_eq!(target.system_profile_key.as_deref(), Some("n64Profile"));
+        assert_eq!(target.system_profile_value.as_deref(), Some("project64"));
+    }
+
+    #[test]
+    fn runtime_target_supports_n64_mupen_family_profile() {
+        let target = runtime_target_for_system(
+            &SourceKind::Custom,
+            &EmulatorProfile::MupenFamily,
+            "n64",
+            "custom",
+        );
+        assert_eq!(target.runtime_profile.as_deref(), Some("n64/mupen-family"));
+        assert_eq!(target.system_profile_key.as_deref(), Some("n64Profile"));
+        assert_eq!(target.system_profile_value.as_deref(), Some("mupen-family"));
     }
 
     #[test]
