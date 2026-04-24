@@ -67,6 +67,7 @@ const SATURN_COMBINED_INTERLEAVED_SIZE: usize =
 const SATURN_INTERNAL_BLOCK_SIZE: usize = 0x40;
 const SATURN_CARTRIDGE_BLOCK_SIZE: usize = 0x200;
 const SATURN_ARCHIVE_ENTRY_MARKER: u32 = 0x8000_0000;
+const N64_RETROARCH_SRM_SIZE: u64 = 0x48800;
 
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "32x",
@@ -968,7 +969,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "snes" => matches!(ext, "srm" | "sav" | "sa1"),
         "gameboy" => matches!(ext, "sav" | "srm" | "gme" | "rtc" | "ram"),
         "gba" => matches!(ext, "sav" | "srm" | "sa1"),
-        "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk" | "cpk"),
+        "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk" | "cpk" | "srm"),
         "nds" => matches!(ext, "sav" | "dsv"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
@@ -1007,6 +1008,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             "eep" => size == 512 || size == 2048,
             "sra" | "mpk" | "cpk" => size == 32 * 1024,
             "fla" => size == 128 * 1024,
+            "srm" => size == N64_RETROARCH_SRM_SIZE,
             _ => false,
         },
         "nds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
@@ -1092,6 +1094,7 @@ fn validate_n64_save_media(path: &Path, ext: &str, size: u64) -> bool {
         "sra" => size == 32 * 1024,
         "mpk" | "cpk" => size == 32 * 1024,
         "fla" => size == 128 * 1024,
+        "srm" => size == N64_RETROARCH_SRM_SIZE,
         _ => false,
     };
     if !expected_size_ok {
@@ -2371,6 +2374,25 @@ mod tests {
         payload[0] = 0x5A;
         payload[4096] = 0x01;
         payload[32767] = 0xA5;
+        fs::write(&save, payload).unwrap();
+
+        assert_eq!(
+            infer_supported_console_slug(&save, None).as_deref(),
+            Some("n64")
+        );
+    }
+
+    #[test]
+    fn n64_retroarch_combined_srm_is_supported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp
+            .path()
+            .join("Emulation/saves/n64/Super Mario 64 (USA).srm");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let mut payload = vec![0u8; N64_RETROARCH_SRM_SIZE as usize];
+        payload[11] = 0x01;
+        payload[12] = 0x20;
+        payload[0x20800] = 0x42;
         fs::write(&save, payload).unwrap();
 
         assert_eq!(

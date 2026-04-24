@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-04-24
+
+### Fixed
+
+- RetroArch N64 combined `.srm` saves are now accepted by the strict scanner (`0x48800` bytes), so KNULLI/Batocera and Steam Deck N64 saves are no longer skipped as unsupported.
+- Cloud restore no longer lets stale sync-state records block backend projections when the local file is missing or invalid.
+- Existing valid local saves still win; only invalid/truncated placeholders are overwritten during restore.
+
 ## [0.4.6] - 2026-04-24
 
 ### Fixed

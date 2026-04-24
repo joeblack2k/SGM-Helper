@@ -415,7 +415,7 @@ fn restore_single_cloud_save(
     }
 
     let provisional_key = provisional_path.to_string_lossy().to_string();
-    if sync_entries.contains_key(&provisional_key) || restored_targets.contains(&provisional_key) {
+    if restored_targets.contains(&provisional_key) {
         return Ok(());
     }
 
@@ -443,12 +443,12 @@ fn restore_single_cloud_save(
         Some(downloaded_bytes.len() as u64),
     );
 
-    if target_path.exists() {
+    if existing_local_save_is_valid(&target_path, &system_slug) {
         return Ok(());
     }
 
     let target_key = target_path.to_string_lossy().to_string();
-    if sync_entries.contains_key(&target_key) || restored_targets.contains(&target_key) {
+    if restored_targets.contains(&target_key) {
         return Ok(());
     }
 

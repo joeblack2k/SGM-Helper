@@ -1,6 +1,6 @@
 [package]
 name = "sgm-mister-helper"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 license = "MIT"
 description = "MiSTer FPGA helper for SGM self-hosted save sync"
