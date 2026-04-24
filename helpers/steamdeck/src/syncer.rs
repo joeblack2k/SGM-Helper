@@ -410,7 +410,7 @@ fn restore_single_cloud_save(
         target_extension.as_deref(),
     );
 
-    if provisional_path.exists() {
+    if existing_local_save_is_valid(&provisional_path, &system_slug) {
         return Ok(());
     }
 
@@ -601,16 +601,68 @@ fn cloud_target_path(
     target_extension: Option<&str>,
 ) -> PathBuf {
     let root = select_cloud_restore_root(save_roots);
+    let filename = cloud_restore_filename(cloud_save, target_extension);
     let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
         root.to_path_buf()
     } else {
-        root.join(system_directory_for_source(
+        if let Some(existing_target) = existing_cloud_target_for_alias(root, system_slug, &filename)
+        {
+            return existing_target;
+        }
+        root.join(preferred_system_directory_for_root(
+            root,
             source_kind,
             source_profile,
             system_slug,
         ))
     };
-    target_dir.join(cloud_restore_filename(cloud_save, target_extension))
+    target_dir.join(filename)
+}
+
+fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
+    path.exists()
+        && classify_supported_save(path, None)
+            .map(|classification| classification.system_slug == system_slug)
+            .unwrap_or(false)
+}
+
+fn existing_cloud_target_for_alias(
+    root: &Path,
+    system_slug: &str,
+    filename: &str,
+) -> Option<PathBuf> {
+    let default_dir = generic_system_directory(system_slug);
+    let candidates = std::iter::once(default_dir).chain(
+        system_directory_aliases(system_slug)
+            .iter()
+            .copied()
+            .filter(move |alias| *alias != default_dir),
+    );
+    for alias in candidates {
+        let candidate = root.join(alias).join(filename);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn preferred_system_directory_for_root(
+    root: &Path,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+) -> String {
+    let default_dir = system_directory_for_source(source_kind, source_profile, system_slug);
+    if root.join(default_dir).is_dir() {
+        return default_dir.to_string();
+    }
+    for alias in system_directory_aliases(system_slug) {
+        if root.join(alias).is_dir() {
+            return (*alias).to_string();
+        }
+    }
+    default_dir.to_string()
 }
 
 fn select_cloud_restore_root(save_roots: &[PathBuf]) -> &PathBuf {

@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-04-24
+
+### Fixed
+
+- Save path hints now win over stale/wrong same-stem ROM matches, fixing MiSTer Saturn saves like `Saturn/Quake (USA).sav` when an unrelated `N64/Quake` ROM also exists.
+- Cloud restore now ignores invalid/truncated local placeholders instead of treating them as already restored, allowing backend projections to repair files such as short KNULLI `megadrive/*.srm` placeholders.
+- Cloud restore target selection checks existing system-directory aliases before creating a new canonical directory, so KNULLI/Batocera `megadrive` paths are reused instead of duplicating into `genesis`.
+
 ## [0.4.5] - 2026-04-24
 
 ### Fixed

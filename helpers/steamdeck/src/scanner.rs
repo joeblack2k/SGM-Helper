@@ -514,12 +514,7 @@ pub fn classify_supported_save(
     }
 
     let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
-    let rom_lower = rom_path
-        .map(|path| path.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    let combined = format!("{} {}", save_lower, rom_lower);
-
-    if contains_any(&combined, &["gameboy advance", "/gba/", "\\gba\\"]) {
+    if contains_any(&save_lower, &["gameboy advance", "/gba/", "\\gba\\"]) {
         if is_plausible_save_for_system(&save_ext, save_size, "gba") {
             return classify_if_valid(
                 save_path,
@@ -532,7 +527,7 @@ pub fn classify_supported_save(
         return None;
     }
     if contains_any(
-        &combined,
+        &save_lower,
         &[
             "game boy color",
             "gameboy color",
@@ -573,7 +568,7 @@ pub fn classify_supported_save(
             "nintendo",
         ],
     ) {
-        let slug = infer_nintendo_slug(&combined);
+        let slug = infer_nintendo_slug(&save_lower);
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
             return classify_if_valid(
                 save_path,
@@ -587,7 +582,7 @@ pub fn classify_supported_save(
     }
 
     if contains_any(
-        &combined,
+        &save_lower,
         &[
             "master system",
             "/sms/",
@@ -626,7 +621,7 @@ pub fn classify_supported_save(
             "sega",
         ],
     ) {
-        let slug = infer_sega_slug(&combined);
+        let slug = infer_sega_slug(&save_lower);
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
             return classify_if_valid(
                 save_path,
@@ -640,7 +635,7 @@ pub fn classify_supported_save(
     }
 
     if contains_any(
-        &combined,
+        &save_lower,
         &[
             "neo geo", "neogeo", "neo-geo", "/mvs/", "\\mvs\\", "/aes/", "\\aes\\",
         ],
@@ -658,7 +653,7 @@ pub fn classify_supported_save(
     }
 
     if contains_any(
-        &combined,
+        &save_lower,
         &[
             "playstation",
             "sony",
@@ -691,7 +686,7 @@ pub fn classify_supported_save(
             "vita3k",
         ],
     ) {
-        let slug = infer_sony_slug(&combined);
+        let slug = infer_sony_slug(&save_lower);
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
             return classify_if_valid(
                 save_path,
@@ -2407,6 +2402,23 @@ mod tests {
         fs::write(&save, vec![0xFFu8; 0x12000]).unwrap();
 
         assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn save_path_hint_wins_over_wrong_same_stem_rom_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/saves/Saturn/Quake (USA).sav");
+        let rom = tmp.path().join("MiSTer/games/N64/Quake (USA).z64");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::create_dir_all(rom.parent().unwrap()).unwrap();
+        fs::write(&save, build_valid_saturn_internal_backup_ram()).unwrap();
+        fs::write(&rom, [0x80, 0x37, 0x12, 0x40]).unwrap();
+
+        assert_eq!(
+            classify_supported_save(&save, Some(&rom))
+                .map(|classification| classification.system_slug),
+            Some("saturn".to_string())
+        );
     }
 
     #[test]
