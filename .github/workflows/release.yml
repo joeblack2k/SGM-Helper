@@ -1,4 +1,4 @@
-name: Release ARMv7 + Windows + Steam Deck
+name: Release ARMv7 + Anbernic + Windows + Steam Deck
 
 on:
   push:
@@ -30,11 +30,15 @@ jobs:
       - name: Add release targets
         run: |
           rustup target add armv7-unknown-linux-musleabihf
+          rustup target add aarch64-unknown-linux-musl
           rustup target add x86_64-pc-windows-gnu
           rustup target add x86_64-unknown-linux-gnu
 
       - name: Build ARMv7 release binary
         run: cargo zigbuild -p sgm-mister-helper --release --target armv7-unknown-linux-musleabihf
+
+      - name: Build Anbernic/KNULLI ARM64 release binary
+        run: cargo zigbuild -p sgm-mister-helper --release --target aarch64-unknown-linux-musl
 
       - name: Build Windows release binary
         run: cargo build -p sgm-windows-helper --release --target x86_64-pc-windows-gnu
@@ -47,14 +51,17 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp target/armv7-unknown-linux-musleabihf/release/sgm-mister-helper dist/
+          cp target/aarch64-unknown-linux-musl/release/sgm-mister-helper dist/sgm-anbernic-helper
           cp target/x86_64-pc-windows-gnu/release/sgm-windows-helper.exe dist/
           cp target/x86_64-unknown-linux-gnu/release/sgm-steamdeck-helper dist/
           tar -C dist -czf dist/sgm-mister-helper-armv7.tar.gz sgm-mister-helper
+          tar -C dist -czf dist/sgm-anbernic-helper-aarch64-unknown-linux-musl.tar.gz sgm-anbernic-helper
           zip -j dist/sgm-windows-helper-x86_64-pc-windows-gnu.zip dist/sgm-windows-helper.exe
           tar -C dist -czf dist/sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz sgm-steamdeck-helper
           (
             cd dist
             sha256sum sgm-mister-helper-armv7.tar.gz > sha256.txt
+            sha256sum sgm-anbernic-helper-aarch64-unknown-linux-musl.tar.gz >> sha256.txt
             sha256sum sgm-windows-helper-x86_64-pc-windows-gnu.zip >> sha256.txt
             sha256sum sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz >> sha256.txt
           )
@@ -64,6 +71,7 @@ jobs:
         with:
           files: |
             dist/sgm-mister-helper-armv7.tar.gz
+            dist/sgm-anbernic-helper-aarch64-unknown-linux-musl.tar.gz
             dist/sgm-windows-helper-x86_64-pc-windows-gnu.zip
             dist/sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz
             dist/sha256.txt

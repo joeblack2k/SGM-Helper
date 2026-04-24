@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file.
 - Cloud-aware restore pass for MiSTer, Steam Deck, and Windows helpers.
 - Helpers now page through `GET /saves` after the local scan and restore backend-only saves into the configured source path.
 - Runtime-profile downloads are requested automatically per source/emulator profile, for example `n64/mister`, `snes/snes9x`, `genesis/retroarch-genesis-plus-gx`, and `saturn/mister`.
+- Release workflow now publishes an Anbernic/KNULLI ARM64 artifact: `sgm-anbernic-helper-aarch64-unknown-linux-musl.tar.gz`.
 
 ### Changed
 

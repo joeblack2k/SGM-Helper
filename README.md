@@ -18,6 +18,7 @@ If backend auth is disabled, you can usually run `sync` directly.
 ## Supported Helpers and Release Files
 
 - MiSTer: `sgm-mister-helper-armv7.tar.gz`
+- Anbernic/KNULLI/Batocera ARM64: `sgm-anbernic-helper-aarch64-unknown-linux-musl.tar.gz`
 - Steam Deck: `sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz`
 - Windows: `sgm-windows-helper-x86_64-pc-windows-gnu.zip`
 - GameCube/Wii: `sgm-gamecube-helper.dol`
@@ -292,4 +293,3 @@ systemctl status sgm-steamdeck-helper.service
 - Windows: [`docs/windows/install.md`](docs/windows/install.md)
 - GameCube: [`docs/gamecube/install.md`](docs/gamecube/install.md)
 - 3DS: [`docs/3ds/install.md`](docs/3ds/install.md)
-
