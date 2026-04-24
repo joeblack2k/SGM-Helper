@@ -540,20 +540,20 @@ fn cloud_target_extension(
     cloud_save: &CloudSaveSummary,
     runtime_profile: Option<&str>,
 ) -> Option<String> {
-    if let Some(runtime_profile) = runtime_profile {
-        if let Some(profile) = cloud_save.download_profiles.iter().find(|profile| {
+    if let Some(runtime_profile) = runtime_profile
+        && let Some(profile) = cloud_save.download_profiles.iter().find(|profile| {
             profile.id.eq_ignore_ascii_case(runtime_profile)
                 && profile
                     .target_extension
                     .as_deref()
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(false)
-        }) {
-            return profile
-                .target_extension
-                .as_deref()
-                .and_then(normalize_extension_value);
-        }
+        })
+    {
+        return profile
+            .target_extension
+            .as_deref()
+            .and_then(normalize_extension_value);
     }
 
     cloud_save
