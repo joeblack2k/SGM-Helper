@@ -455,17 +455,19 @@ fn process_single_save(
 
         let filename = upload_filename_for_sync(save_path, &system_slug);
 
-        let upload_result = api.upload_save(
+        let upload_result = upload_with_n64_mister_cpk_fallback(
+            api,
             &filename,
-            normalized_save.canonical_bytes.clone(),
+            &normalized_save.canonical_bytes,
             &active_rom_sha1,
             rom_md5.as_deref(),
             &effective_slot_name,
             device_type,
             fingerprint,
             app_password,
-            Some(&system_slug),
-            Some(&runtime_target),
+            &system_slug,
+            &runtime_target,
+            verbose,
         );
         if let Err(err) = upload_result {
             if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
@@ -520,17 +522,19 @@ fn process_single_save(
 
         let filename = upload_filename_for_sync(save_path, &system_slug);
 
-        let upload_result = api.upload_save(
+        let upload_result = upload_with_n64_mister_cpk_fallback(
+            api,
             &filename,
-            normalized_save.canonical_bytes.clone(),
+            &normalized_save.canonical_bytes,
             &active_rom_sha1,
             rom_md5.as_deref(),
             &effective_slot_name,
             device_type,
             fingerprint,
             app_password,
-            Some(&system_slug),
-            Some(&runtime_target),
+            &system_slug,
+            &runtime_target,
+            verbose,
         );
         if let Err(err) = upload_result {
             if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
@@ -1457,6 +1461,101 @@ fn is_empty_n64_controller_pak_rejection(err: &anyhow::Error, system_slug: &str)
 }
 
 #[allow(clippy::too_many_arguments)]
+fn upload_with_n64_mister_cpk_fallback(
+    api: &ApiClient,
+    filename: &str,
+    bytes: &[u8],
+    rom_sha1: &str,
+    rom_md5: Option<&str>,
+    slot_name: &str,
+    device_type: &str,
+    fingerprint: &str,
+    app_password: Option<&str>,
+    system_slug: &str,
+    runtime_target: &RuntimeTarget,
+    verbose: bool,
+) -> Result<()> {
+    let upload_result = api.upload_save(
+        filename,
+        bytes.to_vec(),
+        rom_sha1,
+        rom_md5,
+        slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+        Some(system_slug),
+        Some(runtime_target),
+    );
+    if let Err(err) = upload_result {
+        if should_retry_n64_mister_cpk_as_mpk(&err, system_slug, runtime_target, filename)
+            && let Some(fallback_filename) = filename_with_extension(filename, "mpk")
+        {
+            if verbose {
+                eprintln!(
+                    "Retrying N64 controller pak upload as {} (legacy backend compatibility)",
+                    fallback_filename
+                );
+            }
+            let _retry = api.upload_save(
+                &fallback_filename,
+                bytes.to_vec(),
+                rom_sha1,
+                rom_md5,
+                slot_name,
+                device_type,
+                fingerprint,
+                app_password,
+                Some(system_slug),
+                Some(runtime_target),
+            )?;
+            return Ok(());
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn should_retry_n64_mister_cpk_as_mpk(
+    err: &anyhow::Error,
+    system_slug: &str,
+    runtime_target: &RuntimeTarget,
+    filename: &str,
+) -> bool {
+    if system_slug != "n64" {
+        return false;
+    }
+    if !filename.to_ascii_lowercase().ends_with(".cpk") {
+        return false;
+    }
+    let profile = runtime_target
+        .system_profile_value
+        .as_deref()
+        .or(runtime_target.runtime_profile.as_deref())
+        .unwrap_or_default();
+    if profile != "n64/mister" {
+        return false;
+    }
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("status=422 unprocessable entity")
+        && message.contains("unsupported n64 upload form for n64/mister")
+        && message.contains(".cpk")
+}
+
+fn filename_with_extension(filename: &str, target_ext: &str) -> Option<String> {
+    let trimmed_target = target_ext
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if trimmed_target.is_empty() {
+        return None;
+    }
+    let path = Path::new(filename);
+    let stem = path.file_stem()?.to_str()?;
+    Some(format!("{}.{}", stem, trimmed_target))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_conflict(
     api: &ApiClient,
     save_path: &std::path::Path,
@@ -1900,6 +1999,29 @@ mod tests {
         );
         assert!(is_empty_n64_controller_pak_rejection(&err, "n64"));
         assert!(!is_empty_n64_controller_pak_rejection(&err, "snes"));
+    }
+
+    #[test]
+    fn retries_n64_mister_cpk_for_legacy_backend_upload_form() {
+        let err = anyhow::Error::msg(
+            "HTTP request faalde: status=422 Unprocessable Entity body={\"error\":\"Unprocessable Entity\",\"message\":\"unsupported N64 upload form for n64/mister: .cpk (32768 bytes)\",\"statusCode\":422}",
+        );
+        let target = RuntimeTarget {
+            runtime_profile: Some("n64/mister".to_string()),
+            emulator_profile: Some("mister".to_string()),
+            system_profile_key: Some("n64Profile".to_string()),
+            system_profile_value: Some("n64/mister".to_string()),
+        };
+        assert!(should_retry_n64_mister_cpk_as_mpk(
+            &err,
+            "n64",
+            &target,
+            "mk64_1.cpk"
+        ));
+        assert_eq!(
+            filename_with_extension("mk64_1.cpk", "mpk").as_deref(),
+            Some("mk64_1.mpk")
+        );
     }
 
     #[test]
