@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-04-24
+
+### Added
+
+- Cloud-aware restore pass for MiSTer, Steam Deck, and Windows helpers.
+- Helpers now page through `GET /saves` after the local scan and restore backend-only saves into the configured source path.
+- Runtime-profile downloads are requested automatically per source/emulator profile, for example `n64/mister`, `snes/snes9x`, `genesis/retroarch-genesis-plus-gx`, and `saturn/mister`.
+
+### Changed
+
+- Restored saves are written in the local helper format instead of blindly preserving the backend filename extension.
+- MiSTer cartridge restores now land as `.sav` even when the backend download profile exposes `.srm`.
+- N64 controller-pak restores target MiSTer `.cpk`, RetroArch `.srm`, and other emulator `.mpk` projections based on the selected runtime profile.
+- Existing local files remain local-first: the helper does not silently overwrite them during the cloud-only restore pass.
+
+### Tests
+
+- Added syncer tests for MiSTer SNES `.srm` to `.sav` restore targeting.
+- Added syncer tests for N64 controller-pak `.cpk` restore targeting.
+- Added syncer tests to keep single-system emulator roots, such as Snes9x, direct instead of appending another console directory.
+
 ## [0.4.3] - 2026-04-23
 
 ### Added

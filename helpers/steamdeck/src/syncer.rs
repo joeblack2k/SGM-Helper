@@ -1,16 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::api::{ApiClient, ConflictCheckResponse, LatestSaveResponse, RuntimeTarget};
+use crate::api::{
+    ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveResponse, RuntimeTarget,
+};
 use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, dreamcast_skip_reason,
-    encode_download_for_local_container, filename_stem, md5_file, normalize_save_for_sync,
-    saturn_skip_reason, sha1_file, sha256_bytes,
+    encode_download_for_local_container, filename_stem, md5_file, normalize_save_bytes_for_sync,
+    normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes,
 };
 use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
@@ -246,6 +248,20 @@ pub fn run_sync(
                 }
             }
         }
+
+        restore_cloud_only_saves(
+            &api,
+            &source.name,
+            &source.kind,
+            &source.profile,
+            &source.save_roots,
+            &fingerprint,
+            app_password,
+            options,
+            &mut sync_state.entries,
+            &mut report,
+            verbose,
+        )?;
     }
 
     if !options.dry_run {
@@ -257,6 +273,540 @@ pub fn run_sync(
 
 fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_cloud_only_saves(
+    api: &ApiClient,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    save_roots: &[PathBuf],
+    fingerprint: &str,
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    sync_entries: &mut HashMap<String, SyncedEntry>,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<()> {
+    if save_roots.is_empty() {
+        return Ok(());
+    }
+
+    let mut offset = 0usize;
+    let limit = 100usize;
+    let mut restored_targets = HashSet::new();
+
+    loop {
+        let page = match api.list_saves(limit, offset, app_password) {
+            Ok(page) => page,
+            Err(err) => {
+                if verbose {
+                    eprintln!(
+                        "Cloud restore skipped for source '{}': /saves unavailable ({})",
+                        source_name, err
+                    );
+                }
+                return Ok(());
+            }
+        };
+
+        if page.saves.is_empty() {
+            break;
+        }
+
+        if verbose && offset == 0 {
+            eprintln!(
+                "Cloud restore scan for source '{}' saw {} save track(s)",
+                source_name, page.total
+            );
+        }
+
+        let page_len = page.saves.len();
+        for cloud_save in page.saves {
+            match restore_single_cloud_save(
+                api,
+                &cloud_save,
+                source_name,
+                source_kind,
+                source_profile,
+                save_roots,
+                fingerprint,
+                app_password,
+                options,
+                sync_entries,
+                &mut restored_targets,
+                report,
+                verbose,
+            ) {
+                Ok(()) => {}
+                Err(err) => {
+                    report.errors += 1;
+                    if verbose {
+                        let label = cloud_save.display_name();
+                        eprintln!("Cloud restore error for '{}': {}", label, err);
+                    }
+                }
+            }
+        }
+
+        offset += page_len;
+        if page.total > 0 {
+            if offset >= page.total {
+                break;
+            }
+        } else if page_len < limit {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_single_cloud_save(
+    api: &ApiClient,
+    cloud_save: &CloudSaveSummary,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    save_roots: &[PathBuf],
+    fingerprint: &str,
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    sync_entries: &mut HashMap<String, SyncedEntry>,
+    restored_targets: &mut HashSet<String>,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<()> {
+    let Some(system_slug) = cloud_save
+        .system_slug()
+        .map(|value| value.to_ascii_lowercase())
+    else {
+        report.skipped += 1;
+        return Ok(());
+    };
+
+    if !supports_cloud_restore_system(&system_slug) {
+        report.skipped += 1;
+        return Ok(());
+    }
+
+    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
+    let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
+    let runtime_target =
+        runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
+    let runtime_profile = runtime_target
+        .system_profile_value
+        .as_deref()
+        .or(runtime_target.runtime_profile.as_deref());
+    let target_extension = cloud_target_extension(cloud_save, runtime_profile);
+    let provisional_path = cloud_target_path(
+        cloud_save,
+        save_roots,
+        source_kind,
+        &effective_profile,
+        &system_slug,
+        target_extension.as_deref(),
+    );
+
+    if provisional_path.exists() {
+        return Ok(());
+    }
+
+    let provisional_key = provisional_path.to_string_lossy().to_string();
+    if sync_entries.contains_key(&provisional_key) || restored_targets.contains(&provisional_key) {
+        return Ok(());
+    }
+
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(());
+    }
+
+    let downloaded_bytes = api.download_save(
+        &cloud_save.id,
+        device_type,
+        fingerprint,
+        app_password,
+        Some(&runtime_target),
+    )?;
+    let local_container =
+        local_container_for_cloud_download(&system_slug, &provisional_path, &downloaded_bytes)?;
+    let adapter_profile = default_adapter_profile_for_container(local_container);
+    let target_path = preferred_save_path(
+        &provisional_path,
+        source_kind,
+        &effective_profile,
+        Some(&system_slug),
+        local_container,
+        Some(downloaded_bytes.len() as u64),
+    );
+
+    if target_path.exists() {
+        return Ok(());
+    }
+
+    let target_key = target_path.to_string_lossy().to_string();
+    if sync_entries.contains_key(&target_key) || restored_targets.contains(&target_key) {
+        return Ok(());
+    }
+
+    let local_bytes = encode_download_for_local_container(&downloaded_bytes, local_container)?;
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("kan map niet maken: {}", parent.display()))?;
+    }
+    fs::write(&target_path, &local_bytes)
+        .with_context(|| format!("kan cloud save niet herstellen: {}", target_path.display()))?;
+
+    let slot_name = cloud_save
+        .card_slot
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            resolve_slot_name_for_sync(&system_slug, &target_path, &options.slot_name)
+        });
+
+    let entry = synced_entry(
+        sha256_bytes(&downloaded_bytes),
+        cloud_save.rom_sha1.clone(),
+        cloud_save.version,
+        Some(&system_slug),
+        Some(local_container),
+        Some(adapter_profile),
+        Some(source_kind),
+        Some(source_name),
+        Some(&slot_name),
+    );
+    sync_entries.insert(target_key.clone(), entry);
+    restored_targets.insert(provisional_key);
+    restored_targets.insert(target_key);
+    report.downloaded += 1;
+
+    if verbose {
+        eprintln!(
+            "Restored cloud-only {} save '{}' to {} using profile {}",
+            system_slug,
+            cloud_save.display_name(),
+            target_path.display(),
+            runtime_profile.unwrap_or("original")
+        );
+    }
+
+    Ok(())
+}
+
+fn supports_cloud_restore_system(system_slug: &str) -> bool {
+    matches!(
+        system_slug,
+        "nes"
+            | "snes"
+            | "gameboy"
+            | "gba"
+            | "n64"
+            | "nds"
+            | "genesis"
+            | "master-system"
+            | "game-gear"
+            | "sega-cd"
+            | "sega-32x"
+            | "saturn"
+            | "dreamcast"
+            | "neogeo"
+            | "psx"
+            | "ps2"
+            | "psp"
+            | "psvita"
+            | "ps3"
+            | "ps4"
+            | "ps5"
+    )
+}
+
+fn effective_profile_for_cloud_restore(
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+) -> EmulatorProfile {
+    match source_kind {
+        SourceKind::MisterFpga => EmulatorProfile::Mister,
+        SourceKind::RetroArch => EmulatorProfile::RetroArch,
+        _ => source_profile.clone(),
+    }
+}
+
+fn cloud_target_extension(
+    cloud_save: &CloudSaveSummary,
+    runtime_profile: Option<&str>,
+) -> Option<String> {
+    if let Some(runtime_profile) = runtime_profile {
+        if let Some(profile) = cloud_save.download_profiles.iter().find(|profile| {
+            profile.id.eq_ignore_ascii_case(runtime_profile)
+                && profile
+                    .target_extension
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        }) {
+            return profile
+                .target_extension
+                .as_deref()
+                .and_then(normalize_extension_value);
+        }
+    }
+
+    cloud_save
+        .download_profiles
+        .iter()
+        .find(|profile| {
+            profile.id.eq_ignore_ascii_case("original")
+                && profile
+                    .target_extension
+                    .as_deref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+        })
+        .and_then(|profile| {
+            profile
+                .target_extension
+                .as_deref()
+                .and_then(normalize_extension_value)
+        })
+        .or_else(|| extension_from_filename(&cloud_save.filename))
+}
+
+fn normalize_extension_value(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_start_matches('.').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_ascii_lowercase())
+    }
+}
+
+fn extension_from_filename(filename: &str) -> Option<String> {
+    let path = Path::new(filename.trim());
+    path.extension()
+        .and_then(|value| value.to_str())
+        .and_then(normalize_extension_value)
+}
+
+fn cloud_target_path(
+    cloud_save: &CloudSaveSummary,
+    save_roots: &[PathBuf],
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    target_extension: Option<&str>,
+) -> PathBuf {
+    let root = select_cloud_restore_root(save_roots);
+    let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
+        root.to_path_buf()
+    } else {
+        root.join(system_directory_for_source(
+            source_kind,
+            source_profile,
+            system_slug,
+        ))
+    };
+    target_dir.join(cloud_restore_filename(cloud_save, target_extension))
+}
+
+fn select_cloud_restore_root(save_roots: &[PathBuf]) -> &PathBuf {
+    save_roots
+        .iter()
+        .find(|root| root.exists())
+        .unwrap_or(&save_roots[0])
+}
+
+fn cloud_restore_filename(cloud_save: &CloudSaveSummary, target_extension: Option<&str>) -> String {
+    let fallback_name = cloud_save.display_name();
+    let raw_name = if cloud_save.filename.trim().is_empty() {
+        fallback_name
+    } else {
+        cloud_save.filename.trim()
+    };
+    let safe_name = sanitize_filename(raw_name);
+    let stem = Path::new(&safe_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(sanitize_filename)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| sanitize_filename(fallback_name));
+
+    if let Some(extension) = target_extension.and_then(normalize_extension_value) {
+        return format!("{}.{}", stem, extension);
+    }
+
+    if Path::new(&safe_name).extension().is_some() {
+        safe_name
+    } else {
+        format!("{}.sav", stem)
+    }
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.trim().chars() {
+        if ch.is_ascii_control()
+            || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim().trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "save".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn root_is_system_specific(
+    root: &Path,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+) -> bool {
+    if profile_is_system_specific(source_profile, system_slug) {
+        return true;
+    }
+
+    let Some(name) = root.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let normalized = normalize_path_token(name);
+    system_directory_aliases(system_slug)
+        .iter()
+        .any(|alias| normalize_path_token(alias) == normalized)
+}
+
+fn profile_is_system_specific(source_profile: &EmulatorProfile, system_slug: &str) -> bool {
+    matches!(
+        (source_profile, system_slug),
+        (EmulatorProfile::Snes9x, "snes")
+            | (EmulatorProfile::Zsnes, "snes")
+            | (EmulatorProfile::Project64, "n64")
+            | (EmulatorProfile::MupenFamily, "n64")
+            | (EmulatorProfile::EverDrive, "n64")
+    )
+}
+
+fn system_directory_for_source(
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+) -> &'static str {
+    if matches!(source_kind, SourceKind::MisterFpga)
+        || matches!(source_profile, EmulatorProfile::Mister)
+    {
+        return mister_system_directory(system_slug);
+    }
+    generic_system_directory(system_slug)
+}
+
+fn mister_system_directory(system_slug: &str) -> &'static str {
+    match system_slug {
+        "nes" => "NES",
+        "snes" => "SNES",
+        "gameboy" => "GameBoy",
+        "gba" => "GBA",
+        "n64" => "N64",
+        "nds" => "NDS",
+        "genesis" => "MegaDrive",
+        "master-system" => "SMS",
+        "game-gear" => "GameGear",
+        "sega-cd" => "MegaCD",
+        "sega-32x" => "MegaDrive",
+        "saturn" => "Saturn",
+        "dreamcast" => "Dreamcast",
+        "neogeo" => "NeoGeo",
+        "psx" => "PSX",
+        "ps2" => "PS2",
+        "psp" => "PSP",
+        "psvita" => "PSVita",
+        "ps3" => "PS3",
+        "ps4" => "PS4",
+        "ps5" => "PS5",
+        _ => "Other",
+    }
+}
+
+fn generic_system_directory(system_slug: &str) -> &'static str {
+    match system_slug {
+        "nes" => "nes",
+        "snes" => "snes",
+        "gameboy" => "gb",
+        "gba" => "gba",
+        "n64" => "n64",
+        "nds" => "nds",
+        "genesis" => "genesis",
+        "master-system" => "mastersystem",
+        "game-gear" => "gamegear",
+        "sega-cd" => "segacd",
+        "sega-32x" => "sega32x",
+        "saturn" => "saturn",
+        "dreamcast" => "dreamcast",
+        "neogeo" => "neogeo",
+        "psx" => "psx",
+        "ps2" => "ps2",
+        "psp" => "psp",
+        "psvita" => "psvita",
+        "ps3" => "ps3",
+        "ps4" => "ps4",
+        "ps5" => "ps5",
+        _ => "unknown",
+    }
+}
+
+fn system_directory_aliases(system_slug: &str) -> &'static [&'static str] {
+    match system_slug {
+        "nes" => &["nes", "famicom"],
+        "snes" => &["snes", "sfc", "super nintendo", "supernintendo"],
+        "gameboy" => &["gb", "gbc", "gameboy", "game boy", "gameboy color"],
+        "gba" => &["gba", "gameboy advance", "game boy advance"],
+        "n64" => &["n64", "nintendo 64", "nintendo64"],
+        "nds" => &["nds", "nintendo ds", "nintendods"],
+        "genesis" => &["genesis", "megadrive", "mega drive", "md"],
+        "master-system" => &["mastersystem", "master system", "sms"],
+        "game-gear" => &["gamegear", "game gear", "gg"],
+        "sega-cd" => &["segacd", "sega cd", "mega cd", "megacd"],
+        "sega-32x" => &["sega32x", "sega 32x", "32x"],
+        "saturn" => &["saturn", "sega saturn"],
+        "dreamcast" => &["dreamcast", "dc"],
+        "neogeo" => &["neogeo", "neo geo", "mvs", "aes"],
+        "psx" => &["psx", "ps1", "playstation", "playstation 1"],
+        "ps2" => &["ps2", "playstation 2"],
+        "psp" => &["psp"],
+        "psvita" => &["psvita", "vita", "ps vita"],
+        "ps3" => &["ps3", "playstation 3"],
+        "ps4" => &["ps4", "playstation 4"],
+        "ps5" => &["ps5", "playstation 5"],
+        _ => &[],
+    }
+}
+
+fn normalize_path_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn local_container_for_cloud_download(
+    system_slug: &str,
+    target_path: &Path,
+    downloaded_bytes: &[u8],
+) -> Result<SaveContainerFormat> {
+    if system_slug != "psx" {
+        return Ok(SaveContainerFormat::Native);
+    }
+    let normalized = normalize_save_bytes_for_sync(target_path, system_slug, downloaded_bytes)?
+        .context("backend leverde geen geldige PS1 memory card projectie")?;
+    Ok(normalized.local_container)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1643,6 +2193,39 @@ fn synced_entry(
 mod tests {
     use super::*;
 
+    fn cloud_save(
+        filename: &str,
+        title: &str,
+        system_slug: &str,
+        profile_id: &str,
+        target_extension: &str,
+    ) -> CloudSaveSummary {
+        CloudSaveSummary {
+            id: "save-cloud".to_string(),
+            filename: filename.to_string(),
+            display_title: title.to_string(),
+            system_slug: system_slug.to_string(),
+            game: None,
+            sha256: Some("sha".to_string()),
+            version: Some(1),
+            file_size: Some(8192),
+            latest_size_bytes: Some(8192),
+            media_type: None,
+            runtime_profile: None,
+            source_artifact_profile: None,
+            logical_key: None,
+            card_slot: None,
+            download_profiles: vec![crate::api::DownloadProfile {
+                id: profile_id.to_string(),
+                label: profile_id.to_string(),
+                target_extension: Some(target_extension.to_string()),
+                note: None,
+            }],
+            rom_sha1: None,
+            rom_md5: None,
+        }
+    }
+
     #[test]
     fn runtime_target_uses_explicit_n64_profile_key() {
         let target = runtime_target_for_system(
@@ -2021,6 +2604,91 @@ mod tests {
         assert_eq!(
             filename_with_extension("mk64_1.cpk", "mpk").as_deref(),
             Some("mk64_1.mpk")
+        );
+    }
+
+    #[test]
+    fn cloud_restore_targets_mister_snes_sav_even_when_backend_profile_is_srm() {
+        let save = cloud_save(
+            "Super Mario Kart (USA).srm",
+            "Super Mario Kart",
+            "snes",
+            "snes/snes9x",
+            ".srm",
+        );
+        let extension = cloud_target_extension(&save, Some("snes/snes9x"));
+        let provisional = cloud_target_path(
+            &save,
+            &[PathBuf::from("/media/fat/saves")],
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            "snes",
+            extension.as_deref(),
+        );
+        assert_eq!(
+            provisional.to_string_lossy(),
+            "/media/fat/saves/SNES/Super Mario Kart (USA).srm"
+        );
+
+        let final_path = preferred_save_path(
+            &provisional,
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            Some("snes"),
+            SaveContainerFormat::Native,
+            Some(2048),
+        );
+        assert_eq!(
+            final_path.to_string_lossy(),
+            "/media/fat/saves/SNES/Super Mario Kart (USA).sav"
+        );
+    }
+
+    #[test]
+    fn cloud_restore_targets_mister_n64_controller_pak_cpk() {
+        let mut save = cloud_save(
+            "Mario Kart 64 (USA)_1.mpk",
+            "Mario Kart 64",
+            "n64",
+            "n64/mister",
+            ".cpk",
+        );
+        save.media_type = Some("controller-pak".to_string());
+        let extension = cloud_target_extension(&save, Some("n64/mister"));
+        let target = cloud_target_path(
+            &save,
+            &[PathBuf::from("/media/fat/saves")],
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            "n64",
+            extension.as_deref(),
+        );
+        assert_eq!(
+            target.to_string_lossy(),
+            "/media/fat/saves/N64/Mario Kart 64 (USA)_1.cpk"
+        );
+    }
+
+    #[test]
+    fn cloud_restore_keeps_single_system_emulator_root_direct() {
+        let save = cloud_save(
+            "Chrono Trigger (USA).srm",
+            "Chrono Trigger",
+            "snes",
+            "snes/snes9x",
+            ".srm",
+        );
+        let target = cloud_target_path(
+            &save,
+            &[PathBuf::from("/home/snes9x/save")],
+            &SourceKind::Custom,
+            &EmulatorProfile::Snes9x,
+            "snes",
+            Some("srm"),
+        );
+        assert_eq!(
+            target.to_string_lossy(),
+            "/home/snes9x/save/Chrono Trigger (USA).srm"
         );
     }
 

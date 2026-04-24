@@ -92,6 +92,116 @@ pub struct UploadSaveResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct ListSavesResponse {
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub saves: Vec<CloudSaveSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudSaveSummary {
+    pub id: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default, rename = "displayTitle")]
+    pub display_title: String,
+    #[serde(default, rename = "systemSlug")]
+    pub system_slug: String,
+    #[serde(default)]
+    pub game: Option<CloudSaveGame>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub version: Option<i64>,
+    #[serde(default, rename = "fileSize")]
+    pub file_size: Option<u64>,
+    #[serde(default, rename = "latestSizeBytes")]
+    pub latest_size_bytes: Option<u64>,
+    #[serde(default, rename = "mediaType")]
+    pub media_type: Option<String>,
+    #[serde(default, rename = "runtimeProfile")]
+    pub runtime_profile: Option<String>,
+    #[serde(default, rename = "sourceArtifactProfile")]
+    pub source_artifact_profile: Option<String>,
+    #[serde(default, rename = "logicalKey")]
+    pub logical_key: Option<String>,
+    #[serde(default, rename = "cardSlot")]
+    pub card_slot: Option<String>,
+    #[serde(default, rename = "downloadProfiles")]
+    pub download_profiles: Vec<DownloadProfile>,
+    #[serde(default, rename = "romSha1")]
+    pub rom_sha1: Option<String>,
+    #[serde(default, rename = "romMd5")]
+    pub rom_md5: Option<String>,
+}
+
+impl CloudSaveSummary {
+    pub fn system_slug(&self) -> Option<&str> {
+        let direct = self.system_slug.trim();
+        if !direct.is_empty() {
+            return Some(direct);
+        }
+        self.game
+            .as_ref()
+            .and_then(|game| game.system.as_ref())
+            .map(|system| system.slug.trim())
+            .filter(|slug| !slug.is_empty())
+    }
+
+    pub fn display_name(&self) -> &str {
+        let title = self.display_title.trim();
+        if !title.is_empty() {
+            return title;
+        }
+        if let Some(game) = self.game.as_ref() {
+            let display_title = game.display_title.trim();
+            if !display_title.is_empty() {
+                return display_title;
+            }
+            let name = game.name.trim();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+        self.filename.trim()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudSaveGame {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, rename = "displayTitle")]
+    pub display_title: String,
+    #[serde(default)]
+    pub system: Option<CloudSaveSystem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudSaveSystem {
+    #[serde(default)]
+    pub slug: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DownloadProfile {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default, rename = "targetExtension")]
+    pub target_extension: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct UploadedSave {
     pub id: Option<String>,
     pub sha256: Option<String>,
@@ -476,6 +586,26 @@ impl ApiClient {
             .send()
             .context("request naar /saves (multipart) faalde")?;
 
+        parse_json_response(response)
+    }
+
+    pub fn list_saves(
+        &self,
+        limit: usize,
+        offset: usize,
+        app_password: Option<&str>,
+    ) -> Result<ListSavesResponse> {
+        let url = self.url("/saves");
+        let mut request = self
+            .client
+            .get(url)
+            .query(&[("limit", limit.to_string()), ("offset", offset.to_string())]);
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let response = request.send().context("request naar /saves faalde")?;
         parse_json_response(response)
     }
 
