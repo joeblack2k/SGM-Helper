@@ -1044,7 +1044,12 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
                     && size.is_multiple_of(DC_BLOCK_SIZE as u64)
             }
         }
-        "neogeo" => size.is_power_of_two() && (512..=2_097_152).contains(&size),
+        "neogeo" => {
+            // MiSTer NeoGeo backup RAM commonly includes a 0x2000 metadata/padding area
+            // around the 64 KiB payload, so 0x12000 is valid even though it is not
+            // a power-of-two size.
+            size == 0x12000 || (size.is_power_of_two() && (512..=2_097_152).contains(&size))
+        }
         "psx" => {
             let size = size as usize;
             size == PS1_MEMCARD_SIZE
@@ -1067,10 +1072,23 @@ fn passes_binary_validation(save_path: &Path, save_ext: &str, save_size: u64, sl
         "n64" => validate_n64_save_media(save_path, save_ext, save_size),
         "dreamcast" => validate_dreamcast_container(save_path, save_ext),
         "saturn" => validate_saturn_backup_ram(save_path),
+        "neogeo" => validate_non_blank_payload(save_path),
         "psx" => validate_psx_container(save_path, save_ext),
         "ps2" => validate_ps2_memory_card_image(save_path),
         _ => true,
     }
+}
+
+fn validate_non_blank_payload(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return false;
+    }
+    let all_zero = bytes.iter().all(|value| *value == 0x00);
+    let all_ff = bytes.iter().all(|value| *value == 0xFF);
+    !(all_zero || all_ff)
 }
 
 fn validate_n64_save_media(path: &Path, ext: &str, size: u64) -> bool {
@@ -2364,6 +2382,31 @@ mod tests {
             infer_supported_console_slug(&save, None).as_deref(),
             Some("n64")
         );
+    }
+
+    #[test]
+    fn neogeo_mister_backup_ram_size_is_supported_when_non_blank() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/NEOGEO/mslug5.sav");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let mut payload = vec![0u8; 0x12000];
+        payload[16..32].copy_from_slice(b"ABKCPUR MAO  K\x80!");
+        fs::write(&save, payload).unwrap();
+
+        assert_eq!(
+            infer_supported_console_slug(&save, None).as_deref(),
+            Some("neogeo")
+        );
+    }
+
+    #[test]
+    fn neogeo_blank_backup_ram_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("MiSTer/NEOGEO/doubledr.sav");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, vec![0xFFu8; 0x12000]).unwrap();
+
+        assert!(infer_supported_console_slug(&save, None).is_none());
     }
 
     #[test]

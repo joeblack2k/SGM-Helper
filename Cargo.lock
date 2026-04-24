@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "sgm-mister-helper"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "aes",
  "anyhow",
@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "sgm-steamdeck-helper"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "aes",
  "anyhow",
@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "sgm-windows-helper"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "aes",
  "anyhow",

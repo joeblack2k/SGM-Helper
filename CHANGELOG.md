@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-04-24
+
+### Fixed
+
+- MiSTer/SteamDeck/Windows scanner now accepts NeoGeo MiSTer backup RAM saves with the common `0x12000` byte layout.
+- Blank/all-`0xFF` NeoGeo backup RAM files are still rejected, so empty frontend-created placeholders do not pollute the backend.
+
 ## [0.4.4] - 2026-04-24
 
 ### Added
