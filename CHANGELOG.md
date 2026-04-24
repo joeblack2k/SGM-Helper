@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-04-24
+
+### Fixed
+
+- MiSTer cloud restore now prefers MiSTer-native directory casing (`N64`, `SNES`, `MegaDrive`, etc.) before generic aliases, keeping logs and sync-state aligned with the paths MiSTer users expect.
+- GitHub Releases now publish the matching `CHANGELOG.md` section as release notes automatically.
+
 ## [0.4.7] - 2026-04-24
 
 ### Fixed

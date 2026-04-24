@@ -605,8 +605,13 @@ fn cloud_target_path(
     let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
         root.to_path_buf()
     } else {
-        if let Some(existing_target) = existing_cloud_target_for_alias(root, system_slug, &filename)
-        {
+        if let Some(existing_target) = existing_cloud_target_for_alias(
+            root,
+            source_kind,
+            source_profile,
+            system_slug,
+            &filename,
+        ) {
             return existing_target;
         }
         root.join(preferred_system_directory_for_root(
@@ -628,10 +633,12 @@ fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
 
 fn existing_cloud_target_for_alias(
     root: &Path,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
     system_slug: &str,
     filename: &str,
 ) -> Option<PathBuf> {
-    let default_dir = generic_system_directory(system_slug);
+    let default_dir = system_directory_for_source(source_kind, source_profile, system_slug);
     let candidates = std::iter::once(default_dir).chain(
         system_directory_aliases(system_slug)
             .iter()
@@ -2719,6 +2726,36 @@ mod tests {
             target.to_string_lossy(),
             "/media/fat/saves/N64/Mario Kart 64 (USA)_1.cpk"
         );
+    }
+
+    #[test]
+    fn cloud_restore_prefers_mister_directory_casing_over_generic_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        let canonical = root.join("N64");
+        let generic = root.join("n64");
+        fs::create_dir_all(&canonical).unwrap();
+        fs::create_dir_all(&generic).unwrap();
+        fs::write(canonical.join("Mario Kart 64 (USA).eep"), vec![0x01; 2048]).unwrap();
+        fs::write(generic.join("Mario Kart 64 (USA).eep"), vec![0x02; 2048]).unwrap();
+
+        let save = cloud_save(
+            "Mario Kart 64 (USA).eep",
+            "Mario Kart 64",
+            "n64",
+            "n64/mister",
+            ".eep",
+        );
+        let target = cloud_target_path(
+            &save,
+            &[root],
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            "n64",
+            Some("eep"),
+        );
+
+        assert!(target.to_string_lossy().contains("/N64/"));
     }
 
     #[test]

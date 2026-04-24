@@ -66,9 +66,23 @@ jobs:
             sha256sum sgm-steamdeck-helper-x86_64-unknown-linux-gnu.tar.gz >> sha256.txt
           )
 
+      - name: Prepare release notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            index($0, "## [" version "]") == 1 { capture = 1; next }
+            /^## \[/ && capture { exit }
+            capture { print }
+          ' CHANGELOG.md | sed '/^[[:space:]]*$/{$d;}' > dist/release-notes.md
+          if [ ! -s dist/release-notes.md ]; then
+            printf 'Release %s\n' "$GITHUB_REF_NAME" > dist/release-notes.md
+          fi
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: dist/release-notes.md
           files: |
             dist/sgm-mister-helper-armv7.tar.gz
             dist/sgm-anbernic-helper-aarch64-unknown-linux-musl.tar.gz
