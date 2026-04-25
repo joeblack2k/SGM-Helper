@@ -193,7 +193,11 @@ Helpers do not blindly download every save from the backend. Each source has a `
 
 ### Backend-Managed Policy
 
-During `sync` and `watch`, helpers send a parsed config snapshot to the backend at `POST /helpers/config/sync`. If the backend returns policy, that policy wins for the current run, including manual `MANAGED="false"` sources.
+During `sync`, `watch`, and `service run`, helpers send a parsed config snapshot to the backend at `POST /helpers/config/sync`. If the backend returns policy, that policy is written back to `config.ini` and applied to the current run.
+
+Before backend writeback, the helper creates a timestamped backup next to the config file, for example `config.ini.backend.20260425123000`.
+
+Backend-created sources are stored as normal `[source.<id>]` sections. This means the backend UI can add a console/profile/path before any save exists locally, for example `Super Nintendo` + `Snes9x` + `/media/snes9x/saves`.
 
 See [`backend.md`](backend.md) for the full backend contract.
 

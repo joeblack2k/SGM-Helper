@@ -6,22 +6,23 @@ This document defines how SGM helpers share their `config.ini` state with the ba
 
 Helpers must not be the only place where sync policy is configured. The backend Devices UI should become the place where a user can review and change helper/source settings, especially which console systems are synced per helper.
 
-The helper sends a parsed, structured config snapshot. The backend returns an effective policy. The helper applies backend policy at runtime before scanning, uploading, downloading, or restoring saves.
+The helper sends a parsed, structured config snapshot. The backend returns an effective policy. The helper writes that policy back to `config.ini` and applies it at runtime before scanning, uploading, downloading, or restoring saves.
 
 Do not treat `config.ini` as raw text in the backend. Store structured fields.
 
 ## Implemented Helper Behavior
 
-As of helper `v0.4.13`:
+As of helper `v0.4.14`:
 
 - Helpers call `POST /helpers/config/sync` during `sync` and every `watch` sync cycle.
 - Helpers in `service run` mode also call `POST /helpers/config/sync` during startup, backend-triggered sync, and periodic reconcile cycles.
 - The request contains parsed global config, parsed source config, helper identity, and helper capabilities.
 - The helper does not send the raw app password. It sends `appPasswordConfigured: true|false`.
 - The endpoint is best-effort for backwards compatibility. If it is missing or fails, sync continues with local config.
-- If the backend returns policy, the helper applies it in memory for the current run.
-- Backend source policy applies even when the local source has `MANAGED=false`.
-- `MANAGED=false` means only: do not write backend changes back into the local `config.ini` file for that source.
+- If the backend returns policy, the helper writes it to `config.ini` and applies it in memory for the current run.
+- Before writeback, the helper creates a timestamped backup next to the config file, for example `config.ini.backend.20260425123000`.
+- Backend source policy applies and writes back even when the local source has `MANAGED=false`.
+- `MANAGED=false` means only: autoscan does not own that source. It no longer blocks backend writeback.
 
 For the always-on service/heartbeat contract, see [`service.md`](service.md). Service mode adds `POST /helpers/heartbeat`, backend online sensors, and push events over `GET /events`.
 
@@ -51,7 +52,7 @@ Example:
   "schemaVersion": 1,
   "helper": {
     "name": "sgm-mister-helper",
-    "version": "0.4.13",
+    "version": "0.4.14",
     "deviceType": "mister",
     "defaultKind": "mister-fpga",
     "hostname": "MiSTer",
@@ -102,7 +103,8 @@ Example:
     "policy": {
       "supportsSystemsAllowList": true,
       "supportsCreateMissingSystemDirs": true,
-      "manualManagedPolicy": "MANAGED=false prevents config-file writeback only; backend policy still applies at runtime."
+      "supportsConfigWriteback": true,
+      "manualManagedPolicy": "MANAGED indicates autoscan ownership only; backend policy can still write config.ini."
     },
     "service": {
       "supportsDaemonMode": true,
@@ -235,24 +237,32 @@ Example response:
 
 ## Response Global Policy
 
-Currently applied immediately by helpers during `sync`:
+Applied immediately by helpers during `sync` and written back to `config.ini` for subsequent runs:
 
 | Response field | Runtime effect |
 | --- | --- |
+| `url` | Writes `URL`; takes effect on the next helper invocation/control cycle. |
+| `port` | Writes `PORT`; takes effect on the next helper invocation/control cycle. |
+| `email` | Writes `EMAIL`. |
+| `root` | Writes `ROOT`. |
+| `stateDir` | Writes `STATE_DIR`. |
+| `watch` | Writes `WATCH`. |
+| `watchInterval` | Writes `WATCH_INTERVAL`. |
 | `forceUpload` | Overrides local `FORCE_UPLOAD` for the current sync run. |
 | `dryRun` | Overrides local `DRY_RUN` for the current sync run. |
+| `routePrefix` | Writes `ROUTE_PREFIX`. |
 
-Backend should still store all global fields so the Devices UI can manage them. Fields such as `URL`, `PORT`, `ROOT`, and `STATE_DIR` are safer as explicit write-back operations because changing them during an active request can disconnect the helper.
+The current HTTP client keeps using the already loaded base URL for the active request. Changes such as `URL`, `PORT`, `ROOT`, and `STATE_DIR` are persisted and become authoritative on the next run/reload.
 
 ## Response Source Policy
 
-Currently applied immediately by helpers during `sync`:
+Applied immediately by helpers during `sync` and written back to `config.ini`:
 
 | Response field | Runtime effect |
 | --- | --- |
 | `id` / `sourceId` | Preferred source match key. |
 | `name` / `label` | Fallback source match key. |
-| `enabled=false` | Clears `systems`, causing the source to scan no systems. |
+| `enabled=false` | Clears `systems` and persists as `SYSTEMS="none"`. |
 | `kind` | Overrides runtime source kind. |
 | `profile` | Overrides runtime emulator profile/conversion target. |
 | `savePath` / `savePaths` | Overrides runtime save roots. |
@@ -260,19 +270,23 @@ Currently applied immediately by helpers during `sync`:
 | `recursive` | Overrides runtime recursive scan flag. |
 | `systems` | Overrides runtime console allow-list. |
 | `createMissingSystemDirs` | Overrides runtime cloud-restore folder creation policy. |
+| `managed` | Writes `MANAGED`; use mostly for autoscan ownership metadata. |
+| `origin` | Writes `ORIGIN`; recommended value for UI-created sources is `backend-ui`. |
 
-Important: this runtime policy is applied for every source, including `MANAGED=false` sources.
+Important: this policy is applied and written for every source, including `MANAGED=false` sources.
+
+If the backend returns a source that does not exist locally, and it includes at least an `id`/`label` and `savePath`/`savePaths`, the helper creates a new `[source.<id>]` section. This supports backend UI flows like "Add console -> Super Nintendo -> Snes9x -> `/media/snes9x/saves`" before any save exists locally.
 
 ## MANAGED Semantics
 
-`MANAGED` is local write-back metadata only.
+`MANAGED` is autoscan ownership metadata only.
 
 - `MANAGED=true`: helper/autoscan owns the source section and it may be refreshed by scan operations.
-- `MANAGED=false`: user manually owns the local source section.
-- Backend policy must still apply at runtime to both values.
-- Backend UI may edit policy for manual sources, but helper must not silently rewrite those manual source sections unless a future explicit write-back contract says so.
+- `MANAGED=false`: autoscan will not replace it during `--scan`; this is appropriate for backend/UI/manual sources.
+- Backend policy applies to both values.
+- Backend policy writes back to both values.
 
-This lets a power user keep local paths hand-edited while still allowing backend UI to disable Wii on MiSTer, enable PSX on Steam Deck, or change conversion profile for N64.
+This lets autoscan refresh detected sources while still allowing the backend UI to disable Wii on MiSTer, enable PSX on Steam Deck, add an empty Snes9x source, or change conversion profile for N64.
 
 ## Backend Storage Recommendation
 
@@ -301,7 +315,7 @@ Devices UI should show:
 - console toggles from `systems`
 - warning when a selected console is not in the helper capability matrix
 - `CREATE_MISSING_SYSTEM_DIRS` as an advanced toggle
-- `MANAGED=false` badge: “manual local config; backend policy applies, local file is not rewritten”
+- `MANAGED=false` badge: “not autoscan-managed; backend policy may write this config”
 
 ## Safety Rules
 

@@ -2,7 +2,7 @@
 
 This document is the backend handoff for helper service/daemon mode.
 
-Service mode is implemented in helper version `0.4.13` for:
+Service mode is implemented in helper version `0.4.14` for:
 
 - MiSTer helper
 - Steam Deck helper
@@ -19,7 +19,7 @@ The goal is to move from "run a sync command every X minutes" to an always-on he
 
 ## Current Implementation State
 
-Implemented in helper `0.4.13`:
+Implemented in helper `0.4.14`:
 
 - New CLI command group: `service run|install|status|uninstall`.
 - New daemon loop: `service run`.
@@ -31,13 +31,12 @@ Implemented in helper `0.4.13`:
 - Heartbeat is best-effort: if the backend does not support it yet, the helper keeps syncing.
 - Existing config policy sync remains active through `POST /helpers/config/sync`.
 - Backend policy still wins at runtime during sync cycles.
-- Local `config.ini` is not silently rewritten by backend policy in this phase.
+- Backend policy is written back to local `config.ini` with a timestamped backup.
 
 Not implemented yet:
 
 - Native Windows tray icon.
 - Full Windows Service API integration.
-- Backend-to-helper local `config.ini` writeback.
 - WebSocket transport.
 
 The implemented path intentionally uses HTTP + SSE first because it fits the current backend shape and works well on MiSTer, Steam Deck, KNULLI/Batocera, and Windows.
@@ -201,7 +200,7 @@ Example:
   "schemaVersion": 1,
   "helper": {
     "name": "sgm-mister-helper",
-    "version": "0.4.13",
+    "version": "0.4.14",
     "deviceType": "mister",
     "defaultKind": "mister-fpga",
     "hostname": "MiSTer",
@@ -438,40 +437,35 @@ Supported `action` values:
 
 ## Config Management Flow
 
-The current safe flow is runtime policy, not raw file writeback.
+The current safe flow is backend policy plus local `config.ini` writeback.
 
 1. Helper sends full structured config in `POST /helpers/config/sync`.
 2. Backend stores editable helper/source model.
 3. Backend returns policy in the config-sync response.
-4. Helper applies policy in memory for that sync run.
-5. In service mode, backend emits `config.changed`.
-6. Helper receives the event and runs sync immediately.
-7. That sync calls `POST /helpers/config/sync` again and receives the latest policy.
+4. Helper creates a backup next to the local config, for example `config.ini.backend.20260425123000`.
+5. Helper writes backend policy to `config.ini`.
+6. Helper applies the same policy in memory for that sync run.
+7. In service mode, backend emits `config.changed`.
+8. Helper receives the event and runs sync immediately.
+9. That sync calls `POST /helpers/config/sync` again and receives/writes the latest policy.
 
-This means backend changes become active without waiting for the next 30-minute reconcile.
+This means backend changes become active without waiting for the next 30-minute reconcile and also survive helper restarts.
 
-### Why No Silent `config.ini` Writeback Yet
+Backend-created sources are valid even before saves exist locally. For example, the backend can create:
 
-We deliberately do not silently rewrite local `config.ini` from backend policy in `0.4.13`.
+- `LABEL="Super Nintendo Snes9x"`
+- `KIND="retroarch"`
+- `PROFILE="snes9x"`
+- `SAVE_PATH="/media/snes9x/saves"`
+- `ROM_PATH="/media/snes9x/roms"`
+- `SYSTEMS="snes"`
 
-Reason:
+The helper will persist that as a `[source.<id>]` block and include it in future sync runs.
 
-- `config.ini` is also a local escape hatch.
-- Users may hand-edit it while debugging devices over SSH.
-- Backend policy must win at runtime, but local writeback should be explicit and auditable.
-- `MANAGED=false` already means "do not silently write backend changes back to local config.ini".
+`MANAGED` now means autoscan ownership only:
 
-Recommended next backend/helper contract for true writeback:
-
-- Backend stores a config revision number.
-- Backend sends desired config with `revision`.
-- Helper validates the desired config.
-- Helper writes a backup: `config.ini.backup.<timestamp>`.
-- Helper writes the new config atomically.
-- Helper heartbeat reports `configHash` and `configRevision`.
-- Backend only considers the write applied after matching heartbeat.
-
-This is a separate phase because it needs rollback behavior.
+- `MANAGED=true`: scan may refresh/replace the source.
+- `MANAGED=false`: scan will not replace it, but backend policy can still write it.
 
 ## Existing Config Sync Endpoint
 

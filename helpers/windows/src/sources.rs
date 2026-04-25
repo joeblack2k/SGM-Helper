@@ -1363,10 +1363,12 @@ fn render_config_with_sources(base: &str, sources: &[Source]) -> String {
             escape_ini(&source.rom_path().to_string_lossy())
         ));
         lines.push(format!("RECURSIVE=\"{}\"", source.recursive));
-        lines.push(format!(
-            "SYSTEMS=\"{}\"",
-            escape_ini(&source.systems.join(","))
-        ));
+        let rendered_systems = if source.systems.is_empty() {
+            "none".to_string()
+        } else {
+            source.systems.join(",")
+        };
+        lines.push(format!("SYSTEMS=\"{}\"", escape_ini(&rendered_systems)));
         lines.push(format!(
             "CREATE_MISSING_SYSTEM_DIRS=\"{}\"",
             source.create_missing_system_dirs

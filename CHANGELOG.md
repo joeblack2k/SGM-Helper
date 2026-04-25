@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.14] - 2026-04-25
+
+### Changed
+
+- Backend config policy now writes back to local `config.ini` instead of being runtime-only.
+- Helpers create a timestamped `config.ini.backend.<timestamp>` backup before backend writeback.
+- Backend-added sources are persisted as `[source.<id>]` sections, allowing the backend UI to add consoles/emulator profiles before any save exists locally.
+- `MANAGED` now only describes autoscan ownership; it no longer blocks backend writeback.
+- Disabled backend sources are persisted with `SYSTEMS="none"` so they stay disabled after helper restart.
+
+### Tests
+
+- Added config-writeback coverage for backend-created sources, global key updates, backups, and disabled-source persistence.
+
 ## [0.4.13] - 2026-04-25
 
 ### Added
