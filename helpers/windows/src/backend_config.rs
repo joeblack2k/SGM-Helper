@@ -142,7 +142,7 @@ impl BackendSourcePolicy {
     fn id_value(&self) -> Option<&str> {
         self.id
             .as_deref()
-            .or_else(|| self.source_id.as_deref())
+            .or(self.source_id.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
     }
@@ -150,7 +150,7 @@ impl BackendSourcePolicy {
     fn name_value(&self) -> Option<&str> {
         self.name
             .as_deref()
-            .or_else(|| self.label.as_deref())
+            .or(self.label.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
     }
