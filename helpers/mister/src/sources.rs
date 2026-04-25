@@ -23,6 +23,47 @@ pub enum SourceKind {
     SteamDeck,
 }
 
+const ALL_SYNC_SYSTEMS: &[&str] = &[
+    "nes",
+    "snes",
+    "gameboy",
+    "gba",
+    "n64",
+    "nds",
+    "genesis",
+    "master-system",
+    "game-gear",
+    "sega-cd",
+    "sega-32x",
+    "saturn",
+    "dreamcast",
+    "neogeo",
+    "wii",
+    "psx",
+    "ps2",
+    "psp",
+    "psvita",
+    "ps3",
+    "ps4",
+    "ps5",
+];
+
+const MISTER_SYNC_SYSTEMS: &[&str] = &[
+    "nes",
+    "snes",
+    "gameboy",
+    "gba",
+    "n64",
+    "genesis",
+    "master-system",
+    "game-gear",
+    "sega-cd",
+    "sega-32x",
+    "saturn",
+    "neogeo",
+    "psx",
+];
+
 impl SourceKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -112,6 +153,89 @@ pub fn default_profile_for_kind(kind: &SourceKind) -> EmulatorProfile {
     }
 }
 
+pub fn default_systems_for_kind(kind: &SourceKind) -> Vec<String> {
+    match kind {
+        SourceKind::MisterFpga => system_list_from(MISTER_SYNC_SYSTEMS),
+        _ => system_list_from(ALL_SYNC_SYSTEMS),
+    }
+}
+
+fn system_list_from(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn parse_systems(value: Option<&String>, kind: &SourceKind) -> Vec<String> {
+    let Some(raw) = value.map(|value| value.trim()) else {
+        return default_systems_for_kind(kind);
+    };
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        return default_systems_for_kind(kind);
+    }
+    if matches!(
+        raw.to_ascii_lowercase().as_str(),
+        "none" | "disabled" | "off"
+    ) {
+        return Vec::new();
+    }
+    if matches!(raw, "*" | "all") || raw.eq_ignore_ascii_case("all") {
+        return system_list_from(ALL_SYNC_SYSTEMS);
+    }
+
+    let mut out = BTreeSet::new();
+    for token in raw.split([',', ';', '|', '\n']) {
+        if let Some(slug) = normalize_system_slug(token) {
+            out.insert(slug);
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn normalize_system_slug(value: &str) -> Option<String> {
+    let token = value
+        .trim()
+        .trim_matches('"')
+        .replace(['_', '.'], "-")
+        .to_ascii_lowercase();
+    let compact = token
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    let slug = match compact.as_str() {
+        "nes" | "famicom" | "nintendoentertainmentsystem" => "nes",
+        "snes" | "sfc" | "supernintendo" | "superfamicom" => "snes",
+        "gb" | "gbc" | "gameboy" | "gameboycolor" => "gameboy",
+        "gba" | "gameboyadvance" => "gba",
+        "n64" | "nintendo64" => "n64",
+        "nds" | "nintendods" | "ds" => "nds",
+        "genesis" | "megadrive" | "md" => "genesis",
+        "mastersystem" | "sms" => "master-system",
+        "gamegear" | "gg" => "game-gear",
+        "segacd" | "megacd" | "megadrivecd" => "sega-cd",
+        "sega32x" | "32x" | "megadrive32x" => "sega-32x",
+        "saturn" | "segasaturn" => "saturn",
+        "dreamcast" | "dc" => "dreamcast",
+        "neogeo" | "mvs" | "aes" => "neogeo",
+        "wii" | "nintendowii" | "dolphin" => "wii",
+        "psx" | "ps1" | "playstation" | "playstation1" => "psx",
+        "ps2" | "playstation2" => "ps2",
+        "psp" | "playstationportable" => "psp",
+        "psvita" | "vita" | "playstationvita" => "psvita",
+        "ps3" | "playstation3" => "ps3",
+        "ps4" | "playstation4" => "ps4",
+        "ps5" | "playstation5" => "ps5",
+        _ => {
+            let candidate = token.split_whitespace().collect::<Vec<_>>().join("-");
+            if ALL_SYNC_SYSTEMS.contains(&candidate.as_str())
+                || MISTER_SYNC_SYSTEMS.contains(&candidate.as_str())
+            {
+                return Some(candidate);
+            }
+            return None;
+        }
+    };
+    Some(slug.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Source {
     pub id: String,
@@ -121,6 +245,8 @@ pub struct Source {
     pub save_roots: Vec<PathBuf>,
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
+    pub systems: Vec<String>,
+    pub create_missing_system_dirs: bool,
     pub managed: bool,
     pub origin: String,
     pub created_at: String,
@@ -134,6 +260,8 @@ pub struct ResolvedSource {
     pub save_roots: Vec<PathBuf>,
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
+    pub systems: Vec<String>,
+    pub create_missing_system_dirs: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -160,6 +288,7 @@ pub struct ScanCandidate {
     pub recursive: bool,
     pub managed: bool,
     pub origin: String,
+    pub create_missing_system_dirs: bool,
     pub detected_saves: usize,
     pub systems: Vec<String>,
     pub confidence: f32,
@@ -182,7 +311,6 @@ struct CandidatePath {
 struct EvaluatedCandidate {
     source: Source,
     detected_saves: usize,
-    systems: Vec<String>,
     confidence: f32,
     evidence: String,
 }
@@ -218,6 +346,7 @@ impl Source {
     ) -> Self {
         let id = normalize_source_id(&name);
         let profile = default_profile_for_kind(&kind);
+        let systems = default_systems_for_kind(&kind);
         Self {
             id,
             name,
@@ -226,6 +355,8 @@ impl Source {
             save_roots,
             rom_roots,
             recursive,
+            systems,
+            create_missing_system_dirs: false,
             managed: false,
             origin: "manual".to_string(),
             created_at: now_rfc3339(),
@@ -242,6 +373,7 @@ impl Source {
         recursive: bool,
         origin: String,
     ) -> Self {
+        let systems = default_systems_for_kind(&kind);
         Self {
             id,
             name: label,
@@ -250,10 +382,17 @@ impl Source {
             save_roots: vec![save_path],
             rom_roots: vec![rom_path],
             recursive,
+            systems,
+            create_missing_system_dirs: false,
             managed: true,
             origin,
             created_at: now_rfc3339(),
         }
+    }
+
+    fn with_systems(mut self, systems: Vec<String>) -> Self {
+        self.systems = systems;
+        self
     }
 
     pub fn resolve(&self, binary_dir: &Path) -> ResolvedSource {
@@ -272,6 +411,8 @@ impl Source {
                 .map(|path| resolve_path(binary_dir, path))
                 .collect(),
             recursive: self.recursive,
+            systems: self.systems.clone(),
+            create_missing_system_dirs: self.create_missing_system_dirs,
         }
     }
 
@@ -377,6 +518,7 @@ pub fn migrate_legacy_sources_if_needed(config: &AppConfig, verbose: bool) -> Re
             .unwrap_or_else(|| save_path.clone());
         let kind = item.kind.clone();
         let profile = default_profile_for_kind(&kind);
+        let systems = default_systems_for_kind(&kind);
 
         migrated.sources.push(Source {
             id,
@@ -386,6 +528,8 @@ pub fn migrate_legacy_sources_if_needed(config: &AppConfig, verbose: bool) -> Re
             save_roots: vec![save_path],
             rom_roots: vec![rom_path],
             recursive: item.recursive,
+            systems,
+            create_missing_system_dirs: false,
             managed: false,
             origin: "legacy-migrated".to_string(),
             created_at: item.created_at.unwrap_or_else(now_rfc3339),
@@ -756,6 +900,15 @@ fn evaluate_candidates(candidates: Vec<CandidatePath>) -> Vec<EvaluatedCandidate
             id = format!("source_{}", out.len() + 1);
         }
 
+        let allowed_systems = default_systems_for_kind(&candidate.kind);
+        let systems: Vec<String> = systems
+            .into_iter()
+            .filter(|system| allowed_systems.contains(system))
+            .collect();
+        if systems.is_empty() {
+            continue;
+        }
+
         out.push(EvaluatedCandidate {
             source: Source::managed(
                 id,
@@ -766,9 +919,9 @@ fn evaluate_candidates(candidates: Vec<CandidatePath>) -> Vec<EvaluatedCandidate
                 candidate.rom_path.clone(),
                 candidate.recursive,
                 candidate.origin.clone(),
-            ),
+            )
+            .with_systems(systems.clone()),
             detected_saves: valid,
-            systems: systems.into_iter().collect(),
             confidence,
             evidence: format!(
                 "{} valid save(s) gevonden in {}",
@@ -842,6 +995,7 @@ fn deep_scan_candidates(config: &AppConfig) -> Result<Vec<EvaluatedCandidate>> {
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("Deep Scan {}", index + 1));
 
+        let systems: Vec<String> = systems.into_iter().collect();
         candidates.push(EvaluatedCandidate {
             source: Source::managed(
                 id,
@@ -852,9 +1006,9 @@ fn deep_scan_candidates(config: &AppConfig) -> Result<Vec<EvaluatedCandidate>> {
                 dir.clone(),
                 true,
                 "deep-scan".to_string(),
-            ),
+            )
+            .with_systems(systems.clone()),
             detected_saves: count,
-            systems: systems.into_iter().collect(),
             confidence: ((count as f32) / 30.0).min(1.0),
             evidence: format!("{} valid save(s) in {}", count, dir.display()),
         });
@@ -947,8 +1101,9 @@ fn write_scan_report(
                 recursive: value.source.recursive,
                 managed: value.source.managed,
                 origin: value.source.origin.clone(),
+                create_missing_system_dirs: value.source.create_missing_system_dirs,
                 detected_saves: value.detected_saves,
-                systems: value.systems.clone(),
+                systems: value.source.systems.clone(),
                 confidence: value.confidence,
                 evidence: value.evidence.clone(),
             })
@@ -1029,6 +1184,12 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         .get("MANAGED")
         .and_then(|value| parse_bool(value).ok())
         .unwrap_or(false);
+    let systems = parse_systems(section.values.get("SYSTEMS"), &kind);
+    let create_missing_system_dirs = section
+        .values
+        .get("CREATE_MISSING_SYSTEM_DIRS")
+        .and_then(|value| parse_bool(value).ok())
+        .unwrap_or(false);
 
     let origin = section.values.get("ORIGIN").cloned().unwrap_or_else(|| {
         if managed {
@@ -1046,6 +1207,8 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         save_roots: vec![save_path],
         rom_roots: vec![rom_path],
         recursive,
+        systems,
+        create_missing_system_dirs,
         managed,
         origin,
         created_at: now_rfc3339(),
@@ -1159,6 +1322,14 @@ fn render_config_with_sources(base: &str, sources: &[Source]) -> String {
             escape_ini(&source.rom_path().to_string_lossy())
         ));
         lines.push(format!("RECURSIVE=\"{}\"", source.recursive));
+        lines.push(format!(
+            "SYSTEMS=\"{}\"",
+            escape_ini(&source.systems.join(","))
+        ));
+        lines.push(format!(
+            "CREATE_MISSING_SYSTEM_DIRS=\"{}\"",
+            source.create_missing_system_dirs
+        ));
         lines.push(format!("MANAGED=\"{}\"", source.managed));
         lines.push(format!("ORIGIN=\"{}\"", escape_ini(&source.origin)));
     }
@@ -1244,6 +1415,19 @@ mod tests {
     }
 
     #[test]
+    fn default_mister_systems_exclude_non_mister_consoles() {
+        let systems = default_systems_for_kind(&SourceKind::MisterFpga);
+        assert!(systems.contains(&"snes".to_string()));
+        assert!(systems.contains(&"saturn".to_string()));
+        assert!(systems.contains(&"psx".to_string()));
+        assert!(!systems.contains(&"wii".to_string()));
+        assert!(!systems.contains(&"ps2".to_string()));
+
+        let deck_systems = default_systems_for_kind(&SourceKind::SteamDeck);
+        assert!(deck_systems.contains(&"wii".to_string()));
+    }
+
+    #[test]
     fn default_mister_source_uses_media_fat_layout() {
         let cfg = AppConfig {
             url: "127.0.0.1".to_string(),
@@ -1278,6 +1462,8 @@ PROFILE="snes9x"
 SAVE_PATH="/home/snes9x/save"
 ROM_PATH="/home/roms/snes"
 RECURSIVE="true"
+SYSTEMS="Super Nintendo, n64, Wii"
+CREATE_MISSING_SYSTEM_DIRS="true"
 MANAGED="false"
 ORIGIN="manual"
 "#;
@@ -1290,6 +1476,10 @@ ORIGIN="manual"
         assert_eq!(source.kind, SourceKind::RetroArch);
         assert_eq!(source.profile, EmulatorProfile::Snes9x);
         assert_eq!(source.save_path().to_string_lossy(), "/home/snes9x/save");
+        assert!(source.systems.contains(&"snes".to_string()));
+        assert!(source.systems.contains(&"n64".to_string()));
+        assert!(source.systems.contains(&"wii".to_string()));
+        assert!(source.create_missing_system_dirs);
         assert!(!source.managed);
     }
 
@@ -1305,6 +1495,9 @@ SAVE_PATH="/media/fat/saves"
         let sections = parse_source_sections(content).unwrap();
         let source = source_from_section(&sections[0]).unwrap();
         assert_eq!(source.profile, EmulatorProfile::Mister);
+        assert!(source.systems.contains(&"psx".to_string()));
+        assert!(!source.systems.contains(&"wii".to_string()));
+        assert!(!source.create_missing_system_dirs);
     }
 
     #[test]
@@ -1339,6 +1532,8 @@ HELLO="world"
             )],
         );
         assert!(rendered.contains("[source.new_source]"));
+        assert!(rendered.contains("SYSTEMS=\""));
+        assert!(rendered.contains("CREATE_MISSING_SYSTEM_DIRS=\"false\""));
         assert!(rendered.contains("[other.section]"));
     }
 

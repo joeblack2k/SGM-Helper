@@ -161,6 +161,8 @@ PROFILE="snes9x"
 SAVE_PATH="/home/deck/Emulation/saves/snes"
 ROM_PATH="/home/deck/Emulation/roms/snes"
 RECURSIVE="true"
+SYSTEMS="snes"
+CREATE_MISSING_SYSTEM_DIRS="false"
 MANAGED="false"
 ORIGIN="manual"
 ```
@@ -173,8 +175,19 @@ Each key:
 - `SAVE_PATH`: save folder path.
 - `ROM_PATH`: ROM folder path (optional, recommended).
 - `RECURSIVE`: include subfolders.
+- `SYSTEMS`: comma-separated console allow-list for this source, for example `snes,n64,psx`.
+- `CREATE_MISSING_SYSTEM_DIRS`: if `false`, cloud restore only writes into existing system folders.
 - `MANAGED`: `true` if helper manages this source during scans.
 - `ORIGIN`: metadata (`manual`, `scan`, `deep-scan`, `first-run`).
+
+### Console Sync Policy
+
+Helpers do not blindly download every save from the backend. Each source has a `SYSTEMS` allow-list.
+
+- MiSTer defaults to FPGA-supported systems only: `nes,snes,gameboy,gba,n64,genesis,master-system,game-gear,sega-cd,sega-32x,saturn,neogeo,psx`.
+- Steam Deck and Windows default to the broad helper list, including Wii and Sony systems where local emulator folders exist.
+- `CREATE_MISSING_SYSTEM_DIRS="false"` prevents accidental folder creation, for example a MiSTer helper will not create `/media/fat/saves/Wii`.
+- To opt in manually, add the console slug to `SYSTEMS` and create the target system folder yourself, or set `CREATE_MISSING_SYSTEM_DIRS="true"`.
 
 ## CLI Commands
 

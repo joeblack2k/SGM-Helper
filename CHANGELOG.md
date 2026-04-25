@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-04-25
+
+### Added
+
+- Source-level console allow-lists via `SYSTEMS="..."` in `config.ini`.
+- `CREATE_MISSING_SYSTEM_DIRS` config support to prevent helpers from creating unsupported console folders during cloud restore.
+
+### Changed
+
+- MiSTer defaults now exclude non-MiSTer systems such as Wii and PS2, so backend-only saves for those systems are skipped unless explicitly enabled.
+- First-run autoscan and deep-scan now write detected console lists into source sections, keeping future sync runs scoped to the saved source policy.
+
+### Tests
+
+- Added config parsing/rendering tests for source system policies.
+- Added sync policy tests for disabled systems and missing target system folders.
+
 ## [0.4.10] - 2026-04-25
 
 ### Fixed

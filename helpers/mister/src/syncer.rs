@@ -162,6 +162,7 @@ pub fn run_sync(
                 &source.name,
                 &source.kind,
                 &source.profile,
+                &source.systems,
                 &rom_index,
                 &mut rom_hash_cache,
                 app_password,
@@ -224,6 +225,9 @@ pub fn run_sync(
                 &source.name,
                 &source.kind,
                 &source.profile,
+                &source.save_roots,
+                &source.systems,
+                source.create_missing_system_dirs,
                 app_password,
                 options,
                 &mut report,
@@ -256,6 +260,8 @@ pub fn run_sync(
             &source.kind,
             &source.profile,
             &source.save_roots,
+            &source.systems,
+            source.create_missing_system_dirs,
             &fingerprint,
             app_password,
             options,
@@ -276,6 +282,46 @@ fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
+fn source_allows_system(source_systems: &[String], system_slug: &str) -> bool {
+    let clean = system_slug.trim().to_ascii_lowercase();
+    if clean.is_empty() {
+        return false;
+    }
+    source_systems
+        .iter()
+        .any(|system| system == "*" || system.eq_ignore_ascii_case(&clean))
+}
+
+fn target_parent_allowed(
+    target_path: &Path,
+    save_roots: &[PathBuf],
+    create_missing_system_dirs: bool,
+) -> bool {
+    if create_missing_system_dirs {
+        return true;
+    }
+    if target_path.parent().map(Path::exists).unwrap_or(false) {
+        return true;
+    }
+
+    save_roots.iter().any(|root| {
+        if !root.exists() {
+            return false;
+        }
+        let Ok(relative) = target_path.strip_prefix(root) else {
+            return false;
+        };
+        let mut components = relative.components();
+        let Some(first) = components.next() else {
+            return true;
+        };
+        if components.next().is_none() {
+            return true;
+        }
+        root.join(first.as_os_str()).is_dir()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn restore_cloud_only_saves(
     api: &ApiClient,
@@ -283,6 +329,8 @@ fn restore_cloud_only_saves(
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
+    source_systems: &[String],
+    create_missing_system_dirs: bool,
     fingerprint: &str,
     app_password: Option<&str>,
     options: &SyncOptions,
@@ -332,6 +380,8 @@ fn restore_cloud_only_saves(
                 source_kind,
                 source_profile,
                 save_roots,
+                source_systems,
+                create_missing_system_dirs,
                 fingerprint,
                 app_password,
                 options,
@@ -372,6 +422,8 @@ fn restore_single_cloud_save(
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
+    source_systems: &[String],
+    create_missing_system_dirs: bool,
     fingerprint: &str,
     app_password: Option<&str>,
     options: &SyncOptions,
@@ -390,6 +442,18 @@ fn restore_single_cloud_save(
 
     if !supports_cloud_restore_system(&system_slug) {
         report.skipped += 1;
+        return Ok(());
+    }
+    if !source_allows_system(source_systems, &system_slug) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud {} save '{}': system is disabled for source '{}'",
+                system_slug,
+                cloud_save.display_name(),
+                source_name
+            );
+        }
         return Ok(());
     }
 
@@ -412,6 +476,18 @@ fn restore_single_cloud_save(
     );
 
     if existing_local_save_is_valid(&provisional_path, &system_slug) {
+        return Ok(());
+    }
+    if !target_parent_allowed(&provisional_path, save_roots, create_missing_system_dirs) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud {} save '{}': target system folder is not present for source '{}'",
+                system_slug,
+                cloud_save.display_name(),
+                source_name
+            );
+        }
         return Ok(());
     }
 
@@ -445,6 +521,18 @@ fn restore_single_cloud_save(
     );
 
     if existing_local_save_is_valid(&target_path, &system_slug) {
+        return Ok(());
+    }
+    if !target_parent_allowed(&target_path, save_roots, create_missing_system_dirs) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud {} save '{}': final target folder is not present for source '{}'",
+                system_slug,
+                cloud_save.display_name(),
+                source_name
+            );
+        }
         return Ok(());
     }
 
@@ -978,6 +1066,7 @@ fn process_single_save(
     source_name: &str,
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
+    source_systems: &[String],
     rom_index: &HashMap<String, RomIndexEntry>,
     rom_hash_cache: &mut HashMap<String, (String, String)>,
     app_password: Option<&str>,
@@ -1017,6 +1106,18 @@ fn process_single_save(
     };
     let system_slug = classification.system_slug;
     let classification_evidence = classification.evidence;
+    if !source_allows_system(source_systems, &system_slug) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping {}: system {} is disabled for source '{}'",
+                save_path.display(),
+                system_slug,
+                source_name
+            );
+        }
+        return Ok(None);
+    }
     let normalized_save = match normalize_save_for_sync(save_path, &system_slug)? {
         Some(value) => value,
         None => {
@@ -1451,6 +1552,9 @@ fn process_missing_save(
     source_name: &str,
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
+    save_roots: &[PathBuf],
+    source_systems: &[String],
+    create_missing_system_dirs: bool,
     app_password: Option<&str>,
     options: &SyncOptions,
     report: &mut SyncReport,
@@ -1467,24 +1571,48 @@ fn process_missing_save(
         return Ok(None);
     };
 
-    let system_slug = existing_entry.system_slug.as_deref();
-    let effective_slot_name = existing_entry.slot_name.clone().unwrap_or_else(|| {
-        resolve_slot_name_for_sync(system_slug.unwrap_or(""), save_path, &options.slot_name)
-    });
-    let effective_profile = effective_profile_for_save(
-        source_kind,
-        source_profile,
-        system_slug.unwrap_or(""),
-        save_path,
-    );
-    let device_type =
-        helper_device_type_for_upload(source_kind, &effective_profile, system_slug.unwrap_or(""));
-    let runtime_target = runtime_target_for_system(
-        source_kind,
-        &effective_profile,
-        system_slug.unwrap_or(""),
-        device_type,
-    );
+    let Some(system_slug) = existing_entry.system_slug.as_deref() else {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping missing save restore for {}: no system slug in state",
+                save_path.display()
+            );
+        }
+        return Ok(None);
+    };
+    if !source_allows_system(source_systems, system_slug) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping missing {} save restore for {}: system is disabled for source '{}'",
+                system_slug,
+                save_path.display(),
+                source_name
+            );
+        }
+        return Ok(None);
+    }
+    if !target_parent_allowed(save_path, save_roots, create_missing_system_dirs) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping missing {} save restore for {}: target system folder is not present",
+                system_slug,
+                save_path.display()
+            );
+        }
+        return Ok(None);
+    }
+    let effective_slot_name = existing_entry
+        .slot_name
+        .clone()
+        .unwrap_or_else(|| resolve_slot_name_for_sync(system_slug, save_path, &options.slot_name));
+    let effective_profile =
+        effective_profile_for_save(source_kind, source_profile, system_slug, save_path);
+    let device_type = helper_device_type_for_upload(source_kind, &effective_profile, system_slug);
+    let runtime_target =
+        runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type);
 
     let latest = match api.latest_save(
         rom_sha1,
@@ -1541,7 +1669,7 @@ fn process_missing_save(
                 existing_entry.sha256.clone(),
                 Some(rom_sha1.to_string()),
                 latest.version,
-                system_slug,
+                Some(system_slug),
                 Some(local_container),
                 Some(adapter_profile),
                 Some(source_kind),
@@ -1585,7 +1713,7 @@ fn process_missing_save(
             sha256_bytes(&canonical_bytes),
             Some(rom_sha1.to_string()),
             latest.version,
-            system_slug,
+            Some(system_slug),
             Some(local_container),
             Some(adapter_profile),
             Some(source_kind),
@@ -2415,6 +2543,41 @@ fn synced_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_system_policy_allows_only_configured_slugs() {
+        let systems = vec!["snes".to_string(), "n64".to_string()];
+        assert!(source_allows_system(&systems, "snes"));
+        assert!(source_allows_system(&systems, "N64"));
+        assert!(!source_allows_system(&systems, "wii"));
+        assert!(!source_allows_system(&[], "snes"));
+    }
+
+    #[test]
+    fn target_parent_policy_blocks_missing_system_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        fs::create_dir_all(root.join("SNES")).unwrap();
+
+        let existing_system_target = root.join("SNES/Super Mario Kart.sav");
+        assert!(target_parent_allowed(
+            &existing_system_target,
+            std::slice::from_ref(&root),
+            false
+        ));
+
+        let missing_system_target = root.join("Wii/SB4P/data.bin");
+        assert!(!target_parent_allowed(
+            &missing_system_target,
+            std::slice::from_ref(&root),
+            false
+        ));
+        assert!(target_parent_allowed(
+            &missing_system_target,
+            std::slice::from_ref(&root),
+            true
+        ));
+    }
 
     fn cloud_save(
         filename: &str,
