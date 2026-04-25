@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::api::ApiClient;
@@ -43,22 +44,38 @@ struct BackendPolicy {
 #[serde(default)]
 struct BackendGlobalPolicy {
     pub url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u16")]
     pub port: Option<u16>,
     pub email: Option<String>,
     #[serde(rename = "root", alias = "ROOT")]
     pub root: Option<PathBuf>,
     #[serde(rename = "stateDir", alias = "state_dir", alias = "STATE_DIR")]
     pub state_dir: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
     pub watch: Option<bool>,
     #[serde(
         rename = "watchInterval",
         alias = "watch_interval",
-        alias = "WATCH_INTERVAL"
+        alias = "WATCH_INTERVAL",
+        default,
+        deserialize_with = "deserialize_optional_u64"
     )]
     pub watch_interval: Option<u64>,
-    #[serde(rename = "forceUpload", alias = "force_upload", alias = "FORCE_UPLOAD")]
+    #[serde(
+        rename = "forceUpload",
+        alias = "force_upload",
+        alias = "FORCE_UPLOAD",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     pub force_upload: Option<bool>,
-    #[serde(rename = "dryRun", alias = "dry_run", alias = "DRY_RUN")]
+    #[serde(
+        rename = "dryRun",
+        alias = "dry_run",
+        alias = "DRY_RUN",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
     pub dry_run: Option<bool>,
     #[serde(rename = "routePrefix", alias = "route_prefix", alias = "ROUTE_PREFIX")]
     pub route_prefix: Option<String>,
@@ -67,31 +84,68 @@ struct BackendGlobalPolicy {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 struct BackendSourcePolicy {
-    #[serde(alias = "sourceId", alias = "source_id")]
     pub id: Option<String>,
-    #[serde(alias = "label", alias = "name")]
+    #[serde(rename = "sourceId", alias = "source_id")]
+    pub source_id: Option<String>,
     pub name: Option<String>,
+    pub label: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
     pub enabled: Option<bool>,
     pub kind: Option<String>,
     pub profile: Option<String>,
-    #[serde(alias = "savePaths", alias = "save_roots", alias = "SAVE_PATH")]
+    #[serde(
+        alias = "savePaths",
+        alias = "save_roots",
+        alias = "SAVE_PATH",
+        default,
+        deserialize_with = "deserialize_path_vec"
+    )]
     pub save_roots: Vec<PathBuf>,
-    #[serde(alias = "savePath")]
+    #[serde(alias = "savePath", default, deserialize_with = "deserialize_optional_path")]
     pub save_path: Option<PathBuf>,
-    #[serde(alias = "romPaths", alias = "rom_roots", alias = "ROM_PATH")]
+    #[serde(
+        alias = "romPaths",
+        alias = "rom_roots",
+        alias = "ROM_PATH",
+        default,
+        deserialize_with = "deserialize_path_vec"
+    )]
     pub rom_roots: Vec<PathBuf>,
-    #[serde(alias = "romPath")]
+    #[serde(alias = "romPath", default, deserialize_with = "deserialize_optional_path")]
     pub rom_path: Option<PathBuf>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
     pub recursive: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_string_list")]
     pub systems: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
     pub managed: Option<bool>,
     pub origin: Option<String>,
     #[serde(
         rename = "createMissingSystemDirs",
         alias = "create_missing_system_dirs",
-        alias = "CREATE_MISSING_SYSTEM_DIRS"
+        alias = "CREATE_MISSING_SYSTEM_DIRS",
+        default,
+        deserialize_with = "deserialize_optional_bool"
     )]
     pub create_missing_system_dirs: Option<bool>,
+}
+
+impl BackendSourcePolicy {
+    fn id_value(&self) -> Option<&str> {
+        self.id
+            .as_deref()
+            .or_else(|| self.source_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    fn name_value(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or_else(|| self.label.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
 }
 
 pub fn sync_config_with_backend(
@@ -173,7 +227,7 @@ fn source_snapshot(source: &ResolvedSource) -> serde_json::Value {
     })
 }
 
-fn capability_matrix() -> serde_json::Value {
+pub(crate) fn capability_matrix() -> serde_json::Value {
     let kinds = [
         SourceKind::MisterFpga,
         SourceKind::RetroArch,
@@ -218,10 +272,201 @@ fn capability_matrix() -> serde_json::Value {
                 "scan.requested",
                 "deep_scan.requested",
                 "config.changed",
-                "save.changed"
+                "save.changed",
+                "save_created",
+                "save_parsed",
+                "save_deleted",
+                "conflict_created",
+                "conflict_resolved"
             ]
         }
     })
+}
+
+fn deserialize_optional_u16<'de, D>(deserializer: D) -> std::result::Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected u16-compatible number")),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<u16>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+        _ => Err(serde::de::Error::custom("expected number, string, or null")),
+    }
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(number) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected u64-compatible number")),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                trimmed
+                    .parse::<u64>()
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+        _ => Err(serde::de::Error::custom("expected number, string, or null")),
+    }
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Bool(value) => Ok(Some(value)),
+        Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "" => Ok(None),
+                "true" | "1" | "yes" | "on" => Ok(Some(true)),
+                "false" | "0" | "no" | "off" => Ok(Some(false)),
+                _ => Err(serde::de::Error::custom("expected bool-compatible string")),
+            }
+        }
+        _ => Err(serde::de::Error::custom("expected bool, string, or null")),
+    }
+}
+
+fn deserialize_optional_path<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(PathBuf::from(trimmed)))
+            }
+        }
+        _ => Err(serde::de::Error::custom("expected path string or null")),
+    }
+}
+
+fn deserialize_path_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(Vec::new());
+    };
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(split_policy_list(&text)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()),
+        Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(text) => Ok(text.trim().to_string()),
+                _ => Err(serde::de::Error::custom("expected string path item")),
+            })
+            .filter_map(|item| match item {
+                Ok(text) if text.is_empty() => None,
+                other => Some(other.map(PathBuf::from)),
+            })
+            .collect(),
+        _ => Err(serde::de::Error::custom(
+            "expected path string, path array, or null",
+        )),
+    }
+}
+
+fn deserialize_optional_string_list<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) => {
+            let values = split_policy_list(&text);
+            if values.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(values))
+            }
+        }
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    Value::String(text) => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            out.push(trimmed.to_string());
+                        }
+                    }
+                    _ => return Err(serde::de::Error::custom("expected string list item")),
+                }
+            }
+            if out.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(out))
+            }
+        }
+        _ => Err(serde::de::Error::custom(
+            "expected string, string array, or null",
+        )),
+    }
+}
+
+fn split_policy_list(value: &str) -> Vec<String> {
+    value
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn write_backend_policy_to_config(
@@ -424,12 +669,12 @@ fn apply_source_writeback(store: &mut SourceStore, response: &BackendConfigSyncR
 }
 
 fn source_policy_matches_source(source: &Source, policy: &BackendSourcePolicy) -> bool {
-    if let Some(id) = policy.id.as_deref()
+    if let Some(id) = policy.id_value()
         && source.id == id
     {
         return true;
     }
-    if let Some(name) = policy.name.as_deref()
+    if let Some(name) = policy.name_value()
         && source.name == name
     {
         return true;
@@ -439,9 +684,9 @@ fn source_policy_matches_source(source: &Source, policy: &BackendSourcePolicy) -
 
 fn source_from_policy(policy: &BackendSourcePolicy) -> Option<Source> {
     let name = policy
-        .name
-        .clone()
-        .or_else(|| policy.id.clone())
+        .name_value()
+        .map(ToString::to_string)
+        .or_else(|| policy.id_value().map(ToString::to_string))
         .unwrap_or_else(|| "Backend Source".to_string());
     let kind = policy
         .kind
@@ -455,7 +700,7 @@ fn source_from_policy(policy: &BackendSourcePolicy) -> Option<Source> {
     let rom_roots = source_policy_rom_roots(policy, &save_roots);
     let recursive = policy.recursive.unwrap_or(true);
     let mut source = Source::new(name, kind, save_roots, rom_roots, recursive);
-    if let Some(id) = policy.id.as_ref() {
+    if let Some(id) = policy.id_value() {
         source.id = normalize_source_id(id);
     }
     if let Some(profile) = policy.profile.as_deref().and_then(EmulatorProfile::parse) {
@@ -481,8 +726,8 @@ fn source_from_policy(policy: &BackendSourcePolicy) -> Option<Source> {
 }
 
 fn apply_policy_to_stored_source(source: &mut Source, policy: &BackendSourcePolicy) {
-    if let Some(name) = policy.name.as_ref() {
-        source.name = name.clone();
+    if let Some(name) = policy.name_value() {
+        source.name = name.to_string();
     }
     if let Some(kind) = policy.kind.as_deref().and_then(SourceKind::parse) {
         source.kind = kind;
@@ -670,12 +915,12 @@ fn source_policies(response: &BackendConfigSyncResponse) -> Vec<&BackendSourcePo
 }
 
 fn policy_matches(source: &ResolvedSource, policy: &BackendSourcePolicy) -> bool {
-    if let Some(id) = policy.id.as_deref()
+    if let Some(id) = policy.id_value()
         && source.id == id
     {
         return true;
     }
-    if let Some(name) = policy.name.as_deref()
+    if let Some(name) = policy.name_value()
         && source.name == name
     {
         return true;
@@ -800,6 +1045,40 @@ mod tests {
         assert_eq!(overrides.force_upload, Some(true));
         assert_eq!(overrides.dry_run, Some(false));
         assert!(sources[0].systems.is_empty());
+    }
+
+    #[test]
+    fn backend_policy_accepts_ui_string_and_null_values() {
+        let mut sources = vec![source()];
+        let response: BackendConfigSyncResponse = serde_json::from_value(serde_json::json!({
+            "policy": {
+                "global": {
+                    "port": "80",
+                    "forceUpload": "true",
+                    "dryRun": "false",
+                    "watch": null,
+                    "watchInterval": "45"
+                },
+                "sources": [{
+                    "sourceId": "mister_default",
+                    "enabled": "true",
+                    "savePaths": "/media/fat/saves",
+                    "romPaths": null,
+                    "recursive": "false",
+                    "systems": "snes,n64",
+                    "createMissingSystemDirs": "true"
+                }]
+            }
+        }))
+        .unwrap();
+
+        let overrides = apply_backend_response(&mut sources, &response, false);
+        assert_eq!(overrides.force_upload, Some(true));
+        assert_eq!(overrides.dry_run, Some(false));
+        assert_eq!(sources[0].save_roots, vec![PathBuf::from("/media/fat/saves")]);
+        assert!(!sources[0].recursive);
+        assert_eq!(sources[0].systems, vec!["n64", "snes"]);
+        assert!(sources[0].create_missing_system_dirs);
     }
 
     #[test]

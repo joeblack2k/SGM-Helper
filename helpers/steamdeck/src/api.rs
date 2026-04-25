@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -343,6 +343,15 @@ impl ApiClient {
     pub fn new(base_url: String, route_prefix: String, token: Option<String>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        let user_agent = format!(
+            "{}/{} SGM-Helper",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        );
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&user_agent).context("ongeldige User-Agent header")?,
+        );
 
         if let Some(value) = token.as_ref() {
             let auth = format!("Bearer {}", value);

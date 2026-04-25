@@ -132,7 +132,7 @@ pub fn run_sync(
         }
         Err(err) => {
             if verbose {
-                eprintln!("Backend config sync skipped: {}", err);
+                eprintln!("Backend config sync skipped: {:#}", err);
             }
         }
     }
@@ -526,13 +526,28 @@ fn restore_single_cloud_save(
         return Ok(());
     }
 
-    let downloaded_bytes = api.download_save(
+    let downloaded_bytes = match api.download_save(
         &cloud_save.id,
         device_type,
         fingerprint,
         app_password,
         Some(&runtime_target),
-    )?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
+            report.skipped += 1;
+            if verbose {
+                eprintln!(
+                    "Skipping cloud {} save '{}': backend projection is unavailable ({})",
+                    system_slug,
+                    cloud_save.display_name(),
+                    err
+                );
+            }
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let local_container =
         local_container_for_cloud_download(&system_slug, &provisional_path, &downloaded_bytes)?;
     let adapter_profile = default_adapter_profile_for_container(local_container);
@@ -1274,6 +1289,20 @@ fn process_single_save(
                 id: None,
             }
         }
+        Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
+            if verbose {
+                eprintln!(
+                    "Cloud latest points to missing PSX projection for {}; forcing repair upload",
+                    save_path.display()
+                );
+            }
+            LatestSaveResponse {
+                exists: false,
+                sha256: None,
+                version: None,
+                id: None,
+            }
+        }
         Err(err) => return Err(err),
     };
 
@@ -1430,16 +1459,73 @@ fn process_single_save(
         )));
     }
 
-    let conflict = api.conflict_check(
+    let conflict = match api.conflict_check(
         &active_rom_sha1,
         &effective_slot_name,
         device_type,
         fingerprint,
         app_password,
         Some(&runtime_target),
-    )?;
+    ) {
+        Ok(conflict) => conflict,
+        Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
+            if verbose {
+                eprintln!(
+                    "Conflict check points to missing PSX projection for {}; uploading local card as repair",
+                    save_path.display()
+                );
+            }
+            if options.dry_run {
+                report.uploaded += 1;
+                return Ok(Some(processed_entry(
+                    state_key.clone(),
+                    synced_entry(
+                        local_sha,
+                        Some(active_rom_sha1.clone()),
+                        latest.version,
+                        Some(&system_slug),
+                        Some(normalized_save.local_container),
+                        Some(normalized_save.adapter_profile),
+                        Some(source_kind),
+                        Some(source_name),
+                        Some(&effective_slot_name),
+                    ),
+                )));
+            }
+            let filename = upload_filename_for_sync(save_path, &system_slug);
+            api.upload_save(
+                &filename,
+                normalized_save.canonical_bytes.clone(),
+                &active_rom_sha1,
+                rom_md5.as_deref(),
+                &effective_slot_name,
+                device_type,
+                fingerprint,
+                app_password,
+                Some(&system_slug),
+                wii_title_code_from_path(save_path).as_deref(),
+                Some(&runtime_target),
+            )?;
+            report.uploaded += 1;
+            return Ok(Some(processed_entry(
+                state_key.clone(),
+                synced_entry(
+                    local_sha,
+                    Some(active_rom_sha1.clone()),
+                    latest.version,
+                    Some(&system_slug),
+                    Some(normalized_save.local_container),
+                    Some(normalized_save.adapter_profile),
+                    Some(source_kind),
+                    Some(source_name),
+                    Some(&effective_slot_name),
+                ),
+            )));
+        }
+        Err(err) => return Err(err),
+    };
     if conflict.exists {
-        handle_conflict(
+        let conflict_result = handle_conflict(
             api,
             save_path,
             &normalized_save.canonical_bytes,
@@ -1454,7 +1540,47 @@ fn process_single_save(
             source_kind,
             app_password,
             &runtime_target,
-        )?;
+        );
+        if let Err(err) = conflict_result {
+            if is_playstation_projection_unavailable(&err, &system_slug) {
+                if verbose {
+                    eprintln!(
+                        "Conflict report points to missing PSX projection for {}; uploading local card as repair",
+                        save_path.display()
+                    );
+                }
+                let filename = upload_filename_for_sync(save_path, &system_slug);
+                api.upload_save(
+                    &filename,
+                    normalized_save.canonical_bytes.clone(),
+                    &active_rom_sha1,
+                    rom_md5.as_deref(),
+                    &effective_slot_name,
+                    device_type,
+                    fingerprint,
+                    app_password,
+                    Some(&system_slug),
+                    wii_title_code_from_path(save_path).as_deref(),
+                    Some(&runtime_target),
+                )?;
+                report.uploaded += 1;
+                return Ok(Some(processed_entry(
+                    state_key.clone(),
+                    synced_entry(
+                        local_sha,
+                        Some(active_rom_sha1.clone()),
+                        latest.version,
+                        Some(&system_slug),
+                        Some(normalized_save.local_container),
+                        Some(normalized_save.adapter_profile),
+                        Some(source_kind),
+                        Some(source_name),
+                        Some(&effective_slot_name),
+                    ),
+                )));
+            }
+            return Err(err);
+        }
         report.conflicts += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
@@ -1500,13 +1626,53 @@ fn process_single_save(
             )));
         }
 
-        let canonical_bytes = api.download_save(
+        let canonical_bytes = match api.download_save(
             &save_id,
             device_type,
             fingerprint,
             app_password,
             Some(&runtime_target),
-        )?;
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
+                if verbose {
+                    eprintln!(
+                        "Backend PSX projection is unavailable for {}; uploading local card as repair",
+                        save_path.display()
+                    );
+                }
+                let filename = upload_filename_for_sync(save_path, &system_slug);
+                api.upload_save(
+                    &filename,
+                    normalized_save.canonical_bytes.clone(),
+                    &active_rom_sha1,
+                    None,
+                    &effective_slot_name,
+                    device_type,
+                    fingerprint,
+                    app_password,
+                    Some(&system_slug),
+                    wii_title_code_from_path(save_path).as_deref(),
+                    Some(&runtime_target),
+                )?;
+                report.uploaded += 1;
+                return Ok(Some(processed_entry(
+                    state_key.clone(),
+                    synced_entry(
+                        local_sha,
+                        Some(active_rom_sha1.clone()),
+                        latest.version,
+                        Some(&system_slug),
+                        Some(normalized_save.local_container),
+                        Some(normalized_save.adapter_profile),
+                        Some(source_kind),
+                        Some(source_name),
+                        Some(&effective_slot_name),
+                    ),
+                )));
+            }
+            Err(err) => return Err(err),
+        };
         let local_bytes =
             encode_download_for_local_container(&canonical_bytes, normalized_save.local_container)?;
         let target_save_path = preferred_save_path(
@@ -2383,6 +2549,20 @@ fn is_empty_n64_controller_pak_rejection(err: &anyhow::Error, system_slug: &str)
     status_match && controller_pak_hint && empty_hint
 }
 
+fn is_playstation_projection_unavailable(err: &anyhow::Error, system_slug: &str) -> bool {
+    if !is_playstation_system(system_slug) {
+        return false;
+    }
+    let message = format!("{err:#}").to_ascii_lowercase();
+    let status_match = message.contains("status=400 bad request")
+        || message.contains("status=404 not found")
+        || message.contains("status=422 unprocessable entity");
+    let projection_hint = message.contains("playstation projection");
+    let unavailable_hint =
+        message.contains("not found") || message.contains("not a playstation projection");
+    status_match && projection_hint && unavailable_hint
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_with_n64_mister_cpk_fallback(
     api: &ApiClient,
@@ -3066,6 +3246,15 @@ mod tests {
         );
         assert!(is_empty_n64_controller_pak_rejection(&err, "n64"));
         assert!(!is_empty_n64_controller_pak_rejection(&err, "snes"));
+    }
+
+    #[test]
+    fn detects_unavailable_playstation_projection() {
+        let err = anyhow::Error::msg(
+            "download faalde: status=400 Bad Request body={\"message\":\"save is not a playstation projection\"}",
+        );
+        assert!(is_playstation_projection_unavailable(&err, "psx"));
+        assert!(!is_playstation_projection_unavailable(&err, "saturn"));
     }
 
     #[test]

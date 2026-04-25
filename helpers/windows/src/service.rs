@@ -209,8 +209,16 @@ pub fn run_service(
                             report.errors
                         );
                     }
-                    runtime.last_sync_ok = Some(report.errors == 0);
-                    runtime.last_error = None;
+                    if report.errors == 0 {
+                        runtime.last_sync_ok = Some(true);
+                        runtime.last_error = None;
+                    } else {
+                        runtime.last_sync_ok = Some(false);
+                        runtime.last_error = Some(format!(
+                            "sync completed with {} error(s); run with --verbose for details",
+                            report.errors
+                        ));
+                    }
                     runtime.last_sync = Some(report);
                 }
                 Err(err) => {
@@ -463,26 +471,7 @@ fn build_heartbeat_payload(
             "lastSync": runtime.last_sync.as_ref().map(sync_report_json),
         },
         "config": redacted_config,
-        "capabilities": {
-            "serviceRun": true,
-            "serviceInstall": true,
-            "heartbeatEndpoint": "POST /helpers/heartbeat",
-            "configSyncEndpoint": "POST /helpers/config/sync",
-            "controlEvents": [
-                "sync.requested",
-                "scan.requested",
-                "deep_scan.requested",
-                "config.changed",
-                "save.changed",
-                "save_created",
-                "save_parsed",
-                "save_deleted",
-                "conflict_created",
-                "conflict_resolved"
-            ],
-            "schedulerFallback": true,
-            "backendPolicyWins": true
-        }
+        "capabilities": crate::backend_config::capability_matrix()
     }))
 }
 

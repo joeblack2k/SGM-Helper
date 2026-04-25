@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.15] - 2026-04-25
+
+### Fixed
+
+- Helper heartbeats now send the same structured capability matrix as config sync, so the backend Devices page keeps source kinds, profiles, policy support, and service controls populated.
+- Helper HTTP requests now include a stable `User-Agent`, allowing the backend to show the helper client instead of `Unknown`.
+- Service heartbeats now include a clear `lastError` summary when a sync completes with per-save errors, making `degraded` status explainable in the Devices UI.
+- Backend policy parsing is more tolerant of UI-edited values such as string booleans, string numbers, nulls, and single path strings.
+- Missing or legacy PlayStation backend projections now trigger helper repair uploads where safe, and cloud-only non-projection PSX records are skipped. Backend projection-store integrity failures still surface as service `degraded` so the Devices page reflects real sync health.
+
 ## [0.4.14] - 2026-04-25
 
 ### Changed
