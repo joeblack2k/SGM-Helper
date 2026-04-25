@@ -136,6 +136,10 @@ pub struct CloudSaveSummary {
     pub card_slot: Option<String>,
     #[serde(default, rename = "downloadProfiles")]
     pub download_profiles: Vec<DownloadProfile>,
+    #[serde(default)]
+    pub inspection: Option<serde_json::Value>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
     #[serde(default, rename = "romSha1")]
     pub rom_sha1: Option<String>,
     #[serde(default, rename = "romMd5")]

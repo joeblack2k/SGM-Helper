@@ -644,6 +644,26 @@ fn cloud_target_path(
 
 fn cloud_wii_title_code(cloud_save: &CloudSaveSummary) -> Option<String> {
     for candidate in [
+        cloud_json_string(&cloud_save.metadata, "/rsm/wii/titleCode"),
+        cloud_json_string(&cloud_save.metadata, "/rsm/wii/gameCode"),
+        cloud_json_string(&cloud_save.metadata, "/rsm/wii/wiiTitleId"),
+        cloud_json_string(&cloud_save.metadata, "/rsm/wii/wiiTitleID"),
+        cloud_json_string(&cloud_save.metadata, "/rsm/wii/sourcePath"),
+        cloud_json_string(&cloud_save.inspection, "/semanticFields/titleCode"),
+        cloud_json_string(&cloud_save.inspection, "/semanticFields/gameCode"),
+        cloud_json_string(&cloud_save.inspection, "/semanticFields/sourcePath"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(code) = wii_title_code_from_candidate(&candidate) {
+            return Some(code);
+        }
+    }
+    if let Some(code) = cloud_wii_title_code_from_evidence(cloud_save.inspection.as_ref()) {
+        return Some(code);
+    }
+    for candidate in [
         cloud_save.card_slot.as_deref(),
         Some(cloud_save.filename.as_str()),
         Some(cloud_save.display_name()),
@@ -651,18 +671,53 @@ fn cloud_wii_title_code(cloud_save: &CloudSaveSummary) -> Option<String> {
     .into_iter()
     .flatten()
     {
-        let path = Path::new(candidate);
-        if let Some(code) = wii_title_code_from_path(path) {
+        if let Some(code) = wii_title_code_from_candidate(candidate) {
             return Some(code);
         }
-        let clean = candidate.trim().to_ascii_uppercase();
-        if clean.len() == 4
-            && clean
-                .chars()
-                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+    }
+    None
+}
+
+fn cloud_json_string(value: &Option<serde_json::Value>, pointer: &str) -> Option<String> {
+    value
+        .as_ref()
+        .and_then(|root| root.pointer(pointer))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn cloud_wii_title_code_from_evidence(value: Option<&serde_json::Value>) -> Option<String> {
+    let evidence = value?.pointer("/evidence")?.as_array()?;
+    for entry in evidence {
+        let Some(text) = entry.as_str() else {
+            continue;
+        };
+        let Some((key, value)) = text.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("titleCode")
+            && let Some(code) = wii_title_code_from_candidate(value)
         {
-            return Some(clean);
+            return Some(code);
         }
+    }
+    None
+}
+
+fn wii_title_code_from_candidate(candidate: &str) -> Option<String> {
+    let path = Path::new(candidate);
+    if let Some(code) = wii_title_code_from_path(path) {
+        return Some(code);
+    }
+    let clean = candidate.trim().to_ascii_uppercase();
+    if clean.len() == 4
+        && clean
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+    {
+        return Some(clean);
     }
     None
 }
@@ -2389,6 +2444,8 @@ mod tests {
                 target_extension: Some(target_extension.to_string()),
                 note: None,
             }],
+            inspection: None,
+            metadata: None,
             rom_sha1: None,
             rom_md5: None,
         }
@@ -2742,6 +2799,39 @@ mod tests {
         assert_eq!(
             target.to_string_lossy(),
             "/home/deck/Emulation/saves/wii/SB4P/data.bin"
+        );
+    }
+
+    #[test]
+    fn cloud_restore_reads_wii_title_code_from_backend_metadata() {
+        let mut save = cloud_save(
+            "data.bin",
+            "Super Mario Galaxy 2",
+            "wii",
+            "original",
+            ".bin",
+        );
+        save.metadata = Some(serde_json::json!({
+            "rsm": {
+                "wii": {
+                    "titleCode": "SB4P",
+                    "sourcePath": "Super Mario Galaxy 2/SB4P/data.bin"
+                }
+            }
+        }));
+
+        let target = cloud_target_path(
+            &save,
+            &[PathBuf::from("/media/fat/saves")],
+            &SourceKind::MisterFpga,
+            &EmulatorProfile::Mister,
+            "wii",
+            Some("bin"),
+        );
+
+        assert_eq!(
+            target.to_string_lossy(),
+            "/media/fat/saves/Wii/SB4P/data.bin"
         );
     }
 

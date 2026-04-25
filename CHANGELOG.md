@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-04-25
+
+### Fixed
+
+- Wii cloud restore now reads title codes from backend `metadata.rsm.wii` and `inspection.semanticFields`, so restored Wii saves target folders such as `Wii/SB4P/data.bin` instead of colliding at `Wii/data.bin`.
+
 ## [0.4.9] - 2026-04-25
 
 ### Added
