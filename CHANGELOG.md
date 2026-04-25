@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-04-25
+
+### Added
+
+- Helpers now send a structured `config.ini` snapshot to `POST /helpers/config/sync` during sync/watch runs.
+- Backend config policy responses can override source systems, source paths, source kind/profile, recursive scanning, missing folder creation, `FORCE_UPLOAD`, and `DRY_RUN` at runtime.
+- Added `backend.md` with the backend contract, all config fields, defaults, source semantics, capabilities matrix expectations, and `MANAGED=false` rules.
+
+### Changed
+
+- Backend policy is applied even for manual `MANAGED=false` sources; that flag now only means “do not silently write backend changes back into local config.ini”.
+- Config sync is best-effort for backwards compatibility, so older backends without `/helpers/config/sync` continue to sync normally.
+
 ## [0.4.11] - 2026-04-25
 
 ### Added

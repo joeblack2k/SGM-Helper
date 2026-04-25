@@ -2,6 +2,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -777,6 +778,33 @@ impl ApiClient {
             .multipart(form)
             .send()
             .context("request naar /conflicts/report faalde")?;
+
+        parse_json_response(response)
+    }
+
+    pub fn sync_helper_config(
+        &self,
+        payload: &serde_json::Value,
+        app_password: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let url = self.url("/helpers/config/sync");
+        let mut request = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(payload);
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let response = request
+            .send()
+            .context("request naar /helpers/config/sync faalde")?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(serde_json::json!({ "accepted": true }));
+        }
 
         parse_json_response(response)
     }

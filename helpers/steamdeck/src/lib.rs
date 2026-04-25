@@ -1,4 +1,5 @@
 pub mod api;
+pub mod backend_config;
 pub mod cli;
 pub mod config;
 pub mod scanner;

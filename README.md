@@ -189,6 +189,12 @@ Helpers do not blindly download every save from the backend. Each source has a `
 - `CREATE_MISSING_SYSTEM_DIRS="false"` prevents accidental folder creation, for example a MiSTer helper will not create `/media/fat/saves/Wii`.
 - To opt in manually, add the console slug to `SYSTEMS` and create the target system folder yourself, or set `CREATE_MISSING_SYSTEM_DIRS="true"`.
 
+### Backend-Managed Policy
+
+During `sync` and `watch`, helpers send a parsed config snapshot to the backend at `POST /helpers/config/sync`. If the backend returns policy, that policy wins for the current run, including manual `MANAGED="false"` sources.
+
+See [`backend.md`](backend.md) for the full backend contract.
+
 ## CLI Commands
 
 The MiSTer, Steam Deck, and Windows helpers share the same command set.

@@ -89,7 +89,7 @@ impl SourceKind {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mister-fpga" | "mister" => Some(Self::MisterFpga),
             "retroarch" => Some(Self::RetroArch),
@@ -254,6 +254,7 @@ pub struct Source {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedSource {
+    pub id: String,
     pub name: String,
     pub kind: SourceKind,
     pub profile: EmulatorProfile,
@@ -262,6 +263,8 @@ pub struct ResolvedSource {
     pub recursive: bool,
     pub systems: Vec<String>,
     pub create_missing_system_dirs: bool,
+    pub managed: bool,
+    pub origin: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -397,6 +400,7 @@ impl Source {
 
     pub fn resolve(&self, binary_dir: &Path) -> ResolvedSource {
         ResolvedSource {
+            id: self.id.clone(),
             name: self.name.clone(),
             kind: self.kind.clone(),
             profile: self.profile.clone(),
@@ -413,6 +417,8 @@ impl Source {
             recursive: self.recursive,
             systems: self.systems.clone(),
             create_missing_system_dirs: self.create_missing_system_dirs,
+            managed: self.managed,
+            origin: self.origin.clone(),
         }
     }
 

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use crate::api::{
     ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveResponse, RuntimeTarget,
 };
+use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
@@ -99,7 +100,7 @@ pub fn run_sync(
     let token = auth.map(|value| value.token.clone());
     let api = ApiClient::new(config.base_url(), config.route_prefix.clone(), token)?;
 
-    let sources = prepare_sources_for_sync(
+    let mut sources = prepare_sources_for_sync(
         config,
         options.default_source_kind.clone(),
         options.scan,
@@ -112,6 +113,30 @@ pub fn run_sync(
     } else {
         Some(config.app_password.trim())
     };
+    let mut effective_options = options.clone();
+    match sync_config_with_backend(
+        &api,
+        config,
+        &mut sources,
+        &options.default_source_kind,
+        app_password,
+        verbose,
+    ) {
+        Ok(overrides) => {
+            if let Some(value) = overrides.force_upload {
+                effective_options.force_upload = value;
+            }
+            if let Some(value) = overrides.dry_run {
+                effective_options.dry_run = value;
+            }
+        }
+        Err(err) => {
+            if verbose {
+                eprintln!("Backend config sync skipped: {}", err);
+            }
+        }
+    }
+    let options = &effective_options;
 
     let mut report = SyncReport::default();
     let mut rom_hash_cache: HashMap<String, (String, String)> = HashMap::new();
