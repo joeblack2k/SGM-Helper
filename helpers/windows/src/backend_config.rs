@@ -101,7 +101,11 @@ struct BackendSourcePolicy {
         deserialize_with = "deserialize_path_vec"
     )]
     pub save_roots: Vec<PathBuf>,
-    #[serde(alias = "savePath", default, deserialize_with = "deserialize_optional_path")]
+    #[serde(
+        alias = "savePath",
+        default,
+        deserialize_with = "deserialize_optional_path"
+    )]
     pub save_path: Option<PathBuf>,
     #[serde(
         alias = "romPaths",
@@ -111,7 +115,11 @@ struct BackendSourcePolicy {
         deserialize_with = "deserialize_path_vec"
     )]
     pub rom_roots: Vec<PathBuf>,
-    #[serde(alias = "romPath", default, deserialize_with = "deserialize_optional_path")]
+    #[serde(
+        alias = "romPath",
+        default,
+        deserialize_with = "deserialize_optional_path"
+    )]
     pub rom_path: Option<PathBuf>,
     #[serde(default, deserialize_with = "deserialize_optional_bool")]
     pub recursive: Option<bool>,
@@ -1075,7 +1083,10 @@ mod tests {
         let overrides = apply_backend_response(&mut sources, &response, false);
         assert_eq!(overrides.force_upload, Some(true));
         assert_eq!(overrides.dry_run, Some(false));
-        assert_eq!(sources[0].save_roots, vec![PathBuf::from("/media/fat/saves")]);
+        assert_eq!(
+            sources[0].save_roots,
+            vec![PathBuf::from("/media/fat/saves")]
+        );
         assert!(!sources[0].recursive);
         assert_eq!(sources[0].systems, vec!["n64", "snes"]);
         assert!(sources[0].create_missing_system_dirs);
