@@ -182,6 +182,18 @@ fn capability_matrix() -> serde_json::Value {
             "supportsSystemsAllowList": true,
             "supportsCreateMissingSystemDirs": true,
             "manualManagedPolicy": "MANAGED=false prevents config-file writeback only; backend policy still applies at runtime."
+        },
+        "service": {
+            "supportsDaemonMode": true,
+            "heartbeatEndpoint": "POST /helpers/heartbeat",
+            "controlChannel": "GET /events",
+            "controlEvents": [
+                "sync.requested",
+                "scan.requested",
+                "deep_scan.requested",
+                "config.changed",
+                "save.changed"
+            ]
         }
     })
 }

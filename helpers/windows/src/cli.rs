@@ -135,6 +135,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     DeviceAuth {
         #[arg(long = "poll-interval", default_value_t = 5)]
         poll_interval: u64,
@@ -231,6 +235,38 @@ pub enum ScheduleCommand {
     Install {
         #[arg(long = "every-minutes", default_value_t = 30)]
         every_minutes: u32,
+    },
+    Status,
+    Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    Run {
+        #[arg(long = "heartbeat-interval", default_value_t = 30)]
+        heartbeat_interval: u64,
+        #[arg(long = "reconcile-interval", default_value_t = 1800)]
+        reconcile_interval: u64,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        force_upload: Option<bool>,
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        dry_run: Option<bool>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        scan: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        deep_scan: bool,
+        #[arg(long, action = ArgAction::SetTrue)]
+        apply_scan: bool,
+        #[arg(long = "slot-name")]
+        slot_name: Option<String>,
+        #[arg(long, hide = true)]
+        max_cycles: Option<u32>,
+    },
+    Install {
+        #[arg(long = "heartbeat-interval", default_value_t = 30)]
+        heartbeat_interval: u64,
+        #[arg(long = "reconcile-interval", default_value_t = 1800)]
+        reconcile_interval: u64,
     },
     Status,
     Uninstall,

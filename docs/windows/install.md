@@ -64,13 +64,22 @@ Deep scan and apply:
 .\sgm-windows-helper.exe sync --deep-scan --apply-scan
 ```
 
+Service task mode (recommended for always-on sync):
+
+```powershell
+.\sgm-windows-helper.exe service install
+.\sgm-windows-helper.exe service status
+```
+
+The service task starts on logon, sends backend heartbeat sensors, reacts to backend sync events, and still reconciles every 30 minutes by default.
+
 Watch mode:
 
 ```powershell
 .\sgm-windows-helper.exe watch --watch-interval 30
 ```
 
-Scheduler install (every 30 min):
+Scheduler fallback (every 30 min):
 
 ```powershell
 .\sgm-windows-helper.exe schedule install --every-minutes 30

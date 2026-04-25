@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-04-25
+
+### Added
+
+- Added helper service/daemon mode for MiSTer, Steam Deck, and Windows helpers via `service run|install|status|uninstall`.
+- Service mode sends best-effort backend heartbeats to `POST /helpers/heartbeat` with online status, sync health, config hash, source counts, configured systems, lock status, and last sync counters.
+- Service mode listens to `GET /events` and reacts to backend control events such as `sync.requested`, `scan.requested`, `deep_scan.requested`, `config.changed`, and save/conflict events.
+- Service install uses systemd when available on Linux, cron `@reboot` fallback on small Linux systems, and Windows Task Scheduler on Windows.
+- Added `service.md` as the backend handoff for heartbeat sensors, event names, offline rules, UI recommendations, and config policy flow.
+
+### Changed
+
+- Helper capability snapshots now advertise daemon mode, heartbeat endpoint, and control-channel support.
+- README now recommends service mode for always-on devices, with scheduler mode documented as a fallback.
+
+### Tests
+
+- Added service command/payload unit coverage for heartbeat redaction and sensor output.
+
 ## [0.4.12] - 2026-04-25
 
 ### Added

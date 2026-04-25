@@ -809,6 +809,42 @@ impl ApiClient {
         parse_json_response(response)
     }
 
+    pub fn helper_heartbeat(
+        &self,
+        payload: &serde_json::Value,
+        app_password: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let url = self.url("/helpers/heartbeat");
+        let mut request = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .json(payload);
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let response = request
+            .send()
+            .context("request naar /helpers/heartbeat faalde")?;
+
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(serde_json::json!({ "accepted": true }));
+        }
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+        ) {
+            return Ok(serde_json::json!({
+                "accepted": false,
+                "unsupported": true
+            }));
+        }
+
+        parse_json_response(response)
+    }
+
     pub fn open_events(&self) -> Result<Response> {
         let url = self.url("/events");
         let response = self

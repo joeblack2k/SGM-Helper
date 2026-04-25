@@ -15,6 +15,8 @@ This repo is built for homelab emulator users. You run a helper on each device (
 
 If backend auth is disabled, you can usually run `sync` directly.
 
+For always-on devices, use `service install` after the first successful sync. Service mode keeps the helper connected, sends health sensors to the backend, and reacts to backend "Sync now" events.
+
 ## Supported Helpers and Release Files
 
 - MiSTer: `sgm-mister-helper-armv7.tar.gz`
@@ -214,6 +216,7 @@ The MiSTer, Steam Deck, and Windows helpers share the same command set.
 - `state clean --missing|--all`
 - `config show`
 - `schedule install|status|uninstall`
+- `service run|install|status|uninstall`
 - `device-auth`
 
 ## CLI Flags (Global)
@@ -242,67 +245,67 @@ Use these before any command:
 - `--slot-name <name>` (PlayStation slot hint)
 - `watch` only: `--watch-interval <seconds>`
 
+## CLI Flags (`service run`)
+
+- `--heartbeat-interval <seconds>`: how often the helper reports online status to the backend. Default: `30`.
+- `--reconcile-interval <seconds>`: periodic full sync even when no backend event arrives. Default: `1800`.
+- `--force-upload[=true|false]`
+- `--dry-run[=true|false]`
+- `--scan`
+- `--deep-scan`
+- `--apply-scan`
+- `--slot-name <name>`
+
 ## How to Run Automatically (Recommended)
 
-Use built-in scheduler commands. This is the easiest option.
+Use service mode when possible. It is better than a simple timer because the helper stays online, reports health sensors, and can react when the backend sends a sync event.
 
 ### MiSTer
 
 ```bash
 cd /media/fat
-./sgm-mister-helper schedule install --every-minutes 30
-./sgm-mister-helper schedule status
+./sgm-mister-helper service install
+./sgm-mister-helper service status
 ```
 
 ### Steam Deck
 
 ```bash
 cd /home/deck/SGM-Helper
-./sgm-steamdeck-helper schedule install --every-minutes 30
-./sgm-steamdeck-helper schedule status
+./sgm-steamdeck-helper service install
+./sgm-steamdeck-helper service status
+```
+
+Remove service:
+
+```bash
+./sgm-mister-helper service uninstall
+./sgm-steamdeck-helper service uninstall
+```
+
+Notes:
+
+- Linux helpers use systemd when available and fall back to a marked `@reboot` cron entry.
+- Windows helper uses Task Scheduler on logon.
+- Service mode runs `service run --quiet`.
+- It sends heartbeat sensors to `POST /helpers/heartbeat`.
+- It listens to backend events on `GET /events`.
+- It still reconciles every 30 minutes by default.
+- Overlapping syncs are prevented via `STATE_DIR/sync.lock`.
+
+## Timer Fallback
+
+If your device cannot keep a service running, use the older scheduler mode:
+
+```bash
+./sgm-mister-helper schedule install --every-minutes 30
+./sgm-mister-helper schedule status
 ```
 
 Remove schedule:
 
 ```bash
 ./sgm-mister-helper schedule uninstall
-./sgm-steamdeck-helper schedule uninstall
-```
-
-Notes:
-
-- Linux helpers use cron entries.
-- Windows helper uses Task Scheduler.
-- Scheduled runs execute `sync --quiet`.
-- Overlapping runs are prevented via `STATE_DIR/sync.lock`.
-
-## Optional: Continuous Watch as a Systemd Service (Linux)
-
-If you prefer always-on watch mode instead of interval scheduler:
-
-```ini
-[Unit]
-Description=SGM SteamDeck Helper Watch
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/home/deck/SGM-Helper
-ExecStart=/home/deck/SGM-Helper/sgm-steamdeck-helper watch --watch-interval 30 --quiet
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now sgm-steamdeck-helper.service
-systemctl status sgm-steamdeck-helper.service
 ```
 
 ## Documentation
@@ -312,3 +315,4 @@ systemctl status sgm-steamdeck-helper.service
 - Windows: [`docs/windows/install.md`](docs/windows/install.md)
 - GameCube: [`docs/gamecube/install.md`](docs/gamecube/install.md)
 - 3DS: [`docs/3ds/install.md`](docs/3ds/install.md)
+- Backend service contract: [`service.md`](service.md)

@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod scanner;
 pub mod scheduler;
+pub mod service;
 pub mod sources;
 pub mod state;
 pub mod syncer;
@@ -20,13 +21,18 @@ use clap::Parser;
 
 use crate::api::{ApiClient, AutoProvisionRequest, DeviceTokenPoll};
 use crate::cli::{
-    Cli, Commands, ConfigCommand, ScheduleCommand, SourceAddCommand, SourceCommand, StateCommand,
+    Cli, Commands, ConfigCommand, ScheduleCommand, ServiceCommand, SourceAddCommand, SourceCommand,
+    StateCommand,
 };
 use crate::config::{AppConfig, ConfigOverrides, LoadedConfig};
 use crate::scanner::{
     SaveContainerFormat, encode_download_for_local_container, normalize_save_bytes_for_sync,
 };
 use crate::scheduler::{SchedulerBackend, install_schedule, scheduler_status, uninstall_schedule};
+use crate::service::{
+    ServiceRunOptions, detect_service_backend, install_service, run_service, service_status,
+    uninstall_service,
+};
 use crate::sources::{
     EmulatorProfile, Source, SourceKind, load_source_store, migrate_legacy_sources_if_needed,
     remove_source, resolved_sources_or_default, save_source_store, upsert_source,
@@ -572,6 +578,92 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 }
                 ScheduleCommand::Uninstall => {
                     let result = uninstall_schedule(backend, task_name)?;
+                    if !cli.quiet {
+                        println!("{}", result);
+                    }
+                }
+            }
+        }
+        Commands::Service { command } => {
+            let service_name = "SGM MiSTer Helper Service";
+            let binary_path =
+                std::env::current_exe().context("kan executable pad niet bepalen voor service")?;
+            let config_path = loaded.config.config_path.clone();
+            let backend = detect_service_backend();
+
+            match command {
+                ServiceCommand::Run {
+                    heartbeat_interval,
+                    reconcile_interval,
+                    force_upload,
+                    dry_run,
+                    scan,
+                    deep_scan,
+                    apply_scan,
+                    slot_name,
+                    max_cycles,
+                } => {
+                    let mut cfg = loaded.config.clone();
+                    if let Some(value) = force_upload {
+                        cfg.force_upload = value;
+                    }
+                    if let Some(value) = dry_run {
+                        cfg.dry_run = value;
+                    }
+
+                    let auth = ensure_auth_or_auto_enroll(
+                        &cfg,
+                        cli.verbose,
+                        cli.quiet,
+                        SourceKind::MisterFpga,
+                    )?;
+                    run_service(
+                        &cfg,
+                        auth.as_ref(),
+                        ServiceRunOptions {
+                            heartbeat_interval_secs: heartbeat_interval,
+                            reconcile_interval_secs: reconcile_interval,
+                            force_upload: cfg.force_upload,
+                            dry_run: cfg.dry_run,
+                            scan,
+                            deep_scan,
+                            apply_scan,
+                            slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
+                            default_source_kind: SourceKind::MisterFpga,
+                            max_cycles,
+                        },
+                        cli.verbose,
+                        cli.quiet,
+                    )?;
+                }
+                ServiceCommand::Install {
+                    heartbeat_interval,
+                    reconcile_interval,
+                } => {
+                    let result = install_service(
+                        backend,
+                        service_name,
+                        &binary_path,
+                        &config_path,
+                        heartbeat_interval,
+                        reconcile_interval,
+                    )?;
+                    if !cli.quiet {
+                        println!("{}", result);
+                    }
+                }
+                ServiceCommand::Status => {
+                    let status = service_status(backend, service_name, &binary_path, &config_path)?;
+                    if !cli.quiet {
+                        println!(
+                            "Installed: {}\nDetails: {}",
+                            if status.installed { "yes" } else { "no" },
+                            status.details.trim()
+                        );
+                    }
+                }
+                ServiceCommand::Uninstall => {
+                    let result = uninstall_service(backend, service_name)?;
                     if !cli.quiet {
                         println!("{}", result);
                     }

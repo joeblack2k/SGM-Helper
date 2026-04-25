@@ -12,15 +12,18 @@ Do not treat `config.ini` as raw text in the backend. Store structured fields.
 
 ## Implemented Helper Behavior
 
-As of helper `v0.4.12`:
+As of helper `v0.4.13`:
 
 - Helpers call `POST /helpers/config/sync` during `sync` and every `watch` sync cycle.
+- Helpers in `service run` mode also call `POST /helpers/config/sync` during startup, backend-triggered sync, and periodic reconcile cycles.
 - The request contains parsed global config, parsed source config, helper identity, and helper capabilities.
 - The helper does not send the raw app password. It sends `appPasswordConfigured: true|false`.
 - The endpoint is best-effort for backwards compatibility. If it is missing or fails, sync continues with local config.
 - If the backend returns policy, the helper applies it in memory for the current run.
 - Backend source policy applies even when the local source has `MANAGED=false`.
 - `MANAGED=false` means only: do not write backend changes back into the local `config.ini` file for that source.
+
+For the always-on service/heartbeat contract, see [`service.md`](service.md). Service mode adds `POST /helpers/heartbeat`, backend online sensors, and push events over `GET /events`.
 
 ## Endpoint
 
@@ -48,7 +51,7 @@ Example:
   "schemaVersion": 1,
   "helper": {
     "name": "sgm-mister-helper",
-    "version": "0.4.12",
+    "version": "0.4.13",
     "deviceType": "mister",
     "defaultKind": "mister-fpga",
     "hostname": "MiSTer",
@@ -100,6 +103,12 @@ Example:
       "supportsSystemsAllowList": true,
       "supportsCreateMissingSystemDirs": true,
       "manualManagedPolicy": "MANAGED=false prevents config-file writeback only; backend policy still applies at runtime."
+    },
+    "service": {
+      "supportsDaemonMode": true,
+      "heartbeatEndpoint": "POST /helpers/heartbeat",
+      "controlChannel": "GET /events",
+      "controlEvents": ["sync.requested", "scan.requested", "deep_scan.requested", "config.changed", "save.changed"]
     }
   }
 }

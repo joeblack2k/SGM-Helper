@@ -24,6 +24,10 @@ Steam Deck helper CLI for SGM self-hosted save sync.
 - `schedule install --every-minutes 30`
 - `schedule status`
 - `schedule uninstall`
+- `service run`
+- `service install`
+- `service status`
+- `service uninstall`
 
 ## Config
 
@@ -84,6 +88,14 @@ Cross-emulator normalization currently supported:
 - PS1 raw memcard (`.mcr/.mc/.mcd/.psv`) <-> canonical raw sync payload
 - PS1 DexDrive (`.gme`) is decoded to canonical raw for upload/hash and re-encoded on download
 - PS1 PSP VMP (`.vmp`) signature is validated, decoded to canonical raw for upload/hash and re-encoded on download
+
+Service mode:
+
+- `service install` is preferred for always-on devices
+- sends backend heartbeat sensors to `POST /helpers/heartbeat`
+- listens for backend sync events on `GET /events`
+- runs periodic reconcile sync every 30 minutes by default
+- uses user systemd when available
 
 For compatibility with existing 1Retro-style deployments you can also set:
 

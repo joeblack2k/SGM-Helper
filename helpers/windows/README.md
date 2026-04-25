@@ -24,6 +24,10 @@ Windows helper CLI for SGM self-hosted save sync.
 - `schedule install --every-minutes 30`
 - `schedule status`
 - `schedule uninstall`
+- `service run`
+- `service install`
+- `service status`
+- `service uninstall`
 
 ## Config
 
@@ -57,6 +61,14 @@ Autoscan behavior:
 - `--scan` refreshes known emulator paths and replaces only `MANAGED=true` entries
 - `--deep-scan` scans the full disk and writes `state/scan_report.json` (review mode)
 - `--deep-scan --apply-scan` applies deep-scan candidates into managed source blocks
+
+Service mode:
+
+- `service install` is preferred for always-on devices
+- sends backend heartbeat sensors to `POST /helpers/heartbeat`
+- listens for backend sync events on `GET /events`
+- runs periodic reconcile sync every 30 minutes by default
+- uses Windows Task Scheduler on logon
 
 For compatibility with existing 1Retro-style deployments you can also set:
 

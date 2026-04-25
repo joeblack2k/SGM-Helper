@@ -82,13 +82,22 @@ For PS1 formats, sync uses canonical normalization:
 - PS1 uploads use `device_type=retroarch`; PS2 uploads use `device_type=pcsx2`
 - slot is resolved to `Memory Card 1` or `Memory Card 2` from `--slot-name` or filename/path hints (`memory_card_1`, `Mcd001.ps2`), defaulting to `Memory Card 1`
 
+Service mode (recommended for always-on sync):
+
+```bash
+./sgm-steamdeck-helper service install
+./sgm-steamdeck-helper service status
+```
+
+The service sends backend heartbeat sensors, reacts to backend sync events, and still reconciles every 30 minutes by default.
+
 Watch mode:
 
 ```bash
 ./sgm-steamdeck-helper watch --watch-interval 30
 ```
 
-Scheduler install (every 30 min):
+Scheduler fallback (every 30 min):
 
 ```bash
 ./sgm-steamdeck-helper schedule install --every-minutes 30

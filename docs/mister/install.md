@@ -64,13 +64,22 @@ Deep scan and apply:
 ./sgm-mister-helper sync --deep-scan --apply-scan
 ```
 
+Service mode (recommended for always-on sync):
+
+```bash
+./sgm-mister-helper service install
+./sgm-mister-helper service status
+```
+
+The service sends backend heartbeat sensors, reacts to backend sync events, and still reconciles every 30 minutes by default.
+
 Watch mode:
 
 ```bash
 ./sgm-mister-helper watch --watch-interval 30
 ```
 
-Scheduler install (every 30 min):
+Scheduler fallback (every 30 min):
 
 ```bash
 ./sgm-mister-helper schedule install --every-minutes 30
