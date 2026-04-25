@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.16] - 2026-04-25
+
+### Fixed
+
+- ARM64 KNULLI/Anbernic deployments now derive helper identity from the executable name. A binary installed as `sgm-anbernic-helper` reports a RetroArch-style helper/device identity and matching User-Agent instead of the MiSTer default.
+- This keeps the backend Devices page from treating Anbernic service heartbeats as MiSTer helper telemetry while still using the shared Rust sync engine.
+
 ## [0.4.15] - 2026-04-25
 
 ### Fixed

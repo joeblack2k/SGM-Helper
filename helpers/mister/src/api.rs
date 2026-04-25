@@ -345,7 +345,7 @@ impl ApiClient {
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let user_agent = format!(
             "{}/{} SGM-Helper",
-            env!("CARGO_PKG_NAME"),
+            crate::helper_client_name(),
             env!("CARGO_PKG_VERSION")
         );
         headers.insert(

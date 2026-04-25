@@ -70,6 +70,7 @@ pub fn run() -> Result<()> {
 }
 
 fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
+    let default_source_kind = runtime_default_source_kind();
     match cli.command {
         Commands::Signup {
             email,
@@ -222,8 +223,12 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 cfg.dry_run = value;
             }
 
-            let auth =
-                ensure_auth_or_auto_enroll(&cfg, cli.verbose, cli.quiet, SourceKind::MisterFpga)?;
+            let auth = ensure_auth_or_auto_enroll(
+                &cfg,
+                cli.verbose,
+                cli.quiet,
+                default_source_kind.clone(),
+            )?;
 
             let report = run_sync(
                 &cfg,
@@ -235,7 +240,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     deep_scan,
                     apply_scan,
                     slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
-                    default_source_kind: SourceKind::MisterFpga,
+                    default_source_kind: default_source_kind.clone(),
                 },
                 cli.verbose,
             )?;
@@ -305,8 +310,12 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                 cfg.dry_run = value;
             }
 
-            let auth =
-                ensure_auth_or_auto_enroll(&cfg, cli.verbose, cli.quiet, SourceKind::MisterFpga)?;
+            let auth = ensure_auth_or_auto_enroll(
+                &cfg,
+                cli.verbose,
+                cli.quiet,
+                default_source_kind.clone(),
+            )?;
 
             run_watch(
                 &cfg,
@@ -319,7 +328,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     deep_scan,
                     apply_scan,
                     slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
-                    default_source_kind: SourceKind::MisterFpga,
+                    default_source_kind: default_source_kind.clone(),
                     max_cycles,
                 },
                 cli.verbose,
@@ -615,7 +624,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                         &cfg,
                         cli.verbose,
                         cli.quiet,
-                        SourceKind::MisterFpga,
+                        default_source_kind.clone(),
                     )?;
                     run_service(
                         &cfg,
@@ -629,7 +638,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                             deep_scan,
                             apply_scan,
                             slot_name: slot_name.unwrap_or_else(|| "default".to_string()),
-                            default_source_kind: SourceKind::MisterFpga,
+                            default_source_kind: default_source_kind.clone(),
                             max_cycles,
                         },
                         cli.verbose,
@@ -738,7 +747,7 @@ fn ensure_auth_or_auto_enroll(
         device_type: default_source_kind.helper_device_type().to_string(),
         fingerprint,
         hostname,
-        helper_name: env!("CARGO_PKG_NAME").to_string(),
+        helper_name: helper_client_name(),
         helper_version: env!("CARGO_PKG_VERSION").to_string(),
         platform: helper_platform_name(&default_source_kind).to_string(),
         sync_paths,
@@ -790,6 +799,31 @@ fn helper_hostname() -> String {
         .ok()
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| "helper".to_string())
+}
+
+pub(crate) fn helper_client_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_NAME").to_string())
+}
+
+fn runtime_default_source_kind() -> SourceKind {
+    let binary_name = helper_client_name().to_ascii_lowercase();
+    if binary_name.contains("anbernic")
+        || binary_name.contains("knulli")
+        || binary_name.contains("batocera")
+        || binary_name.contains("retroarch")
+    {
+        SourceKind::RetroArch
+    } else {
+        SourceKind::MisterFpga
+    }
 }
 
 fn helper_display_name(kind: &SourceKind) -> &'static str {

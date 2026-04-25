@@ -190,7 +190,7 @@ fn build_config_snapshot(
     Ok(serde_json::json!({
         "schemaVersion": 1,
         "helper": {
-            "name": env!("CARGO_PKG_NAME"),
+            "name": crate::helper_client_name(),
             "version": env!("CARGO_PKG_VERSION"),
             "deviceType": default_source_kind.helper_device_type(),
             "defaultKind": default_source_kind.as_str(),
