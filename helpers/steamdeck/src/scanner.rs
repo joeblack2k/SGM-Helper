@@ -68,11 +68,14 @@ const SATURN_INTERNAL_BLOCK_SIZE: usize = 0x40;
 const SATURN_CARTRIDGE_BLOCK_SIZE: usize = 0x200;
 const SATURN_ARCHIVE_ENTRY_MARKER: u32 = 0x8000_0000;
 const N64_RETROARCH_SRM_SIZE: u64 = 0x48800;
+const WII_DATA_BIN_BACKUP_HEADER_OFFSET: usize = 0xF0C0;
+const WII_DATA_BIN_FILE_HEADER_OFFSET: usize = 0xF140;
+const WII_DATA_BIN_FILE_HEADER_MAGIC: u32 = 0x03AD_F17E;
 
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "32x",
-    "sms", "gg", "cue", "iso", "chd", "gdi", "cdi", "pce", "a26", "a78", "col", "bin", "zip", "7z",
-    "pbp", "cso", "vpk",
+    "sms", "gg", "cue", "iso", "chd", "gdi", "cdi", "rvz", "wbfs", "wad", "pce", "a26", "a78",
+    "col", "bin", "zip", "7z", "pbp", "cso", "vpk",
 ];
 
 #[derive(Debug, Clone)]
@@ -207,6 +210,24 @@ pub fn filename_stem(path: &Path) -> String {
 
 pub fn known_save_extensions() -> BTreeSet<&'static str> {
     SAVE_EXTENSIONS.iter().copied().collect()
+}
+
+pub fn wii_title_code_from_path(path: &Path) -> Option<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let parts: Vec<&str> = normalized.split('/').collect();
+    for (idx, part) in parts.iter().enumerate() {
+        let Some(code) = normalize_wii_title_code(part) else {
+            continue;
+        };
+        if parts
+            .get(idx + 1)
+            .map(|value| value.eq_ignore_ascii_case("data.bin"))
+            .unwrap_or(false)
+        {
+            return Some(code);
+        }
+    }
+    None
 }
 
 pub fn infer_system_slug(path: &Path) -> Option<String> {
@@ -344,6 +365,26 @@ pub fn dreamcast_skip_reason(save_path: &Path, rom_path: Option<&Path>) -> Optio
     }
 }
 
+pub fn wii_skip_reason(save_path: &Path) -> Option<String> {
+    let ext = path_extension(save_path)?;
+    if ext != "bin" {
+        return None;
+    }
+    let lower = save_path.to_string_lossy().to_ascii_lowercase();
+    if !looks_like_wii_data_bin_path(save_path)
+        && !contains_any(
+            &lower,
+            &["/wii/", "\\wii\\", "nintendo wii", "dolphin", "rvl"],
+        )
+    {
+        return None;
+    }
+    match inspect_wii_metadata(save_path) {
+        Some(_) => None,
+        None => Some("skip_invalid_wii_data_bin".to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SaveClassification {
     pub system_slug: String,
@@ -372,6 +413,16 @@ struct SaturnMetadata {
     save_entries: usize,
     has_internal: bool,
     has_cartridge: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WiiMetadata {
+    title_code: Option<String>,
+    file_count: u32,
+    declared_data_size: u32,
+    embedded_file_name: Option<String>,
+    embedded_file_size: u32,
+    certificate_present: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +551,22 @@ pub fn classify_supported_save(
         return None;
     }
 
+    if save_ext == "bin"
+        && is_plausible_save_for_system(&save_ext, save_size, "wii")
+        && inspect_wii_metadata(save_path).is_some()
+    {
+        return classify_if_valid(
+            save_path,
+            &save_ext,
+            save_size,
+            "wii",
+            format!(
+                "wii data.bin backup header + .{} ({} bytes)",
+                save_ext, save_size
+            ),
+        );
+    }
+
     if let Some(slug) = rom_path
         .and_then(path_extension)
         .and_then(system_slug_from_rom_extension)
@@ -552,6 +619,10 @@ pub fn classify_supported_save(
             "gameboy",
             "/gb/",
             "\\gb\\",
+            "nintendo wii",
+            "/wii/",
+            "\\wii\\",
+            "rvl",
             "melonds",
             "desmume",
             "ryujinx",
@@ -747,6 +818,24 @@ fn classify_if_valid(
             metadata.has_cartridge
         );
     }
+    if slug == "wii"
+        && let Some(metadata) = inspect_wii_metadata(save_path)
+    {
+        let title_code = metadata.title_code.unwrap_or_else(|| "-".to_string());
+        let embedded_file = metadata
+            .embedded_file_name
+            .unwrap_or_else(|| "-".to_string());
+        evidence = format!(
+            "{} [wii-data-bin titleCode={} files={} declared={} embedded={} embeddedSize={} certificate={}]",
+            evidence,
+            title_code,
+            metadata.file_count,
+            metadata.declared_data_size,
+            embedded_file,
+            metadata.embedded_file_size,
+            metadata.certificate_present
+        );
+    }
     Some(SaveClassification {
         system_slug: slug.to_string(),
         evidence,
@@ -772,6 +861,7 @@ fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
         "sms" => Some("master-system"),
         "gg" => Some("game-gear"),
         "gdi" | "cdi" => Some("dreamcast"),
+        "rvz" | "wbfs" | "wad" => Some("wii"),
         "pbp" | "cso" => Some("psp"),
         "vpk" => Some("psvita"),
         _ => None,
@@ -783,6 +873,12 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 }
 
 fn infer_nintendo_slug(haystack: &str) -> &'static str {
+    if contains_any(
+        haystack,
+        &["nintendo wii", "/wii/", "\\wii\\", "dolphin", "rvl"],
+    ) {
+        return "wii";
+    }
     if contains_any(haystack, &["gameboy advance", "/gba/", "\\gba\\"]) {
         return "gba";
     }
@@ -978,6 +1074,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "saturn" => matches!(ext, "sav" | "srm" | "ram" | "bkr"),
         "dreamcast" => matches!(ext, "bin" | "vms" | "dci"),
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
+        "wii" => ext == "bin",
         "psx" => matches!(
             ext,
             "sav" | "srm" | "ram" | "mcr" | "mc" | "mcd" | "vmp" | "psv" | "gme"
@@ -1047,6 +1144,8 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             // a power-of-two size.
             size == 0x12000 || (size.is_power_of_two() && (512..=2_097_152).contains(&size))
         }
+        "wii" => (WII_DATA_BIN_FILE_HEADER_OFFSET + 0x80..=MAX_SAVE_BYTES as usize)
+            .contains(&(size as usize)),
         "psx" => {
             let size = size as usize;
             size == PS1_MEMCARD_SIZE
@@ -1070,10 +1169,130 @@ fn passes_binary_validation(save_path: &Path, save_ext: &str, save_size: u64, sl
         "dreamcast" => validate_dreamcast_container(save_path, save_ext),
         "saturn" => validate_saturn_backup_ram(save_path),
         "neogeo" => validate_non_blank_payload(save_path),
+        "wii" => validate_wii_data_bin(save_path),
         "psx" => validate_psx_container(save_path, save_ext),
         "ps2" => validate_ps2_memory_card_image(save_path),
         _ => true,
     }
+}
+
+fn validate_wii_data_bin(path: &Path) -> bool {
+    inspect_wii_metadata(path).is_some()
+}
+
+fn inspect_wii_metadata(path: &Path) -> Option<WiiMetadata> {
+    let bytes = fs::read(path).ok()?;
+    parse_wii_data_bin(&bytes, wii_title_code_from_path(path))
+}
+
+fn parse_wii_data_bin(bytes: &[u8], title_code: Option<String>) -> Option<WiiMetadata> {
+    if bytes.len() < WII_DATA_BIN_FILE_HEADER_OFFSET + 0x80 {
+        return None;
+    }
+    if bytes.iter().all(|value| *value == 0x00) || bytes.iter().all(|value| *value == 0xFF) {
+        return None;
+    }
+    if &bytes[WII_DATA_BIN_BACKUP_HEADER_OFFSET + 4..WII_DATA_BIN_BACKUP_HEADER_OFFSET + 8]
+        != b"Bk\0\x01"
+    {
+        return None;
+    }
+    let header_size = read_be_u32(bytes, WII_DATA_BIN_BACKUP_HEADER_OFFSET)?;
+    if header_size != 0x70 {
+        return None;
+    }
+    let file_count = read_be_u32(bytes, WII_DATA_BIN_BACKUP_HEADER_OFFSET + 0x0C)?;
+    if file_count == 0 || file_count > 64 {
+        return None;
+    }
+    let declared_data_size = read_be_u32(bytes, WII_DATA_BIN_BACKUP_HEADER_OFFSET + 0x10)?;
+    if declared_data_size == 0 || declared_data_size as usize > bytes.len() {
+        return None;
+    }
+    let file_header_magic = read_be_u32(bytes, WII_DATA_BIN_FILE_HEADER_OFFSET)?;
+    if file_header_magic != WII_DATA_BIN_FILE_HEADER_MAGIC {
+        return None;
+    }
+    let embedded_file_size = read_be_u32(bytes, WII_DATA_BIN_FILE_HEADER_OFFSET + 4)?;
+    if embedded_file_size == 0 || embedded_file_size as usize > bytes.len() {
+        return None;
+    }
+    let header_end = bytes.len().min(WII_DATA_BIN_FILE_HEADER_OFFSET + 0x80);
+    Some(WiiMetadata {
+        title_code,
+        file_count,
+        declared_data_size,
+        embedded_file_name: extract_wii_embedded_file_name(
+            &bytes[WII_DATA_BIN_FILE_HEADER_OFFSET..header_end],
+        ),
+        embedded_file_size,
+        certificate_present: bytes.windows(7).any(|window| window == b"Root-CA")
+            || bytes.windows(5).any(|window| window == b"AP000"),
+    })
+}
+
+fn read_be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let chunk = bytes.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes(chunk.try_into().ok()?))
+}
+
+fn extract_wii_embedded_file_name(header: &[u8]) -> Option<String> {
+    let mut best = String::new();
+    let mut start: Option<usize> = None;
+    let flush = |end: usize, start: &mut Option<usize>, best: &mut String| {
+        let Some(begin) = start.take() else {
+            return;
+        };
+        if end <= begin {
+            return;
+        }
+        let candidate = String::from_utf8_lossy(&header[begin..end])
+            .trim()
+            .to_string();
+        if candidate.len() < 3 {
+            return;
+        }
+        if !candidate.contains('.') && !candidate.contains('/') {
+            return;
+        }
+        if candidate.len() > best.len() {
+            *best = candidate;
+        }
+    };
+
+    for (idx, value) in header.iter().enumerate() {
+        if (0x20..=0x7E).contains(value) {
+            start.get_or_insert(idx);
+        } else {
+            flush(idx, &mut start, &mut best);
+        }
+    }
+    flush(header.len(), &mut start, &mut best);
+
+    if best.is_empty() { None } else { Some(best) }
+}
+
+fn normalize_wii_title_code(value: &str) -> Option<String> {
+    let clean = value.trim().to_ascii_uppercase();
+    if clean.len() != 4 {
+        return None;
+    }
+    if clean
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+    {
+        Some(clean)
+    } else {
+        None
+    }
+}
+
+fn looks_like_wii_data_bin_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("data.bin"))
+        .unwrap_or(false)
+        && wii_title_code_from_path(path).is_some()
 }
 
 fn validate_non_blank_payload(path: &Path) -> bool {
@@ -2402,6 +2621,33 @@ mod tests {
     }
 
     #[test]
+    fn wii_data_bin_is_supported_with_title_code_from_parent_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("Super Mario Galaxy 2/SB4P/data.bin");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, wii_data_bin_fixture()).unwrap();
+
+        let classification = classify_supported_save(&save, None).unwrap();
+        assert_eq!(classification.system_slug, "wii");
+        assert!(classification.evidence.contains("titleCode=SB4P"));
+        assert_eq!(wii_title_code_from_path(&save).as_deref(), Some("SB4P"));
+    }
+
+    #[test]
+    fn invalid_wii_data_bin_is_rejected_even_with_wii_path_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("private/wii/title/SB4P/data.bin");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        fs::write(&save, vec![0x44; 4096]).unwrap();
+
+        assert!(classify_supported_save(&save, None).is_none());
+        assert_eq!(
+            wii_skip_reason(&save).as_deref(),
+            Some("skip_invalid_wii_data_bin")
+        );
+    }
+
+    #[test]
     fn neogeo_mister_backup_ram_size_is_supported_when_non_blank() {
         let tmp = tempfile::tempdir().unwrap();
         let save = tmp.path().join("MiSTer/NEOGEO/mslug5.sav");
@@ -2485,5 +2731,39 @@ mod tests {
         assert_eq!(normalized.local_container, SaveContainerFormat::Native);
         assert_eq!(normalized.adapter_profile, SaveAdapterProfile::Identity);
         assert_eq!(normalized.canonical_bytes, payload);
+    }
+
+    fn wii_data_bin_fixture() -> Vec<u8> {
+        let mut payload = vec![0x5A; 75_200];
+        for (idx, value) in payload.iter_mut().enumerate() {
+            *value = ((idx * 31 + 7) & 0xFF) as u8;
+        }
+        write_be_u32(&mut payload, WII_DATA_BIN_BACKUP_HEADER_OFFSET, 0x70);
+        payload[WII_DATA_BIN_BACKUP_HEADER_OFFSET + 4..WII_DATA_BIN_BACKUP_HEADER_OFFSET + 8]
+            .copy_from_slice(b"Bk\0\x01");
+        write_be_u32(&mut payload, WII_DATA_BIN_BACKUP_HEADER_OFFSET + 0x0C, 1);
+        write_be_u32(
+            &mut payload,
+            WII_DATA_BIN_BACKUP_HEADER_OFFSET + 0x10,
+            0x3140,
+        );
+        write_be_u32(
+            &mut payload,
+            WII_DATA_BIN_FILE_HEADER_OFFSET,
+            WII_DATA_BIN_FILE_HEADER_MAGIC,
+        );
+        write_be_u32(&mut payload, WII_DATA_BIN_FILE_HEADER_OFFSET + 4, 0x30A0);
+        let name = b"GameData.bin";
+        payload[WII_DATA_BIN_FILE_HEADER_OFFSET + 0x0B
+            ..WII_DATA_BIN_FILE_HEADER_OFFSET + 0x0B + name.len()]
+            .copy_from_slice(name);
+        let cert = b"Root-CA00000001-MS00000002-NG02";
+        let offset = payload.len() - 640;
+        payload[offset..offset + cert.len()].copy_from_slice(cert);
+        payload
+    }
+
+    fn write_be_u32(payload: &mut [u8], offset: usize, value: u32) {
+        payload[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
 }

@@ -547,6 +547,7 @@ impl ApiClient {
         fingerprint: &str,
         app_password: Option<&str>,
         system_slug: Option<&str>,
+        wii_title_id: Option<&str>,
         runtime_target: Option<&RuntimeTarget>,
     ) -> Result<UploadSaveResponse> {
         let url = self.url("/saves");
@@ -573,6 +574,11 @@ impl ApiClient {
             && !system_slug.trim().is_empty()
         {
             form = form.text("system", system_slug.to_string());
+        }
+        if let Some(wii_title_id) = wii_title_id
+            && !wii_title_id.trim().is_empty()
+        {
+            form = form.text("wiiTitleId", wii_title_id.trim().to_ascii_uppercase());
         }
         if let Some(runtime_target) = runtime_target {
             form = runtime_target.apply_multipart_form(form);

@@ -12,7 +12,8 @@ use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, dreamcast_skip_reason,
     encode_download_for_local_container, filename_stem, md5_file, normalize_save_bytes_for_sync,
-    normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes,
+    normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes, wii_skip_reason,
+    wii_title_code_from_path,
 };
 use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
@@ -137,8 +138,8 @@ pub fn run_sync(
             .unwrap_or_else(|| source.kind.as_str().to_string());
 
         for save_path in save_files {
-            let stem_key = filename_stem(&save_path).to_ascii_lowercase();
-            if let Some(preferred_path) = preferred_save_by_stem.get(&stem_key)
+            let selection_key = save_selection_key(&save_path);
+            if let Some(preferred_path) = preferred_save_by_stem.get(&selection_key)
                 && preferred_path != &save_path
             {
                 report.skipped += 1;
@@ -515,6 +516,7 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "saturn"
             | "dreamcast"
             | "neogeo"
+            | "wii"
             | "psx"
             | "ps2"
             | "psp"
@@ -601,6 +603,22 @@ fn cloud_target_path(
     target_extension: Option<&str>,
 ) -> PathBuf {
     let root = select_cloud_restore_root(save_roots);
+    if system_slug == "wii"
+        && let Some(title_code) = cloud_wii_title_code(cloud_save)
+    {
+        let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
+            root.join(title_code)
+        } else {
+            root.join(preferred_system_directory_for_root(
+                root,
+                source_kind,
+                source_profile,
+                system_slug,
+            ))
+            .join(title_code)
+        };
+        return target_dir.join("data.bin");
+    }
     let filename = cloud_restore_filename(cloud_save, target_extension);
     let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
         root.to_path_buf()
@@ -622,6 +640,31 @@ fn cloud_target_path(
         ))
     };
     target_dir.join(filename)
+}
+
+fn cloud_wii_title_code(cloud_save: &CloudSaveSummary) -> Option<String> {
+    for candidate in [
+        cloud_save.card_slot.as_deref(),
+        Some(cloud_save.filename.as_str()),
+        Some(cloud_save.display_name()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let path = Path::new(candidate);
+        if let Some(code) = wii_title_code_from_path(path) {
+            return Some(code);
+        }
+        let clean = candidate.trim().to_ascii_uppercase();
+        if clean.len() == 4
+            && clean
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+        {
+            return Some(clean);
+        }
+    }
+    None
 }
 
 fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
@@ -782,6 +825,7 @@ fn mister_system_directory(system_slug: &str) -> &'static str {
         "saturn" => "Saturn",
         "dreamcast" => "Dreamcast",
         "neogeo" => "NeoGeo",
+        "wii" => "Wii",
         "psx" => "PSX",
         "ps2" => "PS2",
         "psp" => "PSP",
@@ -809,6 +853,7 @@ fn generic_system_directory(system_slug: &str) -> &'static str {
         "saturn" => "saturn",
         "dreamcast" => "dreamcast",
         "neogeo" => "neogeo",
+        "wii" => "wii",
         "psx" => "psx",
         "ps2" => "ps2",
         "psp" => "psp",
@@ -836,6 +881,7 @@ fn system_directory_aliases(system_slug: &str) -> &'static [&'static str] {
         "saturn" => &["saturn", "sega saturn"],
         "dreamcast" => &["dreamcast", "dc"],
         "neogeo" => &["neogeo", "neo geo", "mvs", "aes"],
+        "wii" => &["wii", "nintendo wii", "dolphin", "rvl"],
         "psx" => &["psx", "ps1", "playstation", "playstation 1"],
         "ps2" => &["ps2", "playstation 2"],
         "psp" => &["psp"],
@@ -904,6 +950,8 @@ fn process_single_save(
             saturn_skip_reason(save_path, rom_entry.map(|entry| entry.path.as_path()))
         {
             eprintln!("Skipping Saturn save {}: {}", save_path.display(), reason);
+        } else if let Some(reason) = wii_skip_reason(save_path) {
+            eprintln!("Skipping Wii save {}: {}", save_path.display(), reason);
         } else if verbose {
             eprintln!(
                 "Skipping non-supported save (outside allowed console families): {}",
@@ -958,6 +1006,11 @@ fn process_single_save(
         Some(dreamcast_line_key(
             &system_slug,
             device_type,
+            &effective_slot_name,
+        ))
+    } else if is_wii_system(&system_slug) {
+        Some(wii_line_key(
+            wii_title_code_from_path(save_path).as_deref(),
             &effective_slot_name,
         ))
     } else {
@@ -1075,6 +1128,7 @@ fn process_single_save(
             fingerprint,
             app_password,
             &system_slug,
+            wii_title_code_from_path(save_path).as_deref(),
             &runtime_target,
             verbose,
         );
@@ -1142,6 +1196,7 @@ fn process_single_save(
             fingerprint,
             app_password,
             &system_slug,
+            wii_title_code_from_path(save_path).as_deref(),
             &runtime_target,
             verbose,
         );
@@ -1497,6 +1552,10 @@ fn is_dreamcast_system(system_slug: &str) -> bool {
     system_slug == "dreamcast"
 }
 
+fn is_wii_system(system_slug: &str) -> bool {
+    system_slug == "wii"
+}
+
 fn helper_device_type_for_upload(
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
@@ -1797,6 +1856,10 @@ fn resolve_slot_name_for_sync(
         return infer_dreamcast_slot_from_path(save_path);
     }
 
+    if is_wii_system(system_slug) {
+        return infer_wii_slot_from_path(save_path);
+    }
+
     configured_slot.to_string()
 }
 
@@ -1861,6 +1924,17 @@ fn infer_dreamcast_slot_from_path(path: &Path) -> String {
     parse_dreamcast_slot(&text).unwrap_or_else(|| "A1".to_string())
 }
 
+fn infer_wii_slot_from_path(path: &Path) -> String {
+    wii_title_code_from_path(path)
+        .map(|code| format!("{}/data.bin", code))
+        .unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "data.bin".to_string())
+        })
+}
+
 fn playstation_line_key(system_slug: &str, device_type: &str, slot_name: &str) -> String {
     let normalized_slot = slot_name
         .trim()
@@ -1882,6 +1956,34 @@ fn dreamcast_line_key(system_slug: &str, device_type: &str, slot_name: &str) -> 
     )
 }
 
+fn wii_line_key(title_code: Option<&str>, slot_name: &str) -> String {
+    let normalized_title = title_code
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase())
+        .unwrap_or_else(|| {
+            slot_name
+                .trim()
+                .to_ascii_lowercase()
+                .replace('\\', "/")
+                .replace(' ', "-")
+        });
+    format!("wii-title:{}", normalized_title)
+}
+
+fn save_selection_key(save_path: &Path) -> String {
+    if save_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("data.bin"))
+        .unwrap_or(false)
+        && let Some(title_code) = wii_title_code_from_path(save_path)
+    {
+        return format!("wii:{}", title_code.to_ascii_lowercase());
+    }
+    filename_stem(save_path).to_ascii_lowercase()
+}
+
 fn select_preferred_save_per_stem(
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
@@ -1891,7 +1993,7 @@ fn select_preferred_save_per_stem(
     let mut selected: HashMap<String, (PathBuf, u8)> = HashMap::new();
 
     for save_path in save_files {
-        let stem_key = filename_stem(save_path).to_ascii_lowercase();
+        let stem_key = save_selection_key(save_path);
         let rom_path = rom_index.get(&stem_key).map(|entry| entry.path.as_path());
         let Some(classification) = classify_supported_save(save_path, rom_path) else {
             continue;
@@ -1978,6 +2080,7 @@ fn preferred_extension_for_system(
         | "sega-cd" | "sega-32x" | "neogeo" => preferred_extension_for_cartridge(source_profile),
         "saturn" => None,
         "n64" => preferred_extension_for_n64(source_kind, source_profile, save_size),
+        "wii" => Some("bin"),
         "nds" | "psp" | "psvita" | "ps3" | "ps4" | "ps5" => Some("sav"),
         "ps2" => Some("ps2"),
         _ => None,
@@ -2021,6 +2124,9 @@ fn is_native_n64_extension(extension: Option<&str>) -> bool {
 }
 
 fn upload_filename_for_sync(save_path: &Path, system_slug: &str) -> String {
+    if system_slug == "wii" {
+        return "data.bin".to_string();
+    }
     let file_name = save_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -2081,6 +2187,7 @@ fn upload_with_n64_mister_cpk_fallback(
     fingerprint: &str,
     app_password: Option<&str>,
     system_slug: &str,
+    wii_title_id: Option<&str>,
     runtime_target: &RuntimeTarget,
     verbose: bool,
 ) -> Result<()> {
@@ -2094,6 +2201,7 @@ fn upload_with_n64_mister_cpk_fallback(
         fingerprint,
         app_password,
         Some(system_slug),
+        wii_title_id,
         Some(runtime_target),
     );
     if let Err(err) = upload_result {
@@ -2116,6 +2224,7 @@ fn upload_with_n64_mister_cpk_fallback(
                 fingerprint,
                 app_password,
                 Some(system_slug),
+                wii_title_id,
                 Some(runtime_target),
             )?;
             return Ok(());
@@ -2595,6 +2704,44 @@ mod tests {
         assert_eq!(
             upload_filename_for_sync(&file, "n64"),
             "Mario Kart 64 (USA)_1.cpk"
+        );
+    }
+
+    #[test]
+    fn wii_slot_and_line_key_use_title_code() {
+        let file = PathBuf::from("/home/deck/Emulation/saves/wii/SB4P/data.bin");
+        assert_eq!(infer_wii_slot_from_path(&file), "SB4P/data.bin");
+        assert_eq!(
+            wii_line_key(wii_title_code_from_path(&file).as_deref(), "ignored"),
+            "wii-title:SB4P"
+        );
+        assert_eq!(upload_filename_for_sync(&file, "wii"), "data.bin");
+        assert_eq!(save_selection_key(&file), "wii:sb4p");
+    }
+
+    #[test]
+    fn cloud_restore_targets_wii_title_code_directory() {
+        let mut save = cloud_save(
+            "data.bin",
+            "Super Mario Galaxy 2",
+            "wii",
+            "original",
+            ".bin",
+        );
+        save.card_slot = Some("SB4P/data.bin".to_string());
+
+        let target = cloud_target_path(
+            &save,
+            &[PathBuf::from("/home/deck/Emulation/saves")],
+            &SourceKind::SteamDeck,
+            &EmulatorProfile::RetroArch,
+            "wii",
+            Some("bin"),
+        );
+
+        assert_eq!(
+            target.to_string_lossy(),
+            "/home/deck/Emulation/saves/wii/SB4P/data.bin"
         );
     }
 

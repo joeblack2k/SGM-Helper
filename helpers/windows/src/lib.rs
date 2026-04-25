@@ -644,7 +644,7 @@ fn ensure_auth_or_auto_enroll(
             helper_display_name(&default_source_kind),
             hostname
         ),
-        device_type: default_source_kind.as_str().to_string(),
+        device_type: default_source_kind.helper_device_type().to_string(),
         fingerprint,
         hostname,
         helper_name: env!("CARGO_PKG_NAME").to_string(),

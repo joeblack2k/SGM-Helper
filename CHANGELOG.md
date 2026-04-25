@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-04-25
+
+### Added
+
+- Wii `data.bin` support across MiSTer, Steam Deck, and Windows helpers.
+- Helpers now strictly validate official Wii SD export structure before upload, including the backup header, embedded file header, file count, declared data size, and blank/noise rejection.
+- Wii title codes are inferred from paths such as `SB4P/data.bin` and sent as `wiiTitleId`, so the backend can enrich saves like Super Mario Galaxy 2.
+- Wii sync identity now uses stable title-code slots such as `SB4P/data.bin`, and cloud restore writes back to `wii/SB4P/data.bin`.
+
+### Fixed
+
+- Auto-enroll now registers the MiSTer helper with backend device type `mister`, matching the device identity used during sync so newly generated helper keys are accepted by strict backend device binding.
+
 ## [0.4.8] - 2026-04-24
 
 ### Fixed

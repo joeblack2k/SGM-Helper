@@ -131,7 +131,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
             let api = ApiClient::new(cfg.base_url(), cfg.route_prefix.clone(), None)?;
             let token_response = if let Some(password) = password {
                 let _login = api
-                    .login_password(&cfg.email, &password, "mister-fpga", &fingerprint)
+                    .login_password(&cfg.email, &password, "mister", &fingerprint)
                     .context("email/password login faalde")?;
                 api.mint_token().context("token mint faalde na login")?
             } else {
@@ -642,7 +642,7 @@ fn ensure_auth_or_auto_enroll(
             helper_display_name(&default_source_kind),
             hostname
         ),
-        device_type: default_source_kind.as_str().to_string(),
+        device_type: default_source_kind.helper_device_type().to_string(),
         fingerprint,
         hostname,
         helper_name: env!("CARGO_PKG_NAME").to_string(),

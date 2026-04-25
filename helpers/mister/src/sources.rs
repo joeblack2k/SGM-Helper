@@ -36,6 +36,18 @@ impl SourceKind {
         }
     }
 
+    pub fn helper_device_type(&self) -> &'static str {
+        match self {
+            Self::MisterFpga => "mister",
+            Self::RetroArch => "retroarch",
+            Self::Custom => "custom",
+            Self::OpenEmu => "openemu",
+            Self::AnaloguePocket => "analogue-pocket",
+            Self::Windows => "windows",
+            Self::SteamDeck => "steamdeck",
+        }
+    }
+
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "mister-fpga" | "mister" => Some(Self::MisterFpga),
@@ -1223,6 +1235,13 @@ fn backup_corrupt(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_device_type_matches_backend_identity_names() {
+        assert_eq!(SourceKind::MisterFpga.helper_device_type(), "mister");
+        assert_eq!(SourceKind::SteamDeck.helper_device_type(), "steamdeck");
+        assert_eq!(SourceKind::Windows.helper_device_type(), "windows");
+    }
 
     #[test]
     fn default_mister_source_uses_media_fat_layout() {

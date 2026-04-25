@@ -393,7 +393,7 @@ fn sync_auto_enrolls_when_gate_is_open_without_login() {
     let auto_token = server.mock(|when, then| {
         when.method(POST)
             .path("/auth/token/app-password")
-            .body_includes("\"deviceType\":\"mister-fpga\"")
+            .body_includes("\"deviceType\":\"mister\"")
             .body_includes("\"helperName\":\"sgm-mister-helper\"");
         then.status(200)
             .header("content-type", "application/json")
