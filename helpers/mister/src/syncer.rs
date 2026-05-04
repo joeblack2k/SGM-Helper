@@ -503,6 +503,19 @@ fn restore_single_cloud_save(
     if existing_local_save_is_valid(&provisional_path, &system_slug) {
         return Ok(());
     }
+
+    let native_target_path = cloud_restore_native_target_path(
+        &provisional_path,
+        source_kind,
+        &effective_profile,
+        &system_slug,
+        cloud_save,
+    );
+    if native_target_path != provisional_path
+        && existing_local_save_is_valid(&native_target_path, &system_slug)
+    {
+        return Ok(());
+    }
     if !target_parent_allowed(&provisional_path, save_roots, create_missing_system_dirs) {
         report.skipped += 1;
         if verbose {
@@ -518,6 +531,10 @@ fn restore_single_cloud_save(
 
     let provisional_key = provisional_path.to_string_lossy().to_string();
     if restored_targets.contains(&provisional_key) {
+        return Ok(());
+    }
+    let native_target_key = native_target_path.to_string_lossy().to_string();
+    if native_target_key != provisional_key && restored_targets.contains(&native_target_key) {
         return Ok(());
     }
 
@@ -855,6 +872,23 @@ fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
         && classify_supported_save(path, None)
             .map(|classification| classification.system_slug == system_slug)
             .unwrap_or(false)
+}
+
+fn cloud_restore_native_target_path(
+    provisional_path: &Path,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    cloud_save: &CloudSaveSummary,
+) -> PathBuf {
+    preferred_save_path(
+        provisional_path,
+        source_kind,
+        source_profile,
+        Some(system_slug),
+        SaveContainerFormat::Native,
+        cloud_save.latest_size_bytes.or(cloud_save.file_size),
+    )
 }
 
 fn existing_cloud_target_for_alias(
@@ -3314,6 +3348,42 @@ mod tests {
         assert_eq!(
             final_path.to_string_lossy(),
             "/media/fat/saves/SNES/Super Mario Kart (USA).sav"
+        );
+    }
+
+    #[test]
+    fn cloud_restore_prechecks_retroarch_preferred_extension_before_download() {
+        let save = cloud_save(
+            "Super Mario Bros. Deluxe.sav",
+            "Super Mario Bros. Deluxe",
+            "gameboy",
+            "original",
+            ".sav",
+        );
+        let extension = cloud_target_extension(&save, None);
+        let provisional = cloud_target_path(
+            &save,
+            &[PathBuf::from("/userdata/saves")],
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "gameboy",
+            extension.as_deref(),
+        );
+        assert_eq!(
+            provisional.to_string_lossy(),
+            "/userdata/saves/gb/Super Mario Bros. Deluxe.sav"
+        );
+
+        let existing_target = cloud_restore_native_target_path(
+            &provisional,
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "gameboy",
+            &save,
+        );
+        assert_eq!(
+            existing_target.to_string_lossy(),
+            "/userdata/saves/gb/Super Mario Bros. Deluxe.srm"
         );
     }
 
