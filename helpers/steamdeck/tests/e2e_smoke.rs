@@ -4,6 +4,7 @@ use std::path::Path;
 use assert_cmd::Command;
 use httpmock::Method::{GET, POST};
 use httpmock::MockServer;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const PS1_MEMCARD_SIZE: usize = 131_072;
@@ -40,6 +41,20 @@ fn build_valid_ps1_memcard() -> Vec<u8> {
     bytes
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn binary_save_payload(seed: u8, len: usize) -> Vec<u8> {
+    let mut payload = vec![0u8; len];
+    for (index, value) in payload.iter_mut().enumerate() {
+        if index % 17 != 0 {
+            *value = seed.wrapping_add(index as u8);
+        }
+    }
+    payload
+}
+
 fn write_config(
     tmp: &TempDir,
     server: &MockServer,
@@ -55,6 +70,44 @@ fn write_config(
     );
     fs::write(&config_path, body).unwrap();
     config_path
+}
+
+fn write_retroarch_config(
+    tmp: &TempDir,
+    server: &MockServer,
+    root: &Path,
+    state_dir: &Path,
+    systems: &str,
+) -> std::path::PathBuf {
+    let config_path = tmp.path().join("config.ini");
+    let body = format!(
+        "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"true\"\nWATCH_INTERVAL=\"1\"\n\n[source.test_retroarch]\nLABEL=\"Test RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"{}\"\nCREATE_MISSING_SYSTEM_DIRS=\"false\"\nMANAGED=\"false\"\nORIGIN=\"test\"\n",
+        server.port(),
+        root.display(),
+        state_dir.display(),
+        root.display(),
+        root.display(),
+        systems
+    );
+    fs::write(&config_path, body).unwrap();
+    config_path
+}
+
+fn mock_login(server: &MockServer, token: &str, email: &str) {
+    let token_body = format!(r#"{{"success":true,"token":"{token}","expiresInDays":7}}"#);
+    server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(token_body);
+    });
+    let auth_body = format!(r#"{{"success":true,"user":{{"email":"{email}"}}}}"#);
+    server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(auth_body);
+    });
 }
 
 #[test]
@@ -285,4 +338,152 @@ fn sync_restores_missing_file_from_cloud_using_saved_adapter_metadata() {
     assert!(missing_save_path.exists());
     assert_eq!(fs::read(&missing_save_path).unwrap(), restored_bytes);
     assert!(download_mock.calls() >= 1);
+}
+
+#[test]
+fn sync_uses_latest_track_context_without_duplicate_upload() {
+    let server = MockServer::start();
+    mock_login(&server, "tok_latest_track", "latest-track@example.com");
+    server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"pokemon-local-rom","md5":"pokemon-md5"}}"#);
+    });
+
+    let payload = binary_save_payload(0x42, 8192);
+    let local_sha = sha256_hex(&payload);
+    let latest_body = format!(
+        r#"{{"success":true,"exists":true,"sha256":"{}","version":7,"id":"save-pokemon"}}"#,
+        local_sha
+    );
+    let latest_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("romSha1", "pokemon-local-rom")
+            .query_param("slotName", "default")
+            .query_param("filename", "Pokemon.srm")
+            .query_param("system", "gameboy")
+            .query_param("displayTitle", "Pokemon");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(latest_body);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+    let upload_mock = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"duplicate":true,"save":{"id":"save-pokemon","sha256":"unused","version":7}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(root.join("Nintendo/Pokemon.srm"), payload).unwrap();
+    let config = write_retroarch_config(&tmp, &server, &root, &state_dir, "gameboy");
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("latest-track@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .assert()
+        .success();
+
+    assert!(latest_mock.calls() >= 1);
+    assert_eq!(upload_mock.calls(), 0);
+}
+
+#[test]
+fn cloud_restore_skips_download_when_preferred_local_file_exists() {
+    let server = MockServer::start();
+    mock_login(&server, "tok_cloud_skip", "cloud-skip@example.com");
+    server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"success":true,"count":1,"rom":{"sha1":"mario-local-rom","md5":"mario-md5"}}"#,
+            );
+    });
+
+    let payload = binary_save_payload(0x24, 8192);
+    let local_sha = sha256_hex(&payload);
+    let latest_body = format!(
+        r#"{{"success":true,"exists":true,"sha256":"{}","version":3,"id":"save-mario"}}"#,
+        local_sha
+    );
+    let latest_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("romSha1", "mario-local-rom")
+            .query_param("slotName", "default")
+            .query_param("filename", "Super Mario Bros. Deluxe.srm")
+            .query_param("system", "gameboy")
+            .query_param("displayTitle", "Super Mario Bros. Deluxe");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(latest_body);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200).header("content-type", "application/json").body(
+            r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-mario","filename":"Super Mario Bros. Deluxe.sav","displayTitle":"Super Mario Bros. Deluxe","systemSlug":"gameboy","sha256":"cloud-sha","version":3,"fileSize":8192,"latestSizeBytes":8192,"downloadProfiles":[{"id":"original","label":"Original","targetExtension":".sav"}]}]}"#,
+        );
+    });
+    let download_mock = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(vec![0x99u8; 8192]);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("gb")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(root.join("gb/Super Mario Bros. Deluxe.srm"), payload).unwrap();
+    let config = write_retroarch_config(&tmp, &server, &root, &state_dir, "gameboy");
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("cloud-skip@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .assert()
+        .success();
+
+    assert!(latest_mock.calls() >= 1);
+    assert_eq!(download_mock.calls(), 0);
 }

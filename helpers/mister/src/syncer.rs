@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::api::{
-    ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveResponse, RuntimeTarget,
+    ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveResponse,
+    RuntimeTarget,
 };
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
@@ -1286,6 +1287,7 @@ fn process_single_save(
         return Ok(None);
     };
 
+    let latest_context = latest_save_context(save_path, &system_slug);
     let latest = match api.latest_save(
         &active_rom_sha1,
         &effective_slot_name,
@@ -1293,6 +1295,7 @@ fn process_single_save(
         fingerprint,
         app_password,
         Some(&runtime_target),
+        Some(&latest_context),
     ) {
         Ok(value) => value,
         Err(err) if is_legacy_n64_latest_mismatch(&err, &system_slug) => {
@@ -1376,20 +1379,23 @@ fn process_single_save(
             &runtime_target,
             verbose,
         );
-        if let Err(err) = upload_result {
-            if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
-                report.skipped += 1;
-                if verbose {
-                    eprintln!(
-                        "Skipping empty N64 controller pak {}: {}",
-                        save_path.display(),
-                        err
-                    );
+        let upload_version = match upload_result {
+            Ok(version) => version,
+            Err(err) => {
+                if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
+                    report.skipped += 1;
+                    if verbose {
+                        eprintln!(
+                            "Skipping empty N64 controller pak {}: {}",
+                            save_path.display(),
+                            err
+                        );
+                    }
+                    return Ok(None);
                 }
-                return Ok(None);
+                return Err(err);
             }
-            return Err(err);
-        }
+        };
 
         report.uploaded += 1;
         return Ok(Some(processed_entry(
@@ -1397,7 +1403,7 @@ fn process_single_save(
             synced_entry(
                 local_sha,
                 Some(active_rom_sha1.clone()),
-                latest.version,
+                upload_version.or(latest.version),
                 Some(&system_slug),
                 Some(normalized_save.local_container),
                 Some(normalized_save.adapter_profile),
@@ -1444,27 +1450,30 @@ fn process_single_save(
             &runtime_target,
             verbose,
         );
-        if let Err(err) = upload_result {
-            if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
-                report.skipped += 1;
-                if verbose {
-                    eprintln!(
-                        "Skipping empty N64 controller pak {}: {}",
-                        save_path.display(),
-                        err
-                    );
+        let upload_version = match upload_result {
+            Ok(version) => version,
+            Err(err) => {
+                if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
+                    report.skipped += 1;
+                    if verbose {
+                        eprintln!(
+                            "Skipping empty N64 controller pak {}: {}",
+                            save_path.display(),
+                            err
+                        );
+                    }
+                    return Ok(None);
                 }
-                return Ok(None);
+                return Err(err);
             }
-            return Err(err);
-        }
+        };
         report.uploaded += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
                 local_sha,
                 Some(active_rom_sha1.clone()),
-                latest.version,
+                upload_version.or(latest.version),
                 Some(&system_slug),
                 Some(normalized_save.local_container),
                 Some(normalized_save.adapter_profile),
@@ -1846,6 +1855,7 @@ fn process_missing_save(
         fingerprint,
         app_password,
         Some(&runtime_target),
+        None,
     ) {
         Ok(value) => value,
         Err(err) if is_missing_cloud_payload_reference(&err) => LatestSaveResponse {
@@ -1950,6 +1960,19 @@ fn process_missing_save(
 
 fn processed_entry(state_key: String, entry: SyncedEntry) -> ProcessedEntry {
     ProcessedEntry { state_key, entry }
+}
+
+fn latest_save_context(save_path: &Path, system_slug: &str) -> LatestSaveContext {
+    LatestSaveContext {
+        filename: save_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| upload_filename_for_sync(save_path, system_slug)),
+        system_slug: system_slug.to_string(),
+        display_title: filename_stem(save_path),
+        region_code: None,
+    }
 }
 
 fn is_playstation_system(system_slug: &str) -> bool {
@@ -2612,7 +2635,7 @@ fn upload_with_n64_mister_cpk_fallback(
     wii_title_id: Option<&str>,
     runtime_target: &RuntimeTarget,
     verbose: bool,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     let upload_result = api.upload_save(
         filename,
         bytes.to_vec(),
@@ -2626,34 +2649,37 @@ fn upload_with_n64_mister_cpk_fallback(
         wii_title_id,
         Some(runtime_target),
     );
-    if let Err(err) = upload_result {
-        if should_retry_n64_mister_cpk_as_mpk(&err, system_slug, runtime_target, filename)
-            && let Some(fallback_filename) = filename_with_extension(filename, "mpk")
-        {
-            if verbose {
-                eprintln!(
-                    "Retrying N64 controller pak upload as {} (legacy backend compatibility)",
-                    fallback_filename
-                );
+    let upload_response = match upload_result {
+        Ok(response) => response,
+        Err(err) => {
+            if should_retry_n64_mister_cpk_as_mpk(&err, system_slug, runtime_target, filename)
+                && let Some(fallback_filename) = filename_with_extension(filename, "mpk")
+            {
+                if verbose {
+                    eprintln!(
+                        "Retrying N64 controller pak upload as {} (legacy backend compatibility)",
+                        fallback_filename
+                    );
+                }
+                api.upload_save(
+                    &fallback_filename,
+                    bytes.to_vec(),
+                    rom_sha1,
+                    rom_md5,
+                    slot_name,
+                    device_type,
+                    fingerprint,
+                    app_password,
+                    Some(system_slug),
+                    wii_title_id,
+                    Some(runtime_target),
+                )?
+            } else {
+                return Err(err);
             }
-            let _retry = api.upload_save(
-                &fallback_filename,
-                bytes.to_vec(),
-                rom_sha1,
-                rom_md5,
-                slot_name,
-                device_type,
-                fingerprint,
-                app_password,
-                Some(system_slug),
-                wii_title_id,
-                Some(runtime_target),
-            )?;
-            return Ok(());
         }
-        return Err(err);
-    }
-    Ok(())
+    };
+    Ok(upload_response.save.and_then(|save| save.version))
 }
 
 fn should_retry_n64_mister_cpk_as_mpk(

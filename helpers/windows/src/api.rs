@@ -75,6 +75,14 @@ pub struct LatestSaveResponse {
     pub id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LatestSaveContext {
+    pub filename: String,
+    pub system_slug: String,
+    pub display_title: String,
+    pub region_code: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LookupRomResponse {
     pub count: Option<u64>,
@@ -210,6 +218,7 @@ pub struct DownloadProfile {
 pub struct UploadedSave {
     pub id: Option<String>,
     pub sha256: Option<String>,
+    pub version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -529,6 +538,7 @@ impl ApiClient {
         fingerprint: &str,
         app_password: Option<&str>,
         runtime_target: Option<&RuntimeTarget>,
+        context: Option<&LatestSaveContext>,
     ) -> Result<LatestSaveResponse> {
         let url = self.url("/save/latest");
         let mut request = self.client.get(url).query(&[
@@ -539,6 +549,22 @@ impl ApiClient {
         ]);
         if let Some(runtime_target) = runtime_target {
             request = runtime_target.apply_query(request);
+        }
+        if let Some(context) = context {
+            if !context.filename.trim().is_empty() {
+                request = request.query(&[("filename", context.filename.trim())]);
+            }
+            if !context.system_slug.trim().is_empty() {
+                request = request.query(&[("system", context.system_slug.trim())]);
+            }
+            if !context.display_title.trim().is_empty() {
+                request = request.query(&[("displayTitle", context.display_title.trim())]);
+            }
+            if let Some(region_code) = context.region_code.as_deref()
+                && !region_code.trim().is_empty()
+            {
+                request = request.query(&[("regionCode", region_code.trim())]);
+            }
         }
         if let Some(app_password) = app_password
             && !app_password.trim().is_empty()
