@@ -2,6 +2,7 @@ pub mod api;
 pub mod backend_config;
 pub mod cli;
 pub mod config;
+pub mod ports;
 pub mod scanner;
 pub mod scheduler;
 pub mod service;
@@ -808,6 +809,7 @@ fn helper_display_name(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::MisterFpga => "SGM MiSTer Helper",
         SourceKind::SteamDeck => "SGM SteamDeck Helper",
+        SourceKind::Ports => "SGM Ports Helper",
         SourceKind::Windows => "SGM Windows Helper",
         SourceKind::RetroArch => "SGM RetroArch Helper",
         SourceKind::OpenEmu => "SGM OpenEmu Helper",
@@ -820,6 +822,7 @@ fn helper_platform_name(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::MisterFpga => "MiSTer",
         SourceKind::SteamDeck => "SteamDeck",
+        SourceKind::Ports => "Native Ports",
         SourceKind::Windows => "Windows",
         SourceKind::RetroArch => "RetroArch",
         SourceKind::OpenEmu => "OpenEmu",

@@ -16,6 +16,7 @@ use crate::scanner::{classify_supported_save, discover_save_files, known_save_ex
 pub enum SourceKind {
     MisterFpga,
     RetroArch,
+    Ports,
     Custom,
     OpenEmu,
     AnaloguePocket,
@@ -64,11 +65,14 @@ const MISTER_SYNC_SYSTEMS: &[&str] = &[
     "psx",
 ];
 
+const PORT_SYNC_SYSTEMS: &[&str] = &["ports"];
+
 impl SourceKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::MisterFpga => "mister-fpga",
             Self::RetroArch => "retroarch",
+            Self::Ports => "ports",
             Self::Custom => "custom",
             Self::OpenEmu => "openemu",
             Self::AnaloguePocket => "analogue-pocket",
@@ -81,6 +85,7 @@ impl SourceKind {
         match self {
             Self::MisterFpga => "mister",
             Self::RetroArch => "retroarch",
+            Self::Ports => "ports",
             Self::Custom => "custom",
             Self::OpenEmu => "openemu",
             Self::AnaloguePocket => "analogue-pocket",
@@ -93,6 +98,7 @@ impl SourceKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "mister-fpga" | "mister" => Some(Self::MisterFpga),
             "retroarch" => Some(Self::RetroArch),
+            "ports" | "port" | "native-port" | "native-ports" | "decomp-ports" => Some(Self::Ports),
             "custom" => Some(Self::Custom),
             "openemu" => Some(Self::OpenEmu),
             "analogue-pocket" | "analoguepocket" => Some(Self::AnaloguePocket),
@@ -156,6 +162,7 @@ pub fn default_profile_for_kind(kind: &SourceKind) -> EmulatorProfile {
 pub fn default_systems_for_kind(kind: &SourceKind) -> Vec<String> {
     match kind {
         SourceKind::MisterFpga => system_list_from(MISTER_SYNC_SYSTEMS),
+        SourceKind::Ports => system_list_from(PORT_SYNC_SYSTEMS),
         _ => system_list_from(ALL_SYNC_SYSTEMS),
     }
 }
@@ -178,6 +185,9 @@ fn parse_systems(value: Option<&String>, kind: &SourceKind) -> Vec<String> {
         return Vec::new();
     }
     if matches!(raw, "*" | "all") || raw.eq_ignore_ascii_case("all") {
+        if matches!(kind, SourceKind::Ports) {
+            return default_systems_for_kind(kind);
+        }
         return system_list_from(ALL_SYNC_SYSTEMS);
     }
 
@@ -223,10 +233,12 @@ fn normalize_system_slug(value: &str) -> Option<String> {
         "ps3" | "playstation3" => "ps3",
         "ps4" | "playstation4" => "ps4",
         "ps5" | "playstation5" => "ps5",
+        "ports" | "port" | "nativeports" | "nativeport" | "decompports" | "decompport" => "ports",
         _ => {
             let candidate = token.split_whitespace().collect::<Vec<_>>().join("-");
             if ALL_SYNC_SYSTEMS.contains(&candidate.as_str())
                 || MISTER_SYNC_SYSTEMS.contains(&candidate.as_str())
+                || PORT_SYNC_SYSTEMS.contains(&candidate.as_str())
             {
                 return Some(candidate);
             }
@@ -720,6 +732,13 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
                 )
             }
         }
+        SourceKind::Ports => Source::new(
+            "default-ports".to_string(),
+            SourceKind::Ports,
+            vec![root.join("ports")],
+            vec![root.join("ports")],
+            true,
+        ),
         SourceKind::Custom => Source::new(
             "default-custom".to_string(),
             SourceKind::Custom,
@@ -1420,6 +1439,7 @@ mod tests {
         assert_eq!(SourceKind::MisterFpga.helper_device_type(), "mister");
         assert_eq!(SourceKind::SteamDeck.helper_device_type(), "steamdeck");
         assert_eq!(SourceKind::Windows.helper_device_type(), "windows");
+        assert_eq!(SourceKind::Ports.helper_device_type(), "ports");
     }
 
     #[test]
@@ -1433,6 +1453,8 @@ mod tests {
 
         let deck_systems = default_systems_for_kind(&SourceKind::SteamDeck);
         assert!(deck_systems.contains(&"wii".to_string()));
+        let port_systems = default_systems_for_kind(&SourceKind::Ports);
+        assert_eq!(port_systems, vec!["ports".to_string()]);
     }
 
     fn test_config(tmp: &tempfile::TempDir, root: PathBuf) -> AppConfig {

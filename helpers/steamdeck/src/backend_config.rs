@@ -239,6 +239,7 @@ pub(crate) fn capability_matrix() -> serde_json::Value {
     let kinds = [
         SourceKind::MisterFpga,
         SourceKind::RetroArch,
+        SourceKind::Ports,
         SourceKind::SteamDeck,
         SourceKind::Windows,
         SourceKind::OpenEmu,

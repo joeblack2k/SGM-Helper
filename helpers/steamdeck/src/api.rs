@@ -83,6 +83,17 @@ pub struct LatestSaveContext {
     pub region_code: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LatestSaveRequest<'a> {
+    pub rom_sha1: &'a str,
+    pub slot_name: &'a str,
+    pub device_type: &'a str,
+    pub fingerprint: &'a str,
+    pub app_password: Option<&'a str>,
+    pub runtime_target: Option<&'a RuntimeTarget>,
+    pub context: Option<&'a LatestSaveContext>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct LookupRomResponse {
     pub count: Option<u64>,
@@ -247,6 +258,18 @@ pub struct RuntimeTarget {
     pub emulator_profile: Option<String>,
     pub system_profile_key: Option<String>,
     pub system_profile_value: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortUploadMetadata {
+    pub port_id: String,
+    pub port_name: String,
+    pub origin_system_slug: String,
+    pub port_save_kind: String,
+    pub relative_path: String,
+    pub root_relative_path: String,
+    pub slot_id: String,
+    pub display_title: String,
 }
 
 impl RuntimeTarget {
@@ -530,27 +553,18 @@ impl ApiClient {
         parse_json_response(response)
     }
 
-    pub fn latest_save(
-        &self,
-        rom_sha1: &str,
-        slot_name: &str,
-        device_type: &str,
-        fingerprint: &str,
-        app_password: Option<&str>,
-        runtime_target: Option<&RuntimeTarget>,
-        context: Option<&LatestSaveContext>,
-    ) -> Result<LatestSaveResponse> {
+    pub fn latest_save(&self, params: LatestSaveRequest<'_>) -> Result<LatestSaveResponse> {
         let url = self.url("/save/latest");
         let mut request = self.client.get(url).query(&[
-            ("romSha1", rom_sha1),
-            ("slotName", slot_name),
-            ("device_type", device_type),
-            ("fingerprint", fingerprint),
+            ("romSha1", params.rom_sha1),
+            ("slotName", params.slot_name),
+            ("device_type", params.device_type),
+            ("fingerprint", params.fingerprint),
         ]);
-        if let Some(runtime_target) = runtime_target {
+        if let Some(runtime_target) = params.runtime_target {
             request = runtime_target.apply_query(request);
         }
-        if let Some(context) = context {
+        if let Some(context) = params.context {
             if !context.filename.trim().is_empty() {
                 request = request.query(&[("filename", context.filename.trim())]);
             }
@@ -566,7 +580,7 @@ impl ApiClient {
                 request = request.query(&[("regionCode", region_code.trim())]);
             }
         }
-        if let Some(app_password) = app_password
+        if let Some(app_password) = params.app_password
             && !app_password.trim().is_empty()
         {
             request = request.header("X-RSM-App-Password", app_password.trim().to_string());
@@ -589,6 +603,7 @@ impl ApiClient {
         system_slug: Option<&str>,
         wii_title_id: Option<&str>,
         runtime_target: Option<&RuntimeTarget>,
+        port_metadata: Option<&PortUploadMetadata>,
     ) -> Result<UploadSaveResponse> {
         let url = self.url("/saves");
         let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(filename.to_string());
@@ -622,6 +637,17 @@ impl ApiClient {
         }
         if let Some(runtime_target) = runtime_target {
             form = runtime_target.apply_multipart_form(form);
+        }
+        if let Some(port) = port_metadata {
+            form = form
+                .text("portId", port.port_id.clone())
+                .text("portName", port.port_name.clone())
+                .text("originSystemSlug", port.origin_system_slug.clone())
+                .text("portSaveKind", port.port_save_kind.clone())
+                .text("relativePath", port.relative_path.clone())
+                .text("rootRelativePath", port.root_relative_path.clone())
+                .text("slotId", port.slot_id.clone())
+                .text("displayTitle", port.display_title.clone());
         }
 
         let response = self

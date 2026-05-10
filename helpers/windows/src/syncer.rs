@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::api::{
-    ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveResponse,
-    RuntimeTarget,
+    ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveRequest,
+    LatestSaveResponse, RuntimeTarget,
 };
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
@@ -1288,15 +1288,15 @@ fn process_single_save(
     };
 
     let latest_context = latest_save_context(save_path, &system_slug);
-    let latest = match api.latest_save(
-        &active_rom_sha1,
-        &effective_slot_name,
+    let latest = match api.latest_save(LatestSaveRequest {
+        rom_sha1: &active_rom_sha1,
+        slot_name: &effective_slot_name,
         device_type,
         fingerprint,
         app_password,
-        Some(&runtime_target),
-        Some(&latest_context),
-    ) {
+        runtime_target: Some(&runtime_target),
+        context: Some(&latest_context),
+    }) {
         Ok(value) => value,
         Err(err) if is_legacy_n64_latest_mismatch(&err, &system_slug) => {
             if verbose {
@@ -1848,15 +1848,15 @@ fn process_missing_save(
     let runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type);
 
-    let latest = match api.latest_save(
+    let latest = match api.latest_save(LatestSaveRequest {
         rom_sha1,
-        &effective_slot_name,
+        slot_name: &effective_slot_name,
         device_type,
         fingerprint,
         app_password,
-        Some(&runtime_target),
-        None,
-    ) {
+        runtime_target: Some(&runtime_target),
+        context: None,
+    }) {
         Ok(value) => value,
         Err(err) if is_missing_cloud_payload_reference(&err) => LatestSaveResponse {
             exists: false,

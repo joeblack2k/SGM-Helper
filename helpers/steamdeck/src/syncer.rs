@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::api::{
-    ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveResponse,
-    RuntimeTarget,
+    ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveRequest,
+    LatestSaveResponse, PortUploadMetadata, RuntimeTarget,
 };
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
+use crate::ports::{PortSaveMatch, discover_port_save_matches};
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, dreamcast_skip_reason,
@@ -143,75 +144,128 @@ pub fn run_sync(
     let mut rom_hash_cache: HashMap<String, (String, String)> = HashMap::new();
 
     for source in sources {
-        let save_files = discover_save_files(&source.save_roots, source.recursive)?;
-        if verbose {
-            eprintln!(
-                "Source '{}' ({}) discovered {} save file(s)",
-                source.name,
-                source.kind.as_str(),
-                save_files.len()
-            );
-        }
-
-        let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
-        let preferred_save_by_stem =
-            select_preferred_save_per_stem(&source.kind, &source.profile, &save_files, &rom_index);
-        report.scanned += save_files.len();
-
         let fingerprint = hostname::get()
             .ok()
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| source.kind.as_str().to_string());
 
-        for save_path in save_files {
-            let selection_key = save_selection_key(&save_path);
-            if let Some(preferred_path) = preferred_save_by_stem.get(&selection_key)
-                && preferred_path != &save_path
-            {
-                report.skipped += 1;
-                if verbose {
-                    eprintln!(
-                        "Skipping duplicate save variant {} in favor of preferred {}",
-                        save_path.display(),
-                        preferred_path.display()
-                    );
-                }
-                continue;
+        if matches!(source.kind, SourceKind::Ports) {
+            let port_saves = discover_port_save_matches(&source.save_roots)?;
+            if verbose {
+                eprintln!(
+                    "Source '{}' ({}) discovered {} port progress save file(s)",
+                    source.name,
+                    source.kind.as_str(),
+                    port_saves.len()
+                );
             }
+            report.scanned += port_saves.len();
 
-            let save_key = save_path.to_string_lossy().to_string();
-            let process_result = process_single_save(
-                &api,
-                &save_path,
-                &save_key,
-                &fingerprint,
-                &source.name,
-                &source.kind,
-                &source.profile,
-                &source.systems,
-                &rom_index,
-                &mut rom_hash_cache,
-                app_password,
-                options,
-                &mut report,
-                verbose,
-            );
+            for port_save in port_saves {
+                let save_key = port_save.path.to_string_lossy().to_string();
+                let process_result = process_port_save(
+                    &api,
+                    &port_save,
+                    &save_key,
+                    &fingerprint,
+                    &source.name,
+                    &source.kind,
+                    &source.systems,
+                    app_password,
+                    options,
+                    &mut report,
+                    verbose,
+                );
 
-            match process_result {
-                Ok(processed) => {
-                    if let Some(processed) = processed {
-                        if processed.state_key != save_key {
-                            sync_state.entries.remove(&save_key);
+                match process_result {
+                    Ok(processed) => {
+                        if let Some(processed) = processed {
+                            if processed.state_key != save_key {
+                                sync_state.entries.remove(&save_key);
+                            }
+                            sync_state
+                                .entries
+                                .insert(processed.state_key, processed.entry);
                         }
-                        sync_state
-                            .entries
-                            .insert(processed.state_key, processed.entry);
+                    }
+                    Err(err) => {
+                        report.errors += 1;
+                        if verbose {
+                            eprintln!("Port sync error for {}: {}", port_save.path.display(), err);
+                        }
                     }
                 }
-                Err(err) => {
-                    report.errors += 1;
+            }
+        } else {
+            let save_files = discover_save_files(&source.save_roots, source.recursive)?;
+            if verbose {
+                eprintln!(
+                    "Source '{}' ({}) discovered {} save file(s)",
+                    source.name,
+                    source.kind.as_str(),
+                    save_files.len()
+                );
+            }
+
+            let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
+            let preferred_save_by_stem = select_preferred_save_per_stem(
+                &source.kind,
+                &source.profile,
+                &save_files,
+                &rom_index,
+            );
+            report.scanned += save_files.len();
+
+            for save_path in save_files {
+                let selection_key = save_selection_key(&save_path);
+                if let Some(preferred_path) = preferred_save_by_stem.get(&selection_key)
+                    && preferred_path != &save_path
+                {
+                    report.skipped += 1;
                     if verbose {
-                        eprintln!("Sync error for {}: {}", save_path.display(), err);
+                        eprintln!(
+                            "Skipping duplicate save variant {} in favor of preferred {}",
+                            save_path.display(),
+                            preferred_path.display()
+                        );
+                    }
+                    continue;
+                }
+
+                let save_key = save_path.to_string_lossy().to_string();
+                let process_result = process_single_save(
+                    &api,
+                    &save_path,
+                    &save_key,
+                    &fingerprint,
+                    &source.name,
+                    &source.kind,
+                    &source.profile,
+                    &source.systems,
+                    &rom_index,
+                    &mut rom_hash_cache,
+                    app_password,
+                    options,
+                    &mut report,
+                    verbose,
+                );
+
+                match process_result {
+                    Ok(processed) => {
+                        if let Some(processed) = processed {
+                            if processed.state_key != save_key {
+                                sync_state.entries.remove(&save_key);
+                            }
+                            sync_state
+                                .entries
+                                .insert(processed.state_key, processed.entry);
+                        }
+                    }
+                    Err(err) => {
+                        report.errors += 1;
+                        if verbose {
+                            eprintln!("Sync error for {}: {}", save_path.display(), err);
+                        }
                     }
                 }
             }
@@ -670,6 +724,7 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "ps3"
             | "ps4"
             | "ps5"
+            | "ports"
     )
 }
 
@@ -680,6 +735,7 @@ fn effective_profile_for_cloud_restore(
     match source_kind {
         SourceKind::MisterFpga => EmulatorProfile::Mister,
         SourceKind::RetroArch => EmulatorProfile::RetroArch,
+        SourceKind::Ports => EmulatorProfile::Generic,
         _ => source_profile.clone(),
     }
 }
@@ -749,6 +805,13 @@ fn cloud_target_path(
     target_extension: Option<&str>,
 ) -> PathBuf {
     let root = select_cloud_restore_root(save_roots);
+    if system_slug == "ports"
+        && let Some(root_relative_path) =
+            cloud_json_string(&cloud_save.metadata, "/rsm/nativePort/rootRelativePath")
+        && safe_cloud_relative_path(&root_relative_path)
+    {
+        return root.join(root_relative_path);
+    }
     if system_slug == "wii"
         && let Some(title_code) = cloud_wii_title_code(cloud_save)
     {
@@ -834,6 +897,14 @@ fn cloud_json_string(value: &Option<serde_json::Value>, pointer: &str) -> Option
         .map(ToString::to_string)
 }
 
+fn safe_cloud_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(component, std::path::Component::Normal(part) if part.to_str().map(|value| !value.trim().is_empty()).unwrap_or(false))
+        })
+}
+
 fn cloud_wii_title_code_from_evidence(value: Option<&serde_json::Value>) -> Option<String> {
     let evidence = value?.pointer("/evidence")?.as_array()?;
     for entry in evidence {
@@ -869,6 +940,9 @@ fn wii_title_code_from_candidate(candidate: &str) -> Option<String> {
 }
 
 fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
+    if system_slug == "ports" {
+        return path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false);
+    }
     path.exists()
         && classify_supported_save(path, None)
             .map(|classification| classification.system_slug == system_slug)
@@ -1133,6 +1207,276 @@ fn local_container_for_cloud_download(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn process_port_save(
+    api: &ApiClient,
+    port_save: &PortSaveMatch,
+    save_key: &str,
+    fingerprint: &str,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_systems: &[String],
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<Option<ProcessedEntry>> {
+    const PORT_SYSTEM_SLUG: &str = "ports";
+
+    if !source_allows_system(source_systems, PORT_SYSTEM_SLUG) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping {}: ports are disabled for source '{}'",
+                port_save.path.display(),
+                source_name
+            );
+        }
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&port_save.path)
+        .with_context(|| format!("kan port save niet lezen: {}", port_save.path.display()))?;
+    if bytes.is_empty() {
+        report.skipped += 1;
+        return Ok(None);
+    }
+
+    let local_sha = sha256_bytes(&bytes);
+    let state_key = save_key.to_string();
+    let rom_key = format!("port:{}", port_save.port_id);
+    let slot_name = port_save.slot_id.as_str();
+    let device_type = "ports";
+    let runtime_target = RuntimeTarget {
+        runtime_profile: Some(port_save.runtime_profile.clone()),
+        emulator_profile: Some(port_save.port_id.clone()),
+        system_profile_key: Some("portsProfile".to_string()),
+        system_profile_value: Some(port_save.runtime_profile.clone()),
+    };
+    let upload_metadata = PortUploadMetadata {
+        port_id: port_save.port_id.clone(),
+        port_name: port_save.port_name.clone(),
+        origin_system_slug: port_save.origin_system_slug.clone(),
+        port_save_kind: "progress".to_string(),
+        relative_path: port_save.relative_path.clone(),
+        root_relative_path: port_save.root_relative_path.clone(),
+        slot_id: port_save.slot_id.clone(),
+        display_title: port_save.display_title.clone(),
+    };
+    let latest_context = LatestSaveContext {
+        filename: port_save
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "port-save.sav".to_string()),
+        system_slug: PORT_SYSTEM_SLUG.to_string(),
+        display_title: port_save.display_title.clone(),
+        region_code: None,
+    };
+
+    if verbose {
+        eprintln!(
+            "Detected native port save {} [{}:{}]",
+            port_save.path.display(),
+            port_save.port_id,
+            port_save.slot_id
+        );
+    }
+
+    let latest = api.latest_save(LatestSaveRequest {
+        rom_sha1: &rom_key,
+        slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+        runtime_target: Some(&runtime_target),
+        context: Some(&latest_context),
+    })?;
+
+    let upload_port_save = |report: &mut SyncReport| -> Result<Option<ProcessedEntry>> {
+        if options.dry_run {
+            report.uploaded += 1;
+            return Ok(Some(processed_entry(
+                state_key.clone(),
+                synced_entry(
+                    local_sha.clone(),
+                    Some(rom_key.clone()),
+                    latest.version,
+                    Some(PORT_SYSTEM_SLUG),
+                    Some(SaveContainerFormat::Native),
+                    Some(SaveAdapterProfile::Identity),
+                    Some(source_kind),
+                    Some(source_name),
+                    Some(slot_name),
+                ),
+            )));
+        }
+
+        let filename = port_save
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("port-save.sav");
+        let response = api.upload_save(
+            filename,
+            bytes.clone(),
+            &rom_key,
+            None,
+            slot_name,
+            device_type,
+            fingerprint,
+            app_password,
+            Some(PORT_SYSTEM_SLUG),
+            None,
+            Some(&runtime_target),
+            Some(&upload_metadata),
+        )?;
+        report.uploaded += 1;
+        Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha.clone(),
+                Some(rom_key.clone()),
+                response
+                    .save
+                    .and_then(|save| save.version)
+                    .or(latest.version),
+                Some(PORT_SYSTEM_SLUG),
+                Some(SaveContainerFormat::Native),
+                Some(SaveAdapterProfile::Identity),
+                Some(source_kind),
+                Some(source_name),
+                Some(slot_name),
+            ),
+        )))
+    };
+
+    if !latest.exists || options.force_upload {
+        return upload_port_save(report);
+    }
+
+    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
+        report.in_sync += 1;
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(rom_key),
+                latest.version,
+                Some(PORT_SYSTEM_SLUG),
+                Some(SaveContainerFormat::Native),
+                Some(SaveAdapterProfile::Identity),
+                Some(source_kind),
+                Some(source_name),
+                Some(slot_name),
+            ),
+        )));
+    }
+
+    let conflict = api.conflict_check(
+        &rom_key,
+        slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+        Some(&runtime_target),
+    )?;
+    if conflict.exists {
+        if !options.dry_run {
+            let cloud_sha = conflict
+                .cloud_sha256
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let device_name = format!("{} ({})", source_kind.as_str(), source_name);
+            let filename = port_save
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("port-save.sav");
+            let _ = api.conflict_report(
+                filename,
+                bytes,
+                &rom_key,
+                slot_name,
+                &local_sha,
+                &cloud_sha,
+                &device_name,
+                device_type,
+                fingerprint,
+                app_password,
+                Some(&runtime_target),
+            )?;
+        }
+        report.conflicts += 1;
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(rom_key),
+                latest.version,
+                Some(PORT_SYSTEM_SLUG),
+                Some(SaveContainerFormat::Native),
+                Some(SaveAdapterProfile::Identity),
+                Some(source_kind),
+                Some(source_name),
+                Some(slot_name),
+            ),
+        )));
+    }
+
+    let Some(save_id) = latest.id.as_deref() else {
+        report.skipped += 1;
+        return Ok(None);
+    };
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            synced_entry(
+                local_sha,
+                Some(rom_key),
+                latest.version,
+                Some(PORT_SYSTEM_SLUG),
+                Some(SaveContainerFormat::Native),
+                Some(SaveAdapterProfile::Identity),
+                Some(source_kind),
+                Some(source_name),
+                Some(slot_name),
+            ),
+        )));
+    }
+
+    let cloud_bytes = api.download_save(
+        save_id,
+        device_type,
+        fingerprint,
+        app_password,
+        Some(&runtime_target),
+    )?;
+    fs::write(&port_save.path, &cloud_bytes).with_context(|| {
+        format!(
+            "kan port save niet overschrijven: {}",
+            port_save.path.display()
+        )
+    })?;
+    report.downloaded += 1;
+    Ok(Some(processed_entry(
+        state_key,
+        synced_entry(
+            sha256_bytes(&cloud_bytes),
+            Some(rom_key),
+            latest.version,
+            Some(PORT_SYSTEM_SLUG),
+            Some(SaveContainerFormat::Native),
+            Some(SaveAdapterProfile::Identity),
+            Some(source_kind),
+            Some(source_name),
+            Some(slot_name),
+        ),
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn process_single_save(
     api: &ApiClient,
     save_path: &std::path::Path,
@@ -1288,15 +1632,15 @@ fn process_single_save(
     };
 
     let latest_context = latest_save_context(save_path, &system_slug);
-    let latest = match api.latest_save(
-        &active_rom_sha1,
-        &effective_slot_name,
+    let latest = match api.latest_save(LatestSaveRequest {
+        rom_sha1: &active_rom_sha1,
+        slot_name: &effective_slot_name,
         device_type,
         fingerprint,
         app_password,
-        Some(&runtime_target),
-        Some(&latest_context),
-    ) {
+        runtime_target: Some(&runtime_target),
+        context: Some(&latest_context),
+    }) {
         Ok(value) => value,
         Err(err) if is_legacy_n64_latest_mismatch(&err, &system_slug) => {
             if verbose {
@@ -1548,6 +1892,7 @@ fn process_single_save(
                 Some(&system_slug),
                 wii_title_code_from_path(save_path).as_deref(),
                 Some(&runtime_target),
+                None,
             )?;
             report.uploaded += 1;
             return Ok(Some(processed_entry(
@@ -1605,6 +1950,7 @@ fn process_single_save(
                     Some(&system_slug),
                     wii_title_code_from_path(save_path).as_deref(),
                     Some(&runtime_target),
+                    None,
                 )?;
                 report.uploaded += 1;
                 return Ok(Some(processed_entry(
@@ -1697,6 +2043,7 @@ fn process_single_save(
                     Some(&system_slug),
                     wii_title_code_from_path(save_path).as_deref(),
                     Some(&runtime_target),
+                    None,
                 )?;
                 report.uploaded += 1;
                 return Ok(Some(processed_entry(
@@ -1848,15 +2195,15 @@ fn process_missing_save(
     let runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type);
 
-    let latest = match api.latest_save(
+    let latest = match api.latest_save(LatestSaveRequest {
         rom_sha1,
-        &effective_slot_name,
+        slot_name: &effective_slot_name,
         device_type,
         fingerprint,
         app_password,
-        Some(&runtime_target),
-        None,
-    ) {
+        runtime_target: Some(&runtime_target),
+        context: None,
+    }) {
         Ok(value) => value,
         Err(err) if is_missing_cloud_payload_reference(&err) => LatestSaveResponse {
             exists: false,
@@ -2008,6 +2355,7 @@ fn helper_device_type_for_upload(
     match source_kind {
         SourceKind::MisterFpga => "mister",
         SourceKind::RetroArch => "retroarch",
+        SourceKind::Ports => "ports",
         SourceKind::Custom => "custom",
         SourceKind::OpenEmu => "openemu",
         SourceKind::AnaloguePocket => "analogue-pocket",
@@ -2059,6 +2407,7 @@ fn projection_runtime_profile_for_system(
         SourceKind::MisterFpga => "mister",
         SourceKind::RetroArch => "retroarch",
         SourceKind::Custom | SourceKind::OpenEmu | SourceKind::AnaloguePocket => "generic",
+        SourceKind::Ports => "ports",
         SourceKind::Windows | SourceKind::SteamDeck => "generic",
     };
 
@@ -2182,6 +2531,7 @@ fn effective_profile_for_save(
         SourceKind::MisterFpga => return EmulatorProfile::Mister,
         SourceKind::RetroArch => return EmulatorProfile::RetroArch,
         SourceKind::Custom
+        | SourceKind::Ports
         | SourceKind::OpenEmu
         | SourceKind::AnaloguePocket
         | SourceKind::Windows
@@ -2648,6 +2998,7 @@ fn upload_with_n64_mister_cpk_fallback(
         Some(system_slug),
         wii_title_id,
         Some(runtime_target),
+        None,
     );
     let upload_response = match upload_result {
         Ok(response) => response,
@@ -2673,6 +3024,7 @@ fn upload_with_n64_mister_cpk_fallback(
                     Some(system_slug),
                     wii_title_id,
                     Some(runtime_target),
+                    None,
                 )?
             } else {
                 return Err(err);
