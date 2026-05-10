@@ -85,7 +85,7 @@ impl SourceKind {
         match self {
             Self::MisterFpga => "mister",
             Self::RetroArch => "retroarch",
-            Self::Ports => "ports",
+            Self::Ports => "steamdeck",
             Self::Custom => "custom",
             Self::OpenEmu => "openemu",
             Self::AnaloguePocket => "analogue-pocket",
@@ -1439,7 +1439,7 @@ mod tests {
         assert_eq!(SourceKind::MisterFpga.helper_device_type(), "mister");
         assert_eq!(SourceKind::SteamDeck.helper_device_type(), "steamdeck");
         assert_eq!(SourceKind::Windows.helper_device_type(), "windows");
-        assert_eq!(SourceKind::Ports.helper_device_type(), "ports");
+        assert_eq!(SourceKind::Ports.helper_device_type(), "steamdeck");
     }
 
     #[test]

@@ -1245,7 +1245,7 @@ fn process_port_save(
     let state_key = save_key.to_string();
     let rom_key = format!("port:{}", port_save.port_id);
     let slot_name = port_save.slot_id.as_str();
-    let device_type = "ports";
+    let device_type = SourceKind::SteamDeck.helper_device_type();
     let runtime_target = RuntimeTarget {
         runtime_profile: Some(port_save.runtime_profile.clone()),
         emulator_profile: Some(port_save.port_id.clone()),
@@ -2355,7 +2355,7 @@ fn helper_device_type_for_upload(
     match source_kind {
         SourceKind::MisterFpga => "mister",
         SourceKind::RetroArch => "retroarch",
-        SourceKind::Ports => "ports",
+        SourceKind::Ports => SourceKind::SteamDeck.helper_device_type(),
         SourceKind::Custom => "custom",
         SourceKind::OpenEmu => "openemu",
         SourceKind::AnaloguePocket => "analogue-pocket",
