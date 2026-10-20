@@ -19,6 +19,7 @@ pub struct ConfigOverrides {
     pub force_upload: Option<bool>,
     pub dry_run: Option<bool>,
     pub route_prefix: Option<String>,
+    pub secure: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,7 @@ pub struct AppConfig {
     pub force_upload: bool,
     pub dry_run: bool,
     pub route_prefix: String,
+    pub secure: bool,
     pub binary_dir: PathBuf,
     pub config_path: PathBuf,
 }
@@ -70,7 +72,8 @@ impl LoadedConfig {
 
 impl AppConfig {
     pub fn base_url(&self) -> String {
-        format!("http://{}:{}", self.url, self.port)
+        let scheme = if self.secure { "https" } else { "http" };
+        format!("{}://{}:{}", scheme, self.url, self.port)
     }
 
     pub fn resolved_root(&self) -> Result<PathBuf> {
@@ -95,10 +98,13 @@ impl AppConfig {
             .or_else(|| env_values.get("API_URL").cloned())
             .or_else(|| ini_values.get("API_URL").cloned())
         {
-            let (url, port) = parse_api_url_host_port(&api_url)?;
+            let (url, port, scheme_secure) = parse_api_url_host_port(&api_url)?;
             let mut merged_overrides = overrides.clone();
             merged_overrides.url = Some(url);
             merged_overrides.port = Some(port);
+            if scheme_secure.is_some() {
+                merged_overrides.secure = scheme_secure;
+            }
             merged_overrides.api_url = None;
             return AppConfig::from_sources(
                 &merged_overrides,
@@ -164,6 +170,7 @@ impl AppConfig {
             "ROUTE_PREFIX",
             "",
         )?);
+        let secure = choose_bool(overrides.secure, env_values, ini_values, "SECURE", false)?;
 
         if watch_interval == 0 {
             bail!("WATCH_INTERVAL moet >= 1 zijn");
@@ -181,6 +188,7 @@ impl AppConfig {
             force_upload,
             dry_run,
             route_prefix,
+            secure,
             binary_dir,
             config_path: config_path.to_path_buf(),
         })
@@ -249,23 +257,29 @@ fn parse_ini_content(content: &str) -> Result<HashMap<String, String>> {
     Ok(values)
 }
 
+/// Every setting the helper reads from the environment. `SECURE` belongs here: without it an
+/// HTTPS endpoint could only ever be configured through `config.ini`, and an env-only deployment
+/// would silently fall back to plain HTTP.
+const ENV_KEYS: &[&str] = &[
+    "ONE_RETRO_API_URL",
+    "API_URL",
+    "URL",
+    "PORT",
+    "EMAIL",
+    "APP_PASSWORD",
+    "ROOT",
+    "STATE_DIR",
+    "WATCH",
+    "WATCH_INTERVAL",
+    "FORCE_UPLOAD",
+    "DRY_RUN",
+    "ROUTE_PREFIX",
+    "SECURE",
+];
+
 fn collect_env_values() -> HashMap<String, String> {
     let mut values = HashMap::new();
-    for key in [
-        "ONE_RETRO_API_URL",
-        "API_URL",
-        "URL",
-        "PORT",
-        "EMAIL",
-        "APP_PASSWORD",
-        "ROOT",
-        "STATE_DIR",
-        "WATCH",
-        "WATCH_INTERVAL",
-        "FORCE_UPLOAD",
-        "DRY_RUN",
-        "ROUTE_PREFIX",
-    ] {
+    for key in ENV_KEYS {
         if let Some(value) = read_env_aliases(key) {
             values.insert(key.to_string(), value);
         }
@@ -394,15 +408,19 @@ fn validate_host_only(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_api_url_host_port(value: &str) -> Result<(String, u16)> {
+fn parse_api_url_host_port(value: &str) -> Result<(String, u16, Option<bool>)> {
     let raw = value.trim();
     if raw.is_empty() {
         bail!("API_URL/ONE_RETRO_API_URL mag niet leeg zijn");
     }
-    let without_scheme = raw
-        .strip_prefix("http://")
-        .or_else(|| raw.strip_prefix("https://"))
-        .unwrap_or(raw);
+    // An explicit scheme selects the transport; without one we leave SECURE alone.
+    let (without_scheme, scheme_secure) = if let Some(rest) = raw.strip_prefix("https://") {
+        (rest, Some(true))
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        (rest, Some(false))
+    } else {
+        (raw, None)
+    };
     let authority = without_scheme
         .split('/')
         .next()
@@ -418,10 +436,11 @@ fn parse_api_url_host_port(value: &str) -> Result<(String, u16)> {
             .with_context(|| "ongeldige poort in API_URL/ONE_RETRO_API_URL")?;
         (host.to_string(), parsed_port)
     } else {
-        (authority.to_string(), 80)
+        let default_port = if scheme_secure == Some(true) { 443 } else { 80 };
+        (authority.to_string(), default_port)
     };
     validate_host_only(&host)?;
-    Ok((host, port))
+    Ok((host, port, scheme_secure))
 }
 
 fn normalize_route_prefix(prefix: &str) -> String {
@@ -496,6 +515,100 @@ SAVE_PATH="/home/snes9x/save"
         )
         .unwrap();
         assert_eq!(cfg.base_url(), "http://192.168.1.9:9096");
+    }
+
+    #[test]
+    fn base_url_uses_https_when_secure_true() {
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[
+                ("URL", "saves.example.com"),
+                ("PORT", "443"),
+                ("SECURE", "true"),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url(), "https://saves.example.com:443");
+        assert!(cfg.secure);
+    }
+
+    #[test]
+    fn base_url_remains_http_when_secure_unset_for_backwards_compat() {
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[("URL", "192.168.1.9"), ("PORT", "9096")],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url(), "http://192.168.1.9:9096");
+        assert!(!cfg.secure);
+    }
+
+    #[test]
+    fn env_keys_include_secure() {
+        assert!(ENV_KEYS.contains(&"SECURE"));
+    }
+
+    #[test]
+    fn api_url_with_https_scheme_selects_https_and_port_443() {
+        let cfg = test_sources(
+            ConfigOverrides {
+                api_url: Some("https://saves.example.com".to_string()),
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url(), "https://saves.example.com:443");
+        assert!(cfg.secure);
+    }
+
+    #[test]
+    fn api_url_with_http_scheme_selects_http_and_port_80() {
+        let cfg = test_sources(
+            ConfigOverrides {
+                api_url: Some("http://helper.example.com".to_string()),
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url(), "http://helper.example.com:80");
+        assert!(!cfg.secure);
+    }
+
+    #[test]
+    fn api_url_without_scheme_leaves_secure_alone() {
+        let cfg = test_sources(
+            ConfigOverrides {
+                api_url: Some("helper.example.com:9096".to_string()),
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url(), "http://helper.example.com:9096");
+        assert!(!cfg.secure);
+    }
+
+    #[test]
+    fn secure_from_environment_uses_https() {
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[
+                ("URL", "saves.example.com"),
+                ("PORT", "443"),
+                ("SECURE", "true"),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url(), "https://saves.example.com:443");
+        assert!(cfg.secure);
     }
 
     #[test]

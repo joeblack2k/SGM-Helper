@@ -1438,6 +1438,7 @@ mod tests {
     #[test]
     fn default_mister_source_uses_media_fat_layout() {
         let cfg = AppConfig {
+            secure: false,
             url: "127.0.0.1".to_string(),
             port: 3001,
             email: String::new(),
