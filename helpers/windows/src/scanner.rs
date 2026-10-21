@@ -582,8 +582,18 @@ pub fn classify_supported_save(
     }
 
     let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
-    if contains_any(&save_lower, &["gameboy advance", "/gba/", "\\gba\\"]) {
-        if is_plausible_save_for_system(&save_ext, save_size, "gba") {
+    if contains_any(
+        &save_lower,
+        &[
+            "gameboy advance",
+            "game boy advance",
+            "mgba",
+            "visualboyadvance",
+            "vba",
+            "/gba/",
+            "\\gba\\",
+        ],
+    ) {        if is_plausible_save_for_system(&save_ext, save_size, "gba") {
             return classify_if_valid(
                 save_path,
                 &save_ext,
@@ -627,6 +637,10 @@ pub fn classify_supported_save(
             "desmume",
             "ryujinx",
             "citra",
+            "n3ds",
+            "/3ds/",
+            "\\3ds\\",
+            "azahar",
             "yuzu",
             "suyu",
             "dolphin",
@@ -640,7 +654,11 @@ pub fn classify_supported_save(
             "nintendo",
         ],
     ) {
-        let slug = infer_nintendo_slug(&save_lower);
+        let Some(slug) = infer_nintendo_slug(&save_lower) else {
+            // No core name matched: leave the save unclassified rather than
+            // labelling it Game Boy, which is a wrong answer rather than a missing one.
+            return None;
+        };
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
             return classify_if_valid(
                 save_path,
@@ -872,32 +890,66 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-fn infer_nintendo_slug(haystack: &str) -> &'static str {
+fn infer_nintendo_slug(haystack: &str) -> Option<&'static str> {
     if contains_any(
         haystack,
         &["nintendo wii", "/wii/", "\\wii\\", "dolphin", "rvl"],
     ) {
-        return "wii";
-    }
-    if contains_any(haystack, &["gameboy advance", "/gba/", "\\gba\\"]) {
-        return "gba";
-    }
-    if contains_any(haystack, &["nintendo ds", "/nds/", "\\nds\\"]) {
-        return "nds";
-    }
-    if contains_any(haystack, &["nintendo 64", "/n64/", "\\n64\\"]) {
-        return "n64";
+        return Some("wii");
     }
     if contains_any(
         haystack,
-        &["super nintendo", "/snes/", "\\snes\\", "/sfc/", "\\sfc\\"],
+        &[
+            "gameboy advance",
+            "game boy advance",
+            "mgba",
+            "visualboyadvance",
+            "vba",
+            "/gba/",
+            "\\gba\\",
+        ],
     ) {
-        return "snes";
+        return Some("gba");
     }
-    if contains_any(haystack, &["famicom", "/nes/", "\\nes\\"]) {
-        return "nes";
+    if contains_any(
+        haystack,
+        &["game boy", "gameboy", "/gb/", "\\gb\\", "/gbc/", "\\gbc\\"],
+    ) {
+        return Some("gameboy");
     }
-    "gameboy"
+    if contains_any(
+        haystack,
+        &["nintendo ds", "/nds/", "\\nds\\", "melonds", "desmume"],
+    ) {
+        return Some("nds");
+    }
+    if contains_any(
+        haystack,
+        &["nintendo 64", "/n64/", "\\n64\\", "mupen", "project64"],
+    ) {
+        return Some("n64");
+    }
+    if contains_any(
+        haystack,
+        &[
+            "super nintendo", "/snes/", "\\snes\\", "/sfc/", "\\sfc\\", "snes9x", "bsnes",
+        ],
+    ) {
+        return Some("snes");
+    }
+    if contains_any(
+        haystack,
+        &["famicom", "/nes/", "\\nes\\", "fceux", "fceumm", "nestopia"],
+    ) {
+        return Some("nes");
+    }
+    if contains_any(
+        haystack,
+        &["n3ds", "/3ds/", "\\3ds\\", "azahar", "citra"],
+    ) {
+        return Some("3ds");
+    }
+    None
 }
 
 fn infer_sega_slug(haystack: &str) -> &'static str {
@@ -1067,6 +1119,9 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "gba" => matches!(ext, "sav" | "srm" | "sa1"),
         "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk" | "cpk" | "srm"),
         "nds" => matches!(ext, "sav" | "dsv"),
+        // Azahar/Citra store per-title save data under nand/ and sdmc/; the
+        // extension set is unverified against a device listing.
+        "3ds" => matches!(ext, "sav" | "dsv" | "dat" | "bin"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
             matches!(ext, "sav" | "srm" | "ram")
@@ -1080,7 +1135,10 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             "sav" | "srm" | "ram" | "mcr" | "mc" | "mcd" | "vmp" | "psv" | "gme"
         ),
         "ps2" => matches!(ext, "ps2" | "bin"),
-        "psp" | "psvita" | "ps3" | "ps4" | "ps5" => matches!(ext, "sav" | "srm" | "ram"),
+        // PPSSPP keeps each game's save in a SAVEDATA/<GAMECODE>/ directory and
+        // the payload is a .bin inside it, which is the file the helper syncs.
+        "psp" => matches!(ext, "sav" | "srm" | "ram" | "bin"),
+        "psvita" | "ps3" | "ps4" | "ps5" => matches!(ext, "sav" | "srm" | "ram"),
         _ => false,
     };
     if !extension_ok {
@@ -2185,6 +2243,21 @@ fn looks_plain_text(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::infer_nintendo_slug;
+
+    #[test]
+    fn core_directory_names_resolve_to_their_system() {
+        // The directory list admits core names, so the classifier has to know them
+        // too, or a path the vocabulary misses is left unclassified.
+        // The caller lowercases the path before classifying.
+        assert_eq!(infer_nintendo_slug("/saves/snes9x"), Some("snes"));
+        assert_eq!(infer_nintendo_slug("/saves/bsnes"), Some("snes"));
+        assert_eq!(infer_nintendo_slug("/saves/fceumm"), Some("nes"));
+        assert_eq!(infer_nintendo_slug("/saves/mgba"), Some("gba"));
+        assert_eq!(infer_nintendo_slug("/saves/desmume"), Some("nds"));
+        assert_eq!(infer_nintendo_slug("/saves/mupen64plus-next opengl"), Some("n64"));
+        assert_eq!(infer_nintendo_slug("/saves/gb/pokemon.sav"), Some("gameboy"));
+    }
     use super::*;
     use std::fs;
     use std::io::Write;
@@ -2441,6 +2514,88 @@ mod tests {
         fs::write(&save, [0x00u8; 1024]).unwrap();
 
         assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn game_boy_path_hints_classify_as_gameboy() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in ["saves/Game Boy", "saves/gb", "saves/Game Boy Color"] {
+            let save = tmp.path().join(hint).join("Pokemon Red.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert_eq!(
+                infer_supported_console_slug(&save, None).as_deref(),
+                Some("gameboy"),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn game_boy_advance_path_hints_classify_as_gba() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in [
+            "saves/Game Boy Advance",
+            "saves/gba",
+            "saves/VisualBoyAdvance",
+        ] {
+            let save = tmp.path().join(hint).join("Metroid Fusion.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert_eq!(
+                infer_supported_console_slug(&save, None).as_deref(),
+                Some("gba"),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn nintendo_hint_without_a_known_system_is_unclassified() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in ["saves/Nintendo", "saves/ryujinx"] {
+            let save = tmp.path().join(hint).join("Pokemon.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert!(
+                infer_supported_console_slug(&save, None).is_none(),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn ppsspp_savedata_bin_classifies_as_psp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp
+            .path()
+            .join("ppsspp_win/memstick/PSP/SAVEDATA/ULUS10437GameData00/DISSIDIA.BIN");
+        fs::create_dir_all(save.parent().unwrap()).unwrap();
+        let mut payload = vec![0x00u8; 500_000];
+        payload[0] = 0xFF;
+        fs::write(&save, &payload).unwrap();
+
+        assert_eq!(
+            infer_supported_console_slug(&save, None).as_deref(),
+            Some("psp")
+        );
+    }
+
+    #[test]
+    fn azahar_and_n3ds_paths_resolve_to_the_3ds_slug() {
+        assert_eq!(
+            infer_nintendo_slug("/saves/n3ds/azahar/nand/title/00040000"),
+            Some("3ds")
+        );
+        assert_eq!(
+            infer_nintendo_slug("/saves/n3ds/azahar/sdmc/Nintendo 3DS"),
+            Some("3ds")
+        );
+        assert_eq!(infer_nintendo_slug("/saves/3ds/citra"), Some("3ds"));
+        assert_eq!(infer_nintendo_slug("/saves/gb/pokemon.sav"), Some("gameboy"));
     }
 
     #[test]
