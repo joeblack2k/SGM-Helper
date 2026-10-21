@@ -162,6 +162,184 @@ fn login_with_password_uses_login_and_token_endpoints() {
 }
 
 #[test]
+fn backend_forced_dry_run_marks_the_summary_and_uploads_nothing() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_dry","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"dry@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"success":true,"count":1,"rom":{"sha1":"dry123","md5":"md5v","fileName":"wario.sav"}}"#,
+            );
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _config_sync = server.mock(|when, then| {
+        when.method(POST).path("/helpers/config/sync");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"accepted":true,"global":{"dryRun":true}}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-dry","sha256":"sha-dry"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("Nintendo/Game Boy/wario.sav"),
+        vec![0x00u8; 32768],
+    )
+    .unwrap();
+    // A save the classifier cannot place: skipped before any write is decided.
+    fs::create_dir_all(root.join("misc")).unwrap();
+    fs::write(root.join("misc/unknown.sav"), vec![0x00u8; 32768]).unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("dry@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "sync failed: {stdout}");
+    assert!(
+        stdout.contains("Sync complete (DRY RUN)"),
+        "summary line carries no dry-run marker: {stdout}"
+    );
+    assert!(
+        stdout.contains("uploaded=0 downloaded=0"),
+        "dry run counted a simulation as work done: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "skipped=1 rejected_n64_controller_pak=0 accepted_not_stored=0 \
+             errors=0 would_upload=1 would_download=0"
+        ),
+        "a skipped save was counted as a simulated upload, or the simulation was missed: {stdout}"
+    );
+    assert_eq!(upload.calls(), 0);
+}
+
+#[test]
+fn port_save_dry_run_counts_a_simulation_not_an_upload() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_port","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"port@example.com"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-port","sha256":"sha-port"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    let port_save = root.join("ports/OcarinaOfTime/Save/global.sav");
+    fs::create_dir_all(port_save.parent().unwrap()).unwrap();
+    fs::write(&port_save, vec![0x00u8; 4096]).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+
+    let config = tmp.path().join("config.ini");
+    let ports_root = root.join("ports");
+    let body = format!(
+        "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"true\"\nWATCH_INTERVAL=\"1\"\n\n[source.ports]\nLABEL=\"Ports\"\nKIND=\"ports\"\nSAVE_PATH=\"{}\"\n",
+        server.port(),
+        root.display(),
+        state_dir.display(),
+        ports_root.display()
+    );
+    fs::write(&config, body).unwrap();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("port@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "sync failed: {stdout}");
+    assert!(
+        stdout.contains("uploaded=0 downloaded=0"),
+        "dry run counted a simulation as work done: {stdout}"
+    );
+    assert!(
+        stdout.contains("would_upload=1"),
+        "the port-save dry run did not count the upload it skipped: {stdout}"
+    );
+    assert_eq!(upload.calls(), 0);
+}
+
+#[test]
 fn sync_uploads_when_no_cloud_save_exists() {
     let server = MockServer::start();
     let _token = server.mock(|when, then| {
