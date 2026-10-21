@@ -35,11 +35,25 @@ pub struct SyncOptions {
 pub struct SyncReport {
     pub scanned: usize,
     pub uploaded: usize,
+    pub would_upload: usize,
     pub downloaded: usize,
+    pub would_download: usize,
     pub in_sync: usize,
     pub conflicts: usize,
     pub skipped: usize,
+    /// The server refused an N64 controller-pak upload. Counted apart from
+    /// `skipped`, which also holds saves with nothing to do, and apart from
+    /// `errors`, which holds refusals and failures on every other system.
+    pub rejected_n64_controller_pak: usize,
+    /// The server answered 2xx but returned no save, so nothing was stored.
+    pub accepted_not_stored: usize,
     pub errors: usize,
+    pub dry_run: bool,
+}
+
+/// Marks a summary whose counters describe what would have happened, not what did.
+pub fn dry_run_marker(report: &SyncReport) -> &'static str {
+    if report.dry_run { " (DRY RUN)" } else { "" }
 }
 
 struct ProcessedEntry {
@@ -227,7 +241,10 @@ pub fn run_sync(
     }
     let options = &effective_options;
 
-    let mut report = SyncReport::default();
+    let mut report = SyncReport {
+        dry_run: options.dry_run,
+        ..Default::default()
+    };
     let mut rom_hash_cache: HashMap<String, (String, String)> = HashMap::new();
 
     for source in sources {
@@ -315,9 +332,7 @@ pub fn run_sync(
                 }
                 Err(err) => {
                     report.errors += 1;
-                    if verbose {
-                        eprintln!("Sync error for {}: {}", save_path.display(), err);
-                    }
+                    eprintln!("Sync error for {}: {}", save_path.display(), err);
                 }
             }
         }
@@ -378,9 +393,7 @@ pub fn run_sync(
                 }
                 Err(err) => {
                     report.errors += 1;
-                    if verbose {
-                        eprintln!("Restore error for {}: {}", save_path.display(), err);
-                    }
+                    eprintln!("Restore error for {}: {}", save_path.display(), err);
                 }
             }
         }
@@ -528,10 +541,8 @@ fn restore_cloud_only_saves(
                 Ok(()) => {}
                 Err(err) => {
                     report.errors += 1;
-                    if verbose {
-                        let label = cloud_save.display_name();
-                        eprintln!("Cloud restore error for '{}': {}", label, err);
-                    }
+                    let label = cloud_save.display_name();
+                    eprintln!("Cloud restore error for '{}': {}", label, err);
                 }
             }
         }
@@ -658,7 +669,7 @@ fn restore_single_cloud_save(
     }
 
     if options.dry_run {
-        report.downloaded += 1;
+        report.would_download += 1;
         return Ok(());
     }
 
@@ -1850,7 +1861,7 @@ fn process_single_save(
             .unwrap_or(false);
     if !latest.exists || moved_to_another_card {
         if options.dry_run {
-            report.uploaded += 1;
+            report.would_upload += 1;
             return Ok(Some(processed_entry(
                 state_key.clone(),
                 synced_entry(
@@ -1885,17 +1896,26 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(version) => version,
+            Ok(Some(version)) => Some(version),
+            Ok(None) => {
+                // 2xx with no `save`: the server accepted the request but stored
+                // nothing.  Counting this as uploaded is how a client reports a
+                // hundred successful uploads while the store never grows.
+                report.accepted_not_stored += 1;
+                eprintln!(
+                    "Server accepted {} but returned no save; nothing was stored",
+                    save_path.display()
+                );
+                return Ok(None);
+            }
             Err(err) => {
                 if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
-                    report.skipped += 1;
-                    if verbose {
-                        eprintln!(
-                            "Skipping empty N64 controller pak {}: {}",
-                            save_path.display(),
-                            err
-                        );
-                    }
+                    report.rejected_n64_controller_pak += 1;
+                    eprintln!(
+                        "Rejected empty N64 controller pak {}: {}",
+                        save_path.display(),
+                        err
+                    );
                     return Ok(None);
                 }
                 return Err(err);
@@ -1952,7 +1972,7 @@ fn process_single_save(
 
     if options.force_upload || local_moved {
         if options.dry_run {
-            report.uploaded += 1;
+            report.would_upload += 1;
             return Ok(Some(processed_entry(
                 state_key.clone(),
                 synced_entry(
@@ -1987,17 +2007,26 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(version) => version,
+            Ok(Some(version)) => Some(version),
+            Ok(None) => {
+                // 2xx with no `save`: the server accepted the request but stored
+                // nothing.  Counting this as uploaded is how a client reports a
+                // hundred successful uploads while the store never grows.
+                report.accepted_not_stored += 1;
+                eprintln!(
+                    "Server accepted {} but returned no save; nothing was stored",
+                    save_path.display()
+                );
+                return Ok(None);
+            }
             Err(err) => {
                 if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
-                    report.skipped += 1;
-                    if verbose {
-                        eprintln!(
-                            "Skipping empty N64 controller pak {}: {}",
-                            save_path.display(),
-                            err
-                        );
-                    }
+                    report.rejected_n64_controller_pak += 1;
+                    eprintln!(
+                        "Rejected empty N64 controller pak {}: {}",
+                        save_path.display(),
+                        err
+                    );
                     return Ok(None);
                 }
                 return Err(err);
@@ -2075,7 +2104,7 @@ fn process_single_save(
                 );
             }
             if options.dry_run {
-                report.uploaded += 1;
+                report.would_upload += 1;
                 return Ok(Some(processed_entry(
                     state_key.clone(),
                     synced_entry(
@@ -2199,7 +2228,7 @@ fn process_single_save(
 
     if let Some(save_id) = latest.id {
         if options.dry_run {
-            report.downloaded += 1;
+            report.would_download += 1;
             let target_save_path = preferred_save_path(
                 save_path,
                 source_kind,
@@ -2454,7 +2483,7 @@ fn process_missing_save(
     let state_key = save_path.to_string_lossy().to_string();
 
     if options.dry_run {
-        report.downloaded += 1;
+        report.would_download += 1;
         return Ok(Some(processed_entry(
             state_key,
             synced_entry(
