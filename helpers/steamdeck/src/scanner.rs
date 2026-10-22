@@ -1436,6 +1436,21 @@ fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Save formats that travel with a primary save rather than standing alone.
+///
+/// An RTC clock, a controller pak and a controller pak's copy are three
+/// different things, and none of them is the cartridge's save: an `.rtc` is
+/// seconds of wall-clock state (Pokemon Crystal/Gold/Silver), an `.mpk`/`.cpk`
+/// is a controller pak (N64). Restoring one onto a primary target overwrites a
+/// real save with a few bytes of something else.
+/// Extensible later (e.g. Dreamcast VMU); these three are the in-scope set.
+pub const SIDECAR_FORMATS: [&str; 3] = ["rtc", "mpk", "cpk"];
+
+/// Whether a bare lowercased extension is a sidecar format.
+pub fn is_sidecar(ext: &str) -> bool {
+    SIDECAR_FORMATS.contains(&ext)
+}
+
 fn is_plausible_save_size(size: u64) -> bool {
     size > 0 && size <= MAX_SAVE_BYTES
 }

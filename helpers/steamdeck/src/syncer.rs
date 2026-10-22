@@ -738,6 +738,14 @@ fn restore_single_cloud_save(
         .system_profile_value
         .as_deref()
         .or(runtime_target.runtime_profile.as_deref());
+    // The cloud track's own format-class (primary vs sidecar), from its stored
+    // filename: it gates the "already present" checks below, so a local file of
+    // the other class can never satisfy this track's restore.
+    let cloud_is_sidecar = std::path::Path::new(&cloud_save.filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| crate::scanner::is_sidecar(&value.to_ascii_lowercase()))
+        .unwrap_or(false);
     let target_extension = cloud_target_extension(cloud_save, runtime_profile);
     let provisional_path = cloud_target_path(
         cloud_save,
@@ -748,7 +756,7 @@ fn restore_single_cloud_save(
         target_extension.as_deref(),
     );
 
-    if existing_local_save_is_valid(&provisional_path, &system_slug) {
+    if existing_local_save_is_valid(&provisional_path, &system_slug, cloud_is_sidecar) {
         return Ok(());
     }
 
@@ -760,7 +768,7 @@ fn restore_single_cloud_save(
         cloud_save,
     );
     if native_target_path != provisional_path
-        && existing_local_save_is_valid(&native_target_path, &system_slug)
+        && existing_local_save_is_valid(&native_target_path, &system_slug, cloud_is_sidecar)
     {
         return Ok(());
     }
@@ -825,7 +833,7 @@ fn restore_single_cloud_save(
         Some(downloaded_bytes.len() as u64),
     );
 
-    if existing_local_save_is_valid(&target_path, &system_slug) {
+    if existing_local_save_is_valid(&target_path, &system_slug, cloud_is_sidecar) {
         return Ok(());
     }
     if !target_parent_allowed(&target_path, save_roots, create_missing_system_dirs) {
@@ -1042,6 +1050,29 @@ fn effective_profile_for_cloud_restore(
 }
 
 fn cloud_target_extension(
+    cloud_save: &CloudSaveSummary,
+    runtime_profile: Option<&str>,
+) -> Option<String> {
+    let profile_extension = profile_target_extension(cloud_save, runtime_profile);
+    // A sidecar must never land on a primary target: an `.rtc` mapped onto a
+    // `.srm` overwrites the real cartridge save with seconds of clock state.
+    // The cloud record carries no format field, so sidecar-ness comes from the
+    // filename it stored. Sidecar-to-sidecar is a container conversion the
+    // profile may legitimately ask for (a MiSTer controller pak writes `.cpk`
+    // for a record stored as `.mpk`), so only a sidecar heading for a
+    // non-sidecar target is redirected.
+    if let (Some(ext), Some(target)) = (
+        extension_from_filename(&cloud_save.filename),
+        profile_extension.as_deref(),
+    ) && crate::scanner::is_sidecar(&ext)
+        && !crate::scanner::is_sidecar(target)
+    {
+        return Some(ext);
+    }
+    profile_extension
+}
+
+fn profile_target_extension(
     cloud_save: &CloudSaveSummary,
     runtime_profile: Option<&str>,
 ) -> Option<String> {
@@ -1427,9 +1458,21 @@ fn wii_title_code_from_candidate(candidate: &str) -> Option<String> {
     None
 }
 
-fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
+fn existing_local_save_is_valid(path: &Path, system_slug: &str, expect_sidecar: bool) -> bool {
     if system_slug == "ports" {
         return path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false);
+    }
+    // A local file satisfies a cloud track's "already present" check only when
+    // it is the same format-class: a kept `.rtc` must not stand in for a deleted
+    // `.srm` (which would then never be restored), and a `.srm` must not stand
+    // in for a `.rtc`.
+    let local_is_sidecar = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| crate::scanner::is_sidecar(&value.to_ascii_lowercase()))
+        .unwrap_or(false);
+    if local_is_sidecar != expect_sidecar {
+        return false;
     }
     path.exists()
         && classify_supported_save(path, None)
@@ -3903,6 +3946,78 @@ mod tests {
             std::slice::from_ref(&root),
             true
         ));
+    }
+
+    // GBC-RTC clobber: a profile that targets the primary extension must not
+    // pull a sidecar onto it. An 8-byte clock state written over a 32 KiB
+    // cartridge save destroys the save.
+    #[test]
+    fn a_sidecar_restores_to_its_own_extension() {
+        let save = cloud_save(
+            "Pokemon - Crystal Version (USA, Europe) (Rev 1).rtc",
+            "Pokemon - Crystal Version",
+            "gameboy",
+            "gameboy/retroarch-gambatte",
+            ".srm",
+        );
+        assert_eq!(
+            cloud_target_extension(&save, Some("gameboy/retroarch-gambatte")).as_deref(),
+            Some("rtc"),
+            "the sidecar was mapped onto the profile's primary extension"
+        );
+    }
+
+    #[test]
+    fn a_primary_still_takes_the_profiles_extension() {
+        let save = cloud_save(
+            "Pokemon - Crystal Version (USA, Europe) (Rev 1).srm",
+            "Pokemon - Crystal Version",
+            "gameboy",
+            "gameboy/retroarch-gambatte",
+            ".srm",
+        );
+        assert_eq!(
+            cloud_target_extension(&save, Some("gameboy/retroarch-gambatte")).as_deref(),
+            Some("srm")
+        );
+    }
+
+    #[test]
+    fn existing_local_save_class_gate() {
+        // Controller paks are the format class that classifies on this tree --
+        // an `.rtc` is deliberately never a standalone save -- so they are what
+        // the gate can be proven on. Real files, because a missing path returns
+        // false for the wrong reason and proves nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/n64");
+        fs::create_dir_all(&dir).unwrap();
+        let mpk = dir.join("Mario Kart 64 (USA)_1.mpk");
+        let cpk = dir.join("Mario Kart 64 (USA)_1.cpk");
+        fs::write(&mpk, vec![0xA5u8; 32768]).unwrap();
+        fs::write(&cpk, vec![0xA5u8; 32768]).unwrap();
+
+        // Same class is accepted: a present pak does not make the device fetch
+        // its own copy again. cpk is what the profile writes; mpk is the record.
+        assert!(
+            existing_local_save_is_valid(&cpk, "n64", true),
+            "a present sidecar was not accepted for a sidecar track"
+        );
+        assert!(
+            existing_local_save_is_valid(&mpk, "n64", true),
+            "a present controller pak of the record's own container was not accepted"
+        );
+
+        // A sidecar never satisfies a primary track: before the gate, any file
+        // the classifier accepted counted as "already present", so a pak stood
+        // in for a cartridge save that had been deleted.
+        assert!(
+            !existing_local_save_is_valid(&mpk, "n64", false),
+            "a controller pak satisfied a primary track's presence check"
+        );
+        assert!(
+            !existing_local_save_is_valid(&cpk, "n64", false),
+            "a controller pak satisfied a primary track's presence check"
+        );
     }
 
     fn cloud_save(
