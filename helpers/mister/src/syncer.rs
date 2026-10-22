@@ -13,9 +13,9 @@ use crate::config::AppConfig;
 use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, dreamcast_skip_reason,
-    encode_download_for_local_container, filename_stem, md5_file, normalize_save_bytes_for_sync,
-    normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes, sha256_file,
-    wii_skip_reason, wii_title_code_from_path,
+    encode_download_for_local_container, filename_stem, is_n64_retroarch_bundle, md5_file,
+    normalize_save_bytes_for_sync, normalize_save_for_sync, saturn_skip_reason, sha1_file,
+    sha256_bytes, sha256_file, wii_skip_reason, wii_title_code_from_path,
 };
 use crate::sources::{EmulatorProfile, ResolvedSource, SourceKind, prepare_sources_for_sync};
 use crate::state::{
@@ -1890,6 +1890,14 @@ fn process_single_save(
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
     let mut runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
+    // A combined N64 save is RetroArch's own form whatever the source profile
+    // says: mupen64plus-next writes one file holding EEPROM, pak templates,
+    // SRAM and FlashRAM, and the server splits it only for that profile. The
+    // device profile can be Generic (a SteamDeck) or MupenFamily, neither of
+    // which accepts the bundle, so the file itself decides.
+    if system_slug == "n64" && is_n64_retroarch_bundle(save_path) {
+        runtime_target = runtime_target_for_profile(&system_slug, "n64/retroarch");
+    }
     // A .dsv is DeSmuME's container. The server strips its footer only for
     // that profile, so the container decides the profile -- otherwise the file
     // is measured with the footer and refused as an unrecognised size.

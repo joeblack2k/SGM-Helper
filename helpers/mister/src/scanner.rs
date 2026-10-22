@@ -71,6 +71,18 @@ const SATURN_ARCHIVE_ENTRY_MARKER: u32 = 0x8000_0000;
 const DESMUME_FOOTER_SIZE: usize = 122;
 
 const N64_RETROARCH_SRM_SIZE: u64 = 0x48800;
+
+/// True for the single file mupen64plus-next writes for an N64 game, which
+/// holds EEPROM, controller-pak templates, SRAM and FlashRAM together.
+pub fn is_n64_retroarch_bundle(save_path: &Path) -> bool {
+    let ext = path_extension(save_path).unwrap_or_default();
+    if ext != "srm" && ext != "sav" {
+        return false;
+    }
+    std::fs::metadata(save_path)
+        .map(|meta| meta.len() == N64_RETROARCH_SRM_SIZE)
+        .unwrap_or(false)
+}
 const WII_DATA_BIN_BACKUP_HEADER_OFFSET: usize = 0xF0C0;
 const WII_DATA_BIN_FILE_HEADER_OFFSET: usize = 0xF140;
 const WII_DATA_BIN_FILE_HEADER_MAGIC: u32 = 0x03AD_F17E;

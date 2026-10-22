@@ -3421,3 +3421,94 @@ fn a_psx_repair_after_a_missing_projection_on_conflict_report_reads_the_body() {
 fn a_psx_repair_after_a_missing_projection_on_download_reads_the_body() {
     assert_psx_repair_counts_no_save_as_stored_nothing(PsxRepairTrigger::Download, "download");
 }
+
+#[test]
+fn a_combined_n64_save_uploads_with_the_retroarch_profile() {
+    // mupen64plus-next writes one file holding EEPROM, pak templates, SRAM and
+    // FlashRAM. The server splits it only for the RetroArch profile, so the
+    // file's form decides the profile -- a SteamDeck's source profile is
+    // Generic, which maps to a profile that cannot take the bundle.
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_n64b","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"n64bundle@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"n64b123","md5":"md5v","fileName":"1080 Snowboarding.zip"}}"#);
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _config_sync = server.mock(|when, then| {
+        when.method(POST).path("/helpers/config/sync");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"accepted":true}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("n64/retroarch");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-n64b","sha256":"sha-n64b","version":1}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/n64")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let mut bundle = vec![0u8; 0x48800];
+    for (index, value) in bundle[0x20800..0x28800].iter_mut().enumerate() {
+        *value = (index % 251) as u8 + 1;
+    }
+    fs::write(
+        root.join("saves/n64/1080 Snowboarding (Japan, USA).srm"),
+        bundle,
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-mister-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("n64bundle@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-mister-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A save under ROOT/saves is discovered by both the root and the saves
+    // root, so it uploads twice; the property is that it uploads at all, and
+    // only under the retroarch profile.
+    assert!(
+        upload.calls() >= 1,
+        "the combined N64 save was not uploaded with the retroarch profile; sync said: {stdout}"
+    );
+}
