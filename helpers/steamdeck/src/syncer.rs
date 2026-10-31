@@ -88,11 +88,83 @@ impl SyncLock {
                 Ok(Self { path })
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display());
+                // A sync that died leaves its lock behind, and every later sync would stop here for
+                // good. The lock names its owner; one whose process is gone is taken over, once.
+                let existing = fs::read_to_string(&path).unwrap_or_default();
+                match lock_owner(&existing) {
+                    Some(pid) if !pid_alive(pid) => {
+                        eprintln!(
+                            "oude sync.lock van pid={} verwijderd (proces draait niet meer): {}",
+                            pid,
+                            path.display()
+                        );
+                        let _ = fs::remove_file(&path);
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&path)
+                            .and_then(|mut file| {
+                                use std::io::Write;
+                                file.write_all(lock_content.as_bytes())
+                            })
+                            .with_context(|| {
+                                format!("sync is al actief (lockfile bestaat): {}", path.display())
+                            })?;
+                        Ok(Self { path })
+                    }
+                    _ => anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display()),
+                }
             }
             Err(err) => Err(err)
                 .with_context(|| format!("kan sync lockfile niet maken: {}", path.display())),
         }
+    }
+}
+
+/// The pid a `sync.lock` names on its `pid=` line.
+fn lock_owner(contents: &str) -> Option<u32> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.trim().parse().ok())
+}
+
+/// Whether a process with this pid is running. A process that exists but this user may not
+/// signal or open (another user's) counts as running, so its lock is never taken.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess only reads the pid; the handle is closed below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: reads this thread's last error, set by OpenProcess.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        // SAFETY: the handle is open and valid; code is a valid out pointer.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+        // SAFETY: closes the handle opened above, once.
+        unsafe { CloseHandle(handle) };
+        !ok || code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -4817,6 +4889,28 @@ mod tests {
         assert_eq!(
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    #[test]
+    fn a_lock_names_its_owner() {
+        assert_eq!(super::lock_owner("pid=1234\nstarted_at=x\n"), Some(1234));
+        assert_eq!(super::lock_owner("started_at=x\n"), None);
+        assert_eq!(super::lock_owner("pid=abc\n"), None);
+    }
+
+    #[test]
+    fn pid_alive_tells_a_running_process_from_a_missing_one() {
+        assert!(
+            super::pid_alive(std::process::id()),
+            "this test's own process reads as dead"
+        );
+        assert!(
+            !super::pid_alive(4_194_303),
+            "a pid naming no process reads as alive"
         );
     }
 }
