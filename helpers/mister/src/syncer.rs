@@ -89,32 +89,48 @@ impl SyncLock {
                 // good. The lock names its owner; one whose process is gone is taken over, once.
                 let existing = fs::read_to_string(&path).unwrap_or_default();
                 match lock_owner(&existing) {
-                    Some(pid) if !pid_alive(pid) => {
-                        eprintln!(
-                            "oude sync.lock van pid={} verwijderd (proces draait niet meer): {}",
-                            pid,
-                            path.display()
-                        );
-                        let _ = fs::remove_file(&path);
-                        fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&path)
-                            .and_then(|mut file| {
-                                use std::io::Write;
-                                file.write_all(lock_content.as_bytes())
-                            })
-                            .with_context(|| {
-                                format!("sync is al actief (lockfile bestaat): {}", path.display())
-                            })?;
-                        Ok(Self { path })
-                    }
+                    Some(pid) if !pid_alive(pid) => Self::take_over(&path, pid, &lock_content),
                     _ => anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display()),
                 }
             }
             Err(err) => Err(err)
                 .with_context(|| format!("kan sync lockfile niet maken: {}", path.display())),
         }
+    }
+}
+
+impl SyncLock {
+    /// Take over a lock whose owner `dead` is gone. Two syncs can find the same dead lock: a rename
+    /// to a name of this process's own moves the file once, so only one of them gets it, and a
+    /// remove by path could delete the lock the other has just created. The renamed file must still
+    /// name `dead`; one naming anyone else is a live lock, put back.
+    fn take_over(path: &Path, dead: u32, lock_content: &str) -> Result<Self> {
+        let busy = || anyhow::anyhow!("sync is al actief (lockfile bestaat): {}", path.display());
+        let stale = path.with_extension(format!("lock.stale.{}", std::process::id()));
+        if fs::rename(path, &stale).is_err() {
+            return Err(busy());
+        }
+        if lock_owner(&fs::read_to_string(&stale).unwrap_or_default()) != Some(dead) {
+            let _ = fs::rename(&stale, path);
+            return Err(busy());
+        }
+        let _ = fs::remove_file(&stale);
+        eprintln!(
+            "oude sync.lock van pid={} verwijderd (proces draait niet meer): {}",
+            dead,
+            path.display()
+        );
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| busy())?;
+        use std::io::Write;
+        file.write_all(lock_content.as_bytes())
+            .with_context(|| format!("kan lockfile niet schrijven: {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
     }
 }
 
@@ -3676,6 +3692,29 @@ mod lock_tests {
         assert_eq!(super::lock_owner("pid=1234\nstarted_at=x\n"), Some(1234));
         assert_eq!(super::lock_owner("started_at=x\n"), None);
         assert_eq!(super::lock_owner("pid=abc\n"), None);
+    }
+
+    #[test]
+    fn of_two_takeovers_of_one_dead_lock_exactly_one_succeeds() {
+        let dir = std::env::temp_dir().join(format!("sgm-lock-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sync.lock");
+        std::fs::write(&path, "pid=4194303\nstarted_at=x\n").unwrap();
+        let first = super::SyncLock::take_over(&path, 4_194_303, "pid=1\n");
+        let second = super::SyncLock::take_over(&path, 4_194_303, "pid=2\n");
+        assert!(first.is_ok(), "the first takeover of a dead lock failed");
+        assert!(
+            second.is_err(),
+            "a second takeover deleted the first one's live lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "pid=1\n",
+            "the first sync's lock was replaced"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
