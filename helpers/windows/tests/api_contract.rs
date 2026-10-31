@@ -615,3 +615,85 @@ fn with_psp_savedata_bundles_off_no_bundle_is_uploaded() {
         );
     }
 }
+
+// a lock whose owner is running still stops it.
+#[test]
+fn a_lock_left_by_a_dead_sync_is_taken_over_and_a_live_ones_is_not() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_lock","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"lock@example.com"}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("lock@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    // A pid no process holds: above the default Linux pid_max, and not a multiple of 4 (Windows).
+    let lock = state_dir.join("sync.lock");
+    fs::write(&lock, "pid=4194303\nstarted_at=2026-10-31T00:00:00Z\n").unwrap();
+    let dead = Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    assert!(
+        dead.status.success(),
+        "a dead sync's lock still stopped the sync:\n{}",
+        String::from_utf8_lossy(&dead.stderr)
+    );
+    assert!(
+        !lock.exists(),
+        "the taken-over lock was not released when the sync ended"
+    );
+
+    // This test's own process: alive, so its lock is left alone.
+    fs::write(
+        &lock,
+        format!(
+            "pid={}\nstarted_at=2026-10-31T00:00:00Z\n",
+            std::process::id()
+        ),
+    )
+    .unwrap();
+    let live = Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    assert!(
+        !live.status.success(),
+        "a running sync's lock was taken over"
+    );
+    assert!(
+        String::from_utf8_lossy(&live.stderr).contains("sync is al actief"),
+        "a live lock stopped the sync without saying why:\n{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+    assert!(lock.exists(), "a running sync's lock was removed");
+}
