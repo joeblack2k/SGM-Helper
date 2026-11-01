@@ -545,6 +545,16 @@ fn restore_single_cloud_save(
         return Ok(());
     }
 
+    if let Some(reason) = psp_restore_refusal(cloud_save, &system_slug) {
+        report.skipped += 1;
+        eprintln!(
+            "Not restoring cloud psp save '{}': {}",
+            cloud_save.display_name(),
+            reason
+        );
+        return Ok(());
+    }
+
     let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
     let runtime_target =
@@ -863,6 +873,29 @@ fn cloud_target_path(
         ))
     };
     target_dir.join(filename)
+}
+
+/// Why a PSP save can't be restored, if it can't. PPSSPP keeps a game's save as a folder,
+/// `PSP/SAVEDATA/<game id>/` (DATA.BIN, PARAM.SFO, ICON0.PNG), and reads it from nowhere else; a
+/// record that names no game id says where none of it goes, so writing its file anywhere only looks
+/// like a restore in the log.
+fn psp_restore_refusal(cloud_save: &CloudSaveSummary, system_slug: &str) -> Option<&'static str> {
+    if system_slug != "psp" {
+        return None;
+    }
+    let named = [
+        cloud_json_string(&cloud_save.metadata, "/rsm/psp/gameId"),
+        cloud_json_string(&cloud_save.metadata, "/rsm/psp/saveDir"),
+        cloud_json_string(&cloud_save.inspection, "/semanticFields/gameId"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|id| !id.trim().is_empty());
+    if named {
+        None
+    } else {
+        Some("PPSSPP reads a save from SAVEDATA/<game id>/, and this record names no game id")
+    }
 }
 
 fn cloud_wii_title_code(cloud_save: &CloudSaveSummary) -> Option<String> {
@@ -3855,6 +3888,17 @@ mod tests {
             Some("flash"),
         );
         assert_eq!(target, root.join("ngpc").join(filename));
+    }
+
+    #[test]
+    fn psp_restore_is_refused_without_a_savedata_game_id() {
+        // PPSSPP reads a game's save from SAVEDATA/<game id>/; a record with no id says nowhere to put it.
+        let save = cloud_save("DISSIDIA.BIN", "DISSIDIA", "psp", "original", ".bin");
+        assert_eq!(
+            psp_restore_refusal(&save, "psp"),
+            Some("PPSSPP reads a save from SAVEDATA/<game id>/, and this record names no game id")
+        );
+        assert_eq!(psp_restore_refusal(&save, "snes"), None);
     }
 
     #[test]
