@@ -522,6 +522,14 @@ fn restore_single_cloud_save(
 
     if !supports_cloud_restore_system(&system_slug) {
         report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud {} save '{}': this helper does not restore {} saves",
+                system_slug,
+                cloud_save.display_name(),
+                system_slug
+            );
+        }
         return Ok(());
     }
     if !source_allows_system(source_systems, &system_slug) {
@@ -725,6 +733,12 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "ps4"
             | "ps5"
             | "ports"
+            | "3do"
+            | "atari-jaguar"
+            | "neogeo-cd"
+            | "ngp"
+            | "pc-engine"
+            | "virtualboy"
     )
 }
 
@@ -1153,6 +1167,12 @@ fn generic_system_directory(system_slug: &str) -> &'static str {
         "ps3" => "ps3",
         "ps4" => "ps4",
         "ps5" => "ps5",
+        "3do" => "3do",
+        "atari-jaguar" => "atarijaguar",
+        "neogeo-cd" => "neogeocd",
+        "ngp" => "ngp",
+        "pc-engine" => "pcengine",
+        "virtualboy" => "virtualboy",
         _ => "unknown",
     }
 }
@@ -1181,6 +1201,12 @@ fn system_directory_aliases(system_slug: &str) -> &'static [&'static str] {
         "ps3" => &["ps3", "playstation 3"],
         "ps4" => &["ps4", "playstation 4"],
         "ps5" => &["ps5", "playstation 5"],
+        "3do" => &["3do", "panasonic 3do"],
+        "atari-jaguar" => &["atarijaguar", "jaguar", "atari jaguar"],
+        "neogeo-cd" => &["neogeocd", "neo geo cd", "neogeo cd"],
+        "ngp" => &["ngp", "ngpc", "neo geo pocket", "neogeo pocket"],
+        "pc-engine" => &["pcengine", "pce", "tg16", "turbografx", "pc engine"],
+        "virtualboy" => &["virtualboy", "virtual boy", "vb"],
         _ => &[],
     }
 }
@@ -3770,6 +3796,65 @@ mod tests {
             existing_target.to_string_lossy(),
             "/userdata/saves/gb/Super Mario Bros. Deluxe.srm"
         );
+    }
+
+    #[test]
+    fn cloud_restore_accepts_every_system_the_server_holds() {
+        // A save another helper uploaded for one of these systems has to come
+        // back down; a system missing here is dropped before any target is chosen.
+        for (slug, filename, folder) in [
+            ("3do", "Star Control II (USA).srm", "3do"),
+            ("atari-jaguar", "Doom (World).srm", "atarijaguar"),
+            ("neogeo-cd", "Samurai Shodown RPG (Japan).srm", "neogeocd"),
+            (
+                "ngp",
+                "Baseball Stars - Pocket Sports Series (Japan, Europe) (En,Ja).flash",
+                "ngp",
+            ),
+            ("pc-engine", "Neutopia (USA).srm", "pcengine"),
+            ("virtualboy", "3-D Tetris (USA).srm", "virtualboy"),
+        ] {
+            assert!(
+                supports_cloud_restore_system(slug),
+                "{slug} is not restored"
+            );
+            let save = cloud_save(filename, "Game", slug, "original", ".srm");
+            let target = cloud_target_path(
+                &save,
+                &[PathBuf::from("/run/media/deck/retrodeck/saves")],
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                slug,
+                Path::new(filename)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+            );
+            assert_eq!(
+                target,
+                PathBuf::from("/run/media/deck/retrodeck/saves")
+                    .join(folder)
+                    .join(filename),
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_restore_uses_an_existing_alias_folder_for_ngp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        fs::create_dir_all(root.join("ngpc")).unwrap();
+        let filename = "Sonic the Hedgehog - Pocket Adventure (World).flash";
+        let save = cloud_save(filename, "Sonic", "ngp", "original", ".flash");
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "ngp",
+            Some("flash"),
+        );
+        assert_eq!(target, root.join("ngpc").join(filename));
     }
 
     #[test]
