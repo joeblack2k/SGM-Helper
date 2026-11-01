@@ -1067,7 +1067,28 @@ fn cloud_target_path(
             system_slug,
         ))
     };
-    target_dir.join(filename)
+    target_dir
+        .join(opera_per_game_subdir(system_slug, &filename))
+        .join(filename)
+}
+
+/// Opera (3DO) saves a game's NVRAM as `<save dir>/opera/per_game/<game>.<version>.srm` and reads
+/// `<save dir>/<game>.srm` only as an unversioned fallback (opera-libretro `opera_lr_nvram.c`), so a
+/// versioned 3DO save goes in `opera/per_game` and an unversioned one stays in the save directory.
+fn opera_per_game_subdir(system_slug: &str, filename: &str) -> PathBuf {
+    let versioned = system_slug == "3do"
+        && Path::new(filename)
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(|version| version.to_str())
+            .is_some_and(|version| {
+                !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+            });
+    if versioned {
+        PathBuf::from("opera").join("per_game")
+    } else {
+        PathBuf::new()
+    }
 }
 
 /// Why a PSP save can't be restored, if it can't. PPSSPP keeps a game's save as a folder,
@@ -4585,6 +4606,53 @@ mod tests {
             .is_err()
         );
         assert!(!tmp.path().join("nowhere").exists());
+    }
+
+    #[test]
+    fn cloud_restore_puts_a_versioned_three_do_save_where_opera_reads_it() {
+        // Opera loads <save dir>/opera/per_game/<game>.<version>.srm first, and
+        // falls back to <save dir>/<game>.srm with no version. A
+        // "<game>.0.srm" written beside the content is read by neither.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        fs::create_dir_all(root.join("3do")).unwrap();
+        let versioned = "20th Century Video Almanac (USA).0.srm";
+        let save = cloud_save(versioned, "Almanac", "3do", "3do/retroarch-opera", ".srm");
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "3do",
+            Some("srm"),
+        );
+        assert_eq!(
+            target,
+            root.join("3do")
+                .join("opera")
+                .join("per_game")
+                .join(versioned)
+        );
+
+        // The unversioned name is the one Opera's fallback reads from the save
+        // directory itself, so it stays there.
+        let plain = "Star Control II (USA).srm";
+        let save = cloud_save(
+            plain,
+            "Star Control II",
+            "3do",
+            "3do/retroarch-opera",
+            ".srm",
+        );
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "3do",
+            Some("srm"),
+        );
+        assert_eq!(target, root.join("3do").join(plain));
     }
 
     #[test]
