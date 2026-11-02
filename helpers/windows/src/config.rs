@@ -36,6 +36,10 @@ pub struct AppConfig {
     pub dry_run: bool,
     pub route_prefix: String,
     pub secure: bool,
+    /// Sync each PPSSPP `SAVEDATA/<dir>/` folder as one bundle instead of its
+    /// data file alone. Off by default until the server stores bundles.
+    #[serde(default)]
+    pub psp_savedata_bundles: bool,
     pub binary_dir: PathBuf,
     pub config_path: PathBuf,
 }
@@ -171,6 +175,8 @@ impl AppConfig {
             "",
         )?);
         let secure = choose_bool(overrides.secure, env_values, ini_values, "SECURE", false)?;
+        let psp_savedata_bundles =
+            choose_bool(None, env_values, ini_values, "PSP_SAVEDATA_BUNDLES", false)?;
 
         if watch_interval == 0 {
             bail!("WATCH_INTERVAL moet >= 1 zijn");
@@ -189,6 +195,7 @@ impl AppConfig {
             dry_run,
             route_prefix,
             secure,
+            psp_savedata_bundles,
             binary_dir,
             config_path: config_path.to_path_buf(),
         })
@@ -275,6 +282,7 @@ const ENV_KEYS: &[&str] = &[
     "DRY_RUN",
     "ROUTE_PREFIX",
     "SECURE",
+    "PSP_SAVEDATA_BUNDLES",
 ];
 
 fn collect_env_values() -> HashMap<String, String> {
@@ -658,5 +666,25 @@ SAVE_PATH="/home/snes9x/save"
         assert!(cfg.force_upload);
         assert!(!cfg.dry_run);
         assert_eq!(cfg.watch_interval, 45);
+    }
+
+    #[test]
+    fn psp_savedata_bundles_is_off_unless_set() {
+        let cfg = test_sources(ConfigOverrides::default(), &[], &[]).unwrap();
+        assert!(!cfg.psp_savedata_bundles);
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[],
+            &[("PSP_SAVEDATA_BUNDLES", "true")],
+        )
+        .unwrap();
+        assert!(cfg.psp_savedata_bundles);
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[("PSP_SAVEDATA_BUNDLES", "0")],
+            &[("PSP_SAVEDATA_BUNDLES", "true")],
+        )
+        .unwrap();
+        assert!(!cfg.psp_savedata_bundles);
     }
 }

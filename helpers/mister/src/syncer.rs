@@ -645,6 +645,8 @@ fn restore_single_cloud_save(
     Ok(())
 }
 
+/// MiSTer has no PSP core, so PSP is not here: a PSP record, a loose file or a PPSSPP SAVEDATA
+/// bundle, has nowhere on this device a game reads it from.
 fn supports_cloud_restore_system(system_slug: &str) -> bool {
     matches!(
         system_slug,
@@ -665,7 +667,6 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "wii"
             | "psx"
             | "ps2"
-            | "psp"
             | "psvita"
             | "ps3"
             | "ps4"
@@ -3556,5 +3557,13 @@ mod tests {
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
         );
+    }
+
+    #[test]
+    fn mister_never_restores_a_psp_save() {
+        // MiSTer has no PSP core: a PSP record, loose or a PPSSPP SAVEDATA
+        // bundle, has nowhere on this device a game reads it from.
+        assert!(!supports_cloud_restore_system("psp"));
+        assert!(supports_cloud_restore_system("psx"));
     }
 }
