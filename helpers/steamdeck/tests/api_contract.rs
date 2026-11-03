@@ -445,3 +445,246 @@ fn sync_auto_enrolls_when_gate_is_open_without_login() {
     let auth: Value = serde_json::from_str(&fs::read_to_string(auth_path).unwrap()).unwrap();
     assert_eq!(auth["token"], "RSM-AAAA-BBBB");
 }
+
+/// Genesis Plus GX's shared Sega CD backup RAM: 8 KiB, a directory of saves at
+/// the end, closed by the format's trailer (`SEGA_CD_ROM`, `RAM_CARTRIDGE`).
+fn sega_cd_internal_bram() -> Vec<u8> {
+    let mut bytes = vec![0u8; 8192];
+    // One saved game's data and directory entry, so the image is not blank.
+    for (index, value) in bytes[0x40..0x240].iter_mut().enumerate() {
+        *value = (index as u8).wrapping_mul(29) | 0x01;
+    }
+    bytes[0x1F80..0x1F8B].copy_from_slice(b"POPFUL_MAIL");
+    bytes[0x1FC0..0x1FCB].copy_from_slice(b"___________");
+    bytes[0x1FCF] = 0x40;
+    bytes[0x1FE0..0x1FEB].copy_from_slice(b"SEGA_CD_ROM");
+    bytes[0x1FEC] = 0x01;
+    bytes[0x1FF0..0x2000].copy_from_slice(b"RAM_CARTRIDGE___");
+    bytes
+}
+
+// Genesis Plus GX keeps every Sega CD game's save in one backup RAM per device
+// (segacd/scd_U.brm), not a file per game, so there is no ROM to name it by.
+// It syncs as one device-level save under a line key, as a PS1 card does.
+#[test]
+fn sync_uploads_a_shared_sega_cd_backup_ram_under_its_line_key() {
+    let expected_line = "segacd-bram:retroarch:scd_u";
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_scd","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"scd@example.com"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("romSha1", expected_line);
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("name=\"rom_sha1\"")
+            .body_includes(expected_line);
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-scd","sha256":"sha-scd"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("segacd")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(root.join("segacd/scd_U.brm"), sega_cd_internal_bram()).unwrap();
+    let config = tmp.path().join("config.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.retroarch]\nLABEL=\"RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"sega-cd\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.display(),
+            tmp.path().join("roms").display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "login",
+            "--email",
+            "scd@example.com",
+            "--app-password",
+            "pw",
+        ])
+        .assert()
+        .success();
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["sync", "--verbose"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        upload.calls(),
+        1,
+        "the shared backup RAM did not upload under its line key:\n{stderr}"
+    );
+}
+
+// A blank, freshly formatted backup RAM holds no save, and must not replace a
+// real one on the server.
+#[test]
+fn a_blank_sega_cd_backup_ram_is_not_uploaded() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_scd","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"scd@example.com"}}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-scd","sha256":"sha-scd"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("segacd")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let mut blank = vec![0u8; 8192];
+    blank[0x1FC0..0x1FCB].copy_from_slice(b"___________");
+    blank[0x1FE0..0x1FEB].copy_from_slice(b"SEGA_CD_ROM");
+    blank[0x1FF0..0x2000].copy_from_slice(b"RAM_CARTRIDGE___");
+    fs::write(root.join("segacd/scd_U.brm"), blank).unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "login",
+            "--email",
+            "scd@example.com",
+            "--app-password",
+            "pw",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+
+    assert_eq!(upload.calls(), 0, "a blank backup RAM was uploaded");
+}
+
+// The restore half: another device's backup RAM lands in segacd/<same file>,
+// where Genesis Plus GX reads it, and the bytes are kept whole.
+#[test]
+fn a_shared_sega_cd_backup_ram_restores_to_its_own_file() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_scd","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"scd@example.com"}}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-scd","filename":"scd_U.brm","displayTitle":"scd_U","systemSlug":"sega-cd","romSha1":"segacd-bram:retroarch:scd_u","sha256":"sha-scd","version":2,"latestSizeBytes":8192}]}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(sega_cd_internal_bram());
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("segacd")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = tmp.path().join("config.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.retroarch]\nLABEL=\"RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"sega-cd\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.display(),
+            tmp.path().join("roms").display()
+        ),
+    )
+    .unwrap();
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "login",
+            "--email",
+            "scd@example.com",
+            "--app-password",
+            "pw",
+        ])
+        .assert()
+        .success();
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["sync", "--verbose"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        fs::read(root.join("segacd/scd_U.brm")).ok(),
+        Some(sega_cd_internal_bram()),
+        "the backup RAM did not restore to segacd/scd_U.brm:\n{stderr}"
+    );
+}

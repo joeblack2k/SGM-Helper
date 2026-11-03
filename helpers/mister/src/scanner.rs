@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "cpk", "dsv", "gme", "mcr",
-    "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
+    "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr", "brm",
 ];
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -548,6 +548,18 @@ pub fn classify_supported_save(
 
     let save_size = save_path.metadata().ok()?.len();
     if !is_plausible_save_size(save_size) || looks_plain_text(save_path) {
+        return None;
+    }
+
+    // Decided by the format's own trailer, before any path rule: the file is
+    // every Sega CD game's save at once, so no ROM names it.
+    if save_ext == "brm" {
+        if is_sega_cd_shared_bram(save_path) {
+            return Some(SaveClassification {
+                system_slug: "sega-cd".to_string(),
+                evidence: format!("sega cd backup ram trailer + .brm ({} bytes)", save_size),
+            });
+        }
         return None;
     }
 
@@ -1293,6 +1305,37 @@ fn looks_like_wii_data_bin_path(path: &Path) -> bool {
         .map(|value| value.eq_ignore_ascii_case("data.bin"))
         .unwrap_or(false)
         && wii_title_code_from_path(path).is_some()
+}
+
+/// Genesis Plus GX's Sega CD backup RAM, internal (`scd_U.brm`, 8 KiB) or RAM
+/// cart (`cart.brm`, 512 KiB): it ends with the format's trailer, and a blank,
+/// freshly formatted one is all zero before its last 64 bytes.
+pub fn is_sega_cd_shared_bram(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    sega_cd_bram_has_saves(&bytes)
+}
+
+fn sega_cd_bram_has_saves(bytes: &[u8]) -> bool {
+    const TRAILER: usize = 0x40;
+    if !matches!(bytes.len(), 8192 | 524_288) {
+        return false;
+    }
+    let trailer = &bytes[bytes.len() - TRAILER..];
+    if &trailer[0x20..0x2B] != b"SEGA_CD_ROM" || &trailer[0x30..0x3D] != b"RAM_CARTRIDGE" {
+        return false;
+    }
+    bytes[..bytes.len() - TRAILER]
+        .iter()
+        .any(|value| *value != 0)
+}
+
+/// The line key a shared Sega CD backup RAM syncs under: one per device kind and
+/// file, since the file is the device's whole Sega CD save store.
+pub fn sega_cd_bram_line_key(device_type: &str, save_path: &Path) -> Option<String> {
+    let stem = save_path.file_stem()?.to_str()?.to_ascii_lowercase();
+    Some(format!("segacd-bram:{}:{}", device_type, stem))
 }
 
 fn validate_non_blank_payload(path: &Path) -> bool {
