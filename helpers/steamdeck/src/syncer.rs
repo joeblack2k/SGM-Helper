@@ -1193,7 +1193,8 @@ fn restore_single_cloud_save(
         .and_then(|value| value.to_str())
         .map(|value| crate::scanner::is_sidecar(&value.to_ascii_lowercase()))
         .unwrap_or(false);
-    let target_extension = cloud_target_extension(cloud_save, runtime_profile);
+    let target_extension = ps1_per_game_card_extension(cloud_save, source_profile)
+        .or_else(|| cloud_target_extension(cloud_save, runtime_profile));
     let Some(provisional_path) = cloud_target_path_with_known(
         cloud_save,
         save_roots,
@@ -4754,9 +4755,52 @@ fn parse_playstation_slot(value: &str) -> Option<String> {
     None
 }
 
+/// A PS1 card the emulator keeps per game (RetroArch's Beetle PSX without
+/// shared cards, the MiSTer) is named after that game and holds only its saves.
+/// The server keeps one line per card slot, so such a card gets its own slot,
+/// "Game: <name>"; sharing "Memory Card 1" made each game's card read as a
+/// deletion of every other game's save. A numbered card (memory_card_1, mcd001)
+/// is a shared card and keeps its number, and so does a PS2 card.
+const PS1_PER_GAME_SLOT_PREFIX: &str = "Game: ";
+
 fn infer_playstation_slot_from_path(path: &Path) -> String {
     let text = path.to_string_lossy().to_ascii_lowercase();
-    parse_playstation_slot(&text).unwrap_or_else(|| "Memory Card 1".to_string())
+    if let Some(slot) = parse_playstation_slot(&text) {
+        return slot;
+    }
+    let is_ps1_card = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("ps2"))
+        .unwrap_or(false);
+    match path.file_stem().and_then(|value| value.to_str()) {
+        Some(stem) if is_ps1_card && !stem.trim().is_empty() => {
+            format!("{PS1_PER_GAME_SLOT_PREFIX}{}", stem.trim())
+        }
+        _ => "Memory Card 1".to_string(),
+    }
+}
+
+/// The extension a per-game PS1 card has on this device: the server names the
+/// card after its game but knows only the `.mcr` container, while RetroArch
+/// reads `<game>.srm` and the MiSTer `<game>.sav`.
+fn ps1_per_game_card_extension(
+    cloud_save: &CloudSaveSummary,
+    source_profile: &EmulatorProfile,
+) -> Option<String> {
+    let slot = cloud_save.card_slot.as_deref()?.trim();
+    if !slot.starts_with(PS1_PER_GAME_SLOT_PREFIX)
+        || !cloud_save.system_slug.eq_ignore_ascii_case("psx")
+    {
+        return None;
+    }
+    Some(
+        match source_profile {
+            EmulatorProfile::Mister => "sav",
+            _ => "srm",
+        }
+        .to_string(),
+    )
 }
 
 fn parse_dreamcast_slot(value: &str) -> Option<String> {
@@ -6547,6 +6591,23 @@ mod tests {
         );
         assert_eq!(
             infer_playstation_slot_from_path(Path::new("/games/ps2/custom.ps2")),
+            "Memory Card 1".to_string()
+        );
+    }
+
+    #[test]
+    fn a_ps1_card_named_after_its_game_is_its_own_slot() {
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/Tekken 3 (USA).srm")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/PSX/Tekken 3 (USA).sav")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        // Numbered cards are shared and keep their number.
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/memory_card_1.mcr")),
             "Memory Card 1".to_string()
         );
     }

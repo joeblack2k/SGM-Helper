@@ -734,7 +734,11 @@ fn a_dry_run_names_the_save_it_would_upload() {
     fs::create_dir_all(root.join("Sony/PSX")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     let raw = build_valid_ps1_memcard();
-    fs::write(root.join("Sony/PSX/ff7.gme"), encode_ps1_dexdrive(&raw)).unwrap();
+    fs::write(
+        root.join("Sony/PSX/memory_card_1.gme"),
+        encode_ps1_dexdrive(&raw),
+    )
+    .unwrap();
     let config = write_config(&tmp, &server, &root, &state_dir);
 
     Command::cargo_bin("sgm-windows-helper")
@@ -762,7 +766,7 @@ fn a_dry_run_names_the_save_it_would_upload() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(upload.calls(), 0, "a dry run uploaded:\n{stderr}");
     assert!(
-        stderr.contains("Would upload") && stderr.contains("ff7.gme"),
+        stderr.contains("Would upload") && stderr.contains("memory_card_1.gme"),
         "the dry run does not name the save it would upload:\n{stderr}"
     );
     assert!(
@@ -904,7 +908,11 @@ fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
     fs::create_dir_all(root.join("Sony/PSX")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     let raw = build_valid_ps1_memcard();
-    fs::write(root.join("Sony/PSX/ff7.gme"), encode_ps1_dexdrive(&raw)).unwrap();
+    fs::write(
+        root.join("Sony/PSX/memory_card_1.gme"),
+        encode_ps1_dexdrive(&raw),
+    )
+    .unwrap();
     let config = write_config(&tmp, &server, &root, &state_dir);
 
     Command::cargo_bin("sgm-windows-helper")
@@ -2429,7 +2437,11 @@ fn a_duplicate_on_a_converted_save_is_not_uploaded_again() {
     fs::create_dir_all(root.join("Sony/PSX")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     let raw = build_valid_ps1_memcard();
-    fs::write(root.join("Sony/PSX/ff7.gme"), encode_ps1_dexdrive(&raw)).unwrap();
+    fs::write(
+        root.join("Sony/PSX/memory_card_1.gme"),
+        encode_ps1_dexdrive(&raw),
+    )
+    .unwrap();
     let config = write_config(&tmp, &server, &root, &state_dir);
 
     Command::cargo_bin("sgm-windows-helper")
