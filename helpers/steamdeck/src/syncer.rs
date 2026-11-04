@@ -237,6 +237,7 @@ pub fn run_sync(
                     &api,
                     &save_path,
                     &save_key,
+                    sync_state.entries.get(&save_key),
                     &fingerprint,
                     &source.name,
                     &source.kind,
@@ -1481,6 +1482,7 @@ fn process_single_save(
     api: &ApiClient,
     save_path: &std::path::Path,
     save_key: &str,
+    prior_entry: Option<&SyncedEntry>,
     fingerprint: &str,
     source_name: &str,
     source_kind: &SourceKind,
@@ -1758,7 +1760,37 @@ fn process_single_save(
         )));
     }
 
-    if options.force_upload {
+    // What did both sides last agree on?  Comparing local against remote alone
+    // cannot tell "the user just saved" from "the server has something new", so a
+    // divergence was resolved by asking the server, which can only see its own side.
+    let (local_moved, remote_moved) = match prior_entry {
+        Some(prior) => {
+            let last = prior.sha256.as_str();
+            let remote = latest.sha256.as_deref().unwrap_or("");
+            (last != local_sha.as_str(), last != remote)
+        }
+        // Nothing agreed yet (first sync): not a conflict, fall through.
+        None => (false, false),
+    };
+
+    if local_moved && remote_moved {
+        // Both sides moved, and neither is more real.  Touch neither.
+        let remote_sha = latest.sha256.as_deref().unwrap_or("");
+        report.conflicts += 1;
+        eprintln!(
+            "Sync conflict for {}: local {} and server {} both changed since the last sync; leaving both untouched",
+            save_path.display(),
+            &local_sha[..local_sha.len().min(8)],
+            &remote_sha[..remote_sha.len().min(8)]
+        );
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            prior_entry.expect("conflict requires a prior entry").clone(),
+        )));
+    }
+
+    // Only the local side moved: the ordinary "player just saved" case.  Upload it.
+    if options.force_upload || local_moved {
         if options.dry_run {
             report.uploaded += 1;
             return Ok(Some(processed_entry(
