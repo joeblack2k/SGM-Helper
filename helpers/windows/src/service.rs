@@ -1099,6 +1099,7 @@ mod tests {
         .unwrap();
         let config = AppConfig {
             secure: false,
+            psp_savedata_bundles: false,
             url: "127.0.0.1".to_string(),
             port: 80,
             email: "helper@example.com".to_string(),

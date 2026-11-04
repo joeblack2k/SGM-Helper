@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "cpk", "dsv", "gme", "mcr",
-    "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
+    "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr", "brm",
 ];
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -199,6 +199,379 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+/// The directory names PPSSPP keeps game saves under: its own `SAVEDATA`, and
+/// `PPSSPP-SA`, the folder RetroDECK links `SAVEDATA` to.
+const PSP_SAVEDATA_PARENTS: &[&str] = &["SAVEDATA", "PPSSPP-SA"];
+
+/// Where PPSSPP's SAVEDATA sits below a directory a source names: RetroDECK's
+/// saves root, PPSSPP's own memory stick, and a memory stick root.
+pub const PSP_SAVEDATA_SUBPATHS: &[&str] =
+    &["PSP/PPSSPP-SA", "PSP/SAVEDATA", "memstick/PSP/SAVEDATA"];
+
+/// The largest PARAM.SFO the helper reads. PPSSPP writes about 5 KB; anything
+/// far larger is not a PARAM.SFO.
+const PSP_PARAM_SFO_MAX_BYTES: u64 = 1024 * 1024;
+
+/// DOS date for 1980-01-01, the earliest a zip can name: day 1, month 1, year 0.
+const ZIP_FIXED_DOS_DATE: u16 = 0x0021;
+
+/// Pack a PPSSPP `SAVEDATA/<dir>/` folder into one payload, and its sha256.
+///
+/// The helper decides "in sync" by comparing this sha256 with the server's, so
+/// the bytes depend only on the files' names and contents: every regular file
+/// directly in the folder, sorted by name, stored without compression, under a
+/// fixed timestamp, with no extra fields and no comments. A subdirectory is not
+/// part of the save PPSSPP reads and is left out.
+pub fn pack_psp_savedata(dir: &Path) -> Result<(Vec<u8>, String)> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("kan PSP SAVEDATA map niet lezen: {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("kan PSP SAVEDATA map niet lezen: {}", dir.display()))?;
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = entry.file_name().into_string().map_err(|name| {
+            anyhow::anyhow!(
+                "PSP SAVEDATA bestand heeft geen UTF-8 naam: {:?} in {}",
+                name,
+                dir.display()
+            )
+        })?;
+        let bytes = fs::read(entry.path())
+            .with_context(|| format!("kan bestand niet lezen: {}", entry.path().display()))?;
+        entries.push((name, bytes));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let bytes = build_stored_zip(&entries)?;
+    let sha = sha256_bytes(&bytes);
+    Ok((bytes, sha))
+}
+
+/// A zip archive of `entries` in the order given: Stored, DOS time
+/// 1980-01-01 00:00, no extra fields, no comments, no zip64.
+pub fn build_stored_zip(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, bytes) in entries {
+        let name_len = u16::try_from(name.len())
+            .ok()
+            .context("zip entry naam is te lang")?;
+        let size = u32::try_from(bytes.len())
+            .ok()
+            .filter(|size| *size != u32::MAX)
+            .context("zip entry is te groot")?;
+        let offset = u32::try_from(out.len())
+            .ok()
+            .context("zip archief is te groot")?;
+        let crc = crc32(bytes);
+
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: Stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // time 00:00:00
+        out.extend_from_slice(&ZIP_FIXED_DOS_DATE.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(bytes);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&ZIP_FIXED_DOS_DATE.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&name_len.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
+        central.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let count = u16::try_from(entries.len())
+        .ok()
+        .context("te veel zip entries")?;
+    let central_offset = u32::try_from(out.len())
+        .ok()
+        .context("zip archief is te groot")?;
+    let central_len = u32::try_from(central.len())
+        .ok()
+        .context("zip archief is te groot")?;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&central_len.to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    Ok(out)
+}
+
+/// The entries of a SAVEDATA bundle, names exactly as stored. Only Stored
+/// entries are accepted, every offset is bounds-checked, and every entry's
+/// CRC must match: a payload that is not the bundle the helpers write is an
+/// error, never a partial restore.
+pub fn unpack_psp_savedata(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+        let end = at.checked_add(2)?;
+        bytes
+            .get(at..end)
+            .map(|raw| u16::from_le_bytes([raw[0], raw[1]]))
+    }
+    fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+        let end = at.checked_add(4)?;
+        bytes
+            .get(at..end)
+            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    const EOCD_LEN: usize = 22;
+    let earliest = bytes.len().saturating_sub(EOCD_LEN + u16::MAX as usize);
+    let eocd = (earliest..=bytes.len().saturating_sub(EOCD_LEN))
+        .rev()
+        .find(|at| u32_at(bytes, *at) == Some(0x0605_4b50))
+        .filter(|_| bytes.len() >= EOCD_LEN)
+        .context("PSP bundle is geen zip archief")?;
+    let count = u16_at(bytes, eocd + 10).context("PSP bundle zip is afgekapt")? as usize;
+    let mut cursor = u32_at(bytes, eocd + 16).context("PSP bundle zip is afgekapt")? as usize;
+
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if u32_at(bytes, cursor) != Some(0x0201_4b50) {
+            anyhow::bail!("PSP bundle zip heeft een ongeldige centrale directory");
+        }
+        let method = u16_at(bytes, cursor + 10).context("PSP bundle zip is afgekapt")?;
+        let crc = u32_at(bytes, cursor + 16).context("PSP bundle zip is afgekapt")?;
+        let size = u32_at(bytes, cursor + 20).context("PSP bundle zip is afgekapt")? as usize;
+        let name_len = u16_at(bytes, cursor + 28).context("PSP bundle zip is afgekapt")? as usize;
+        let extra_len = u16_at(bytes, cursor + 30).context("PSP bundle zip is afgekapt")? as usize;
+        let comment_len =
+            u16_at(bytes, cursor + 32).context("PSP bundle zip is afgekapt")? as usize;
+        let local = u32_at(bytes, cursor + 42).context("PSP bundle zip is afgekapt")? as usize;
+        let name_start = cursor + 46;
+        let name = bytes
+            .get(name_start..name_start + name_len)
+            .context("PSP bundle zip is afgekapt")?;
+        let name = String::from_utf8(name.to_vec())
+            .ok()
+            .context("PSP bundle zip entry heeft geen UTF-8 naam")?;
+        if method != 0 {
+            anyhow::bail!(
+                "PSP bundle entry {:?} is gecomprimeerd (methode {}); alleen Stored wordt gelezen",
+                name,
+                method
+            );
+        }
+        if u32_at(bytes, local) != Some(0x0403_4b50) {
+            anyhow::bail!("PSP bundle entry {:?} wijst naar geen lokale header", name);
+        }
+        let local_name_len =
+            u16_at(bytes, local + 26).context("PSP bundle zip is afgekapt")? as usize;
+        let local_extra_len =
+            u16_at(bytes, local + 28).context("PSP bundle zip is afgekapt")? as usize;
+        let data_start = local + 30 + local_name_len + local_extra_len;
+        let data = bytes
+            .get(
+                data_start
+                    ..data_start
+                        .checked_add(size)
+                        .context("PSP bundle zip is afgekapt")?,
+            )
+            .context("PSP bundle zip is afgekapt")?;
+        if crc32(data) != crc {
+            anyhow::bail!("PSP bundle entry {:?} heeft een ongeldige CRC", name);
+        }
+        entries.push((name, data.to_vec()));
+        cursor = name_start + name_len + extra_len + comment_len;
+    }
+    Ok(entries)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// The SAVEDATA_DIRECTORY a PARAM.SFO names: the folder PPSSPP reads the save from.
+pub fn read_param_sfo_savedir(path: &Path) -> Option<String> {
+    let len = fs::metadata(path).ok()?.len();
+    if len > PSP_PARAM_SFO_MAX_BYTES {
+        return None;
+    }
+    parse_param_sfo_savedir(&fs::read(path).ok()?)
+}
+
+/// Parse a PSF (`\0PSF`) table and return its SAVEDATA_DIRECTORY. Every offset
+/// comes from the file, so every one is checked before it is used.
+pub fn parse_param_sfo_savedir(bytes: &[u8]) -> Option<String> {
+    let u16_at = |at: usize| -> Option<u16> {
+        bytes
+            .get(at..at.checked_add(2)?)
+            .map(|raw| u16::from_le_bytes([raw[0], raw[1]]))
+    };
+    let u32_at = |at: usize| -> Option<usize> {
+        bytes
+            .get(at..at.checked_add(4)?)
+            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize)
+    };
+    if bytes.get(0..4)? != b"\0PSF" {
+        return None;
+    }
+    let key_table = u32_at(8)?;
+    let data_table = u32_at(12)?;
+    let count = u32_at(16)?;
+    for index in 0..count {
+        let entry = index.checked_mul(16)?.checked_add(20)?;
+        let key_offset = usize::from(u16_at(entry)?);
+        let format = u16_at(entry + 2)?;
+        let value_len = u32_at(entry + 4)?;
+        let data_offset = u32_at(entry + 12)?;
+
+        let key_start = key_table.checked_add(key_offset)?;
+        let key_bytes = bytes.get(key_start..)?;
+        let key_end = key_bytes.iter().position(|byte| *byte == 0)?;
+        if &key_bytes[..key_end] != b"SAVEDATA_DIRECTORY" {
+            continue;
+        }
+        // utf8 (NUL-terminated) or utf8-s; an integer is not a directory name.
+        if format != 0x0204 && format != 0x0004 {
+            return None;
+        }
+        let value_start = data_table.checked_add(data_offset)?;
+        let value = bytes.get(value_start..value_start.checked_add(value_len)?)?;
+        let value = value.split(|byte| *byte == 0).next().unwrap_or_default();
+        let value = std::str::from_utf8(value).ok()?.trim();
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    None
+}
+
+pub fn is_psp_savedata_parent(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            PSP_SAVEDATA_PARENTS
+                .iter()
+                .any(|parent| parent.eq_ignore_ascii_case(name))
+        })
+        .unwrap_or(false)
+}
+
+/// A folder is a PPSSPP save when it sits in SAVEDATA (or RetroDECK's
+/// PPSSPP-SA) and its PARAM.SFO names the folder itself.
+pub fn is_psp_savedata_dir(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !dir.parent().map(is_psp_savedata_parent).unwrap_or(false) {
+        return false;
+    }
+    let Ok(listing) = fs::read_dir(dir) else {
+        return false;
+    };
+    listing
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        })
+        .find(|entry| entry.file_name().eq_ignore_ascii_case("PARAM.SFO"))
+        .and_then(|entry| read_param_sfo_savedir(&entry.path()))
+        .map(|savedir| savedir == name)
+        .unwrap_or(false)
+}
+
+/// Every PPSSPP save folder under `roots`, once each. A root may be the
+/// SAVEDATA folder itself.
+pub fn discover_psp_savedata_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    discover_psp_savedata_dirs_in(roots, true)
+}
+
+fn discover_psp_savedata_dirs_in(roots: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        // A non-recursive source still sees the folders of a SAVEDATA root,
+        // and of the places PPSSPP keeps one under its own directory.
+        let mut starts = vec![root.clone()];
+        if !recursive {
+            starts.extend(
+                PSP_SAVEDATA_SUBPATHS
+                    .iter()
+                    .map(|subpath| root.join(subpath))
+                    .filter(|path| path.is_dir()),
+            );
+        }
+        for start in starts {
+            let walker = if recursive {
+                WalkDir::new(&start)
+            } else {
+                WalkDir::new(&start).max_depth(1)
+            };
+            let mut walk = walker.follow_links(false).into_iter();
+            while let Some(entry) = walk.next() {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                if !entry.file_type().is_dir() {
+                    continue;
+                }
+                if is_psp_savedata_dir(entry.path()) {
+                    dirs.push(entry.path().to_path_buf());
+                    walk.skip_current_dir();
+                }
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Single-file saves and PPSSPP save folders under `roots`. A file inside a
+/// save folder belongs to the folder and is not returned on its own: its data
+/// file alone names no folder, and a record of it restores nowhere.
+pub fn discover_save_files_and_psp_bundles(
+    roots: &[PathBuf],
+    recursive: bool,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let bundles = discover_psp_savedata_dirs_in(roots, recursive);
+    let files = discover_save_files(roots, recursive)?
+        .into_iter()
+        .filter(|path| !bundles.iter().any(|bundle| path.starts_with(bundle)))
+        .collect();
+    Ok((files, bundles))
 }
 
 pub fn filename_stem(path: &Path) -> String {
@@ -548,6 +921,18 @@ pub fn classify_supported_save(
 
     let save_size = save_path.metadata().ok()?.len();
     if !is_plausible_save_size(save_size) || looks_plain_text(save_path) {
+        return None;
+    }
+
+    // Decided by the format's own trailer, before any path rule: the file is
+    // every Sega CD game's save at once, so no ROM names it.
+    if save_ext == "brm" {
+        if is_sega_cd_shared_bram(save_path) {
+            return Some(SaveClassification {
+                system_slug: "sega-cd".to_string(),
+                evidence: format!("sega cd backup ram trailer + .brm ({} bytes)", save_size),
+            });
+        }
         return None;
     }
 
@@ -1293,6 +1678,37 @@ fn looks_like_wii_data_bin_path(path: &Path) -> bool {
         .map(|value| value.eq_ignore_ascii_case("data.bin"))
         .unwrap_or(false)
         && wii_title_code_from_path(path).is_some()
+}
+
+/// Genesis Plus GX's Sega CD backup RAM, internal (`scd_U.brm`, 8 KiB) or RAM
+/// cart (`cart.brm`, 512 KiB): it ends with the format's trailer, and a blank,
+/// freshly formatted one is all zero before its last 64 bytes.
+pub fn is_sega_cd_shared_bram(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    sega_cd_bram_has_saves(&bytes)
+}
+
+fn sega_cd_bram_has_saves(bytes: &[u8]) -> bool {
+    const TRAILER: usize = 0x40;
+    if !matches!(bytes.len(), 8192 | 524_288) {
+        return false;
+    }
+    let trailer = &bytes[bytes.len() - TRAILER..];
+    if &trailer[0x20..0x2B] != b"SEGA_CD_ROM" || &trailer[0x30..0x3D] != b"RAM_CARTRIDGE" {
+        return false;
+    }
+    bytes[..bytes.len() - TRAILER]
+        .iter()
+        .any(|value| *value != 0)
+}
+
+/// The line key a shared Sega CD backup RAM syncs under: one per device kind and
+/// file, since the file is the device's whole Sega CD save store.
+pub fn sega_cd_bram_line_key(device_type: &str, save_path: &Path) -> Option<String> {
+    let stem = save_path.file_stem()?.to_str()?.to_ascii_lowercase();
+    Some(format!("segacd-bram:{}:{}", device_type, stem))
 }
 
 fn validate_non_blank_payload(path: &Path) -> bool {
@@ -2180,6 +2596,49 @@ fn looks_plain_text(path: &Path) -> bool {
     printable.saturating_mul(100) >= bytes.len().saturating_mul(95)
 }
 
+/// A PARAM.SFO the way PPSSPP writes one: the PSF header, an index entry
+/// per key, a key table and a data table. Only the two keys the helper
+/// reads; the real file also carries the title, detail and file list.
+#[cfg(test)]
+pub(crate) fn param_sfo_fixture(save_dir: &str) -> Vec<u8> {
+    let keys: &[(&str, &[u8], u32)] = &[
+        ("CATEGORY", b"MS\0", 4),
+        ("SAVEDATA_DIRECTORY", save_dir.as_bytes(), 64),
+    ];
+    let mut key_table = Vec::new();
+    let mut data_table = Vec::new();
+    let mut index = Vec::new();
+    for (key, value, max_len) in keys {
+        let mut value = value.to_vec();
+        if !value.ends_with(&[0]) {
+            value.push(0);
+        }
+        index.extend_from_slice(&(key_table.len() as u16).to_le_bytes());
+        index.extend_from_slice(&0x0204u16.to_le_bytes());
+        index.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        index.extend_from_slice(&max_len.to_le_bytes());
+        index.extend_from_slice(&(data_table.len() as u32).to_le_bytes());
+        key_table.extend_from_slice(key.as_bytes());
+        key_table.push(0);
+        value.resize(*max_len as usize, 0);
+        data_table.extend_from_slice(&value);
+    }
+    while key_table.len() % 4 != 0 {
+        key_table.push(0);
+    }
+    let key_offset = 20 + index.len();
+    let data_offset = key_offset + key_table.len();
+    let mut out = b"\0PSF".to_vec();
+    out.extend_from_slice(&0x0101u32.to_le_bytes());
+    out.extend_from_slice(&(key_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    out.extend_from_slice(&index);
+    out.extend_from_slice(&key_table);
+    out.extend_from_slice(&data_table);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2765,5 +3224,168 @@ mod tests {
 
     fn write_be_u32(payload: &mut [u8], offset: usize, value: u32) {
         payload[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_psp_savedata(parent: &Path, save_dir: &str) -> PathBuf {
+        let dir = parent.join(save_dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut data = vec![0u8; 4096];
+        data[0] = 0xFF;
+        data[17] = 0x42;
+        fs::write(dir.join("DISSIDIA.BIN"), &data).unwrap();
+        fs::write(dir.join("ICON0.PNG"), b"\x89PNG\r\n\x1a\nicon").unwrap();
+        fs::write(dir.join("PARAM.SFO"), param_sfo_fixture(save_dir)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn param_sfo_names_its_savedata_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("PARAM.SFO");
+        fs::write(&path, param_sfo_fixture("ULUS10437GameData00")).unwrap();
+        assert_eq!(
+            read_param_sfo_savedir(&path).as_deref(),
+            Some("ULUS10437GameData00")
+        );
+
+        // Every offset is read from the file, so every one is checked: a
+        // truncated or foreign file answers None rather than panicking.
+        let whole = param_sfo_fixture("ULUS10437GameData00");
+        for cut in 0..whole.len() {
+            let _ = parse_param_sfo_savedir(&whole[..cut]);
+        }
+        assert_eq!(parse_param_sfo_savedir(&whole[..whole.len() - 70]), None);
+        assert_eq!(parse_param_sfo_savedir(b"not a psf at all"), None);
+        let mut bad_offset = whole.clone();
+        bad_offset[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_param_sfo_savedir(&bad_offset), None);
+    }
+
+    #[test]
+    fn a_psp_savedata_bundle_is_byte_identical_across_runs_and_mtimes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_psp_savedata(&tmp.path().join("PSP/SAVEDATA"), "ULUS10437GameData00");
+        // A subdirectory is not part of the save PPSSPP reads.
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("nested/stray.bin"), b"stray").unwrap();
+
+        let (first, first_sha) = pack_psp_savedata(&dir).unwrap();
+        let (second, second_sha) = pack_psp_savedata(&dir).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first_sha, second_sha);
+        assert_eq!(first_sha, sha256_bytes(&first));
+
+        // "In sync" is a sha comparison with the server, so touching a file
+        // must not change the bundle.
+        for name in ["DISSIDIA.BIN", "ICON0.PNG", "PARAM.SFO"] {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap();
+            file.set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            )
+            .unwrap();
+        }
+        let (third, third_sha) = pack_psp_savedata(&dir).unwrap();
+        assert_eq!(first, third);
+        assert_eq!(first_sha, third_sha);
+
+        let entries = unpack_psp_savedata(&first).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["DISSIDIA.BIN", "ICON0.PNG", "PARAM.SFO"]);
+        assert_eq!(entries[0].1, fs::read(dir.join("DISSIDIA.BIN")).unwrap());
+        // Stored, DOS time 1980-01-01 00:00 (date 0x0021, time 0).
+        assert_eq!(&first[0..4], b"PK\x03\x04");
+        assert_eq!(
+            u16::from_le_bytes([first[8], first[9]]),
+            0,
+            "method must be Stored"
+        );
+        assert_eq!(u16::from_le_bytes([first[10], first[11]]), 0);
+        assert_eq!(u16::from_le_bytes([first[12], first[13]]), 0x0021);
+    }
+
+    #[test]
+    fn a_psp_savedata_folder_is_one_bundle_and_its_bin_is_not_a_loose_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saves = tmp.path().join("saves");
+        let bundle = write_psp_savedata(&saves.join("PSP/PPSSPP-SA"), "ULUS10437GameData00");
+        // A folder whose PARAM.SFO names another directory is not PPSSPP's save.
+        let renamed = write_psp_savedata(&saves.join("PSP/SAVEDATA"), "ULUS10437GameData01");
+        fs::write(
+            renamed.join("PARAM.SFO"),
+            param_sfo_fixture("SOMETHINGELSE"),
+        )
+        .unwrap();
+        // Not under SAVEDATA / PPSSPP-SA: an ordinary directory.
+        write_psp_savedata(&saves.join("psp"), "ULUS10437GameData02");
+        fs::create_dir_all(saves.join("snes")).unwrap();
+        fs::write(saves.join("snes/mario.srm"), vec![0x11u8; 8192]).unwrap();
+
+        let roots = vec![saves.clone()];
+        assert_eq!(discover_psp_savedata_dirs(&roots), vec![bundle.clone()]);
+
+        // A source whose root is the SAVEDATA folder itself (the cabinet's
+        // PPSSPP source) still finds the folder.
+        assert_eq!(
+            discover_psp_savedata_dirs(&[saves.join("PSP/PPSSPP-SA")]),
+            vec![bundle.clone()]
+        );
+
+        let (files, bundles) = discover_save_files_and_psp_bundles(&roots, true).unwrap();
+        assert_eq!(bundles, vec![bundle.clone()]);
+        assert!(
+            !files.iter().any(|path| path.starts_with(&bundle)),
+            "the bundle's own files were discovered as loose saves: {files:?}"
+        );
+        assert!(files.contains(&saves.join("snes/mario.srm")));
+        assert!(files.contains(&renamed.join("DISSIDIA.BIN")));
+    }
+}
+
+#[cfg(test)]
+mod sega_cd_bram_tests {
+    use super::*;
+
+    fn bram(size: usize, with_save: bool) -> Vec<u8> {
+        let mut bytes = vec![0u8; size];
+        let t = size - 0x40;
+        bytes[t + 0x20..t + 0x2B].copy_from_slice(b"SEGA_CD_ROM");
+        bytes[t + 0x30..t + 0x3D].copy_from_slice(b"RAM_CARTRIDGE");
+        if with_save {
+            bytes[0x10] = 0x42;
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_backup_ram_with_a_save_is_sega_cd_whatever_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, size) in [("scd_U.brm", 8192), ("cart.brm", 524_288)] {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bram(size, true)).unwrap();
+            let class = classify_supported_save(&path, None).expect(name);
+            assert_eq!(class.system_slug, "sega-cd", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_blank_or_foreign_brm_is_not_a_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blank = tmp.path().join("scd_U.brm");
+        std::fs::write(&blank, bram(8192, false)).unwrap();
+        assert!(classify_supported_save(&blank, None).is_none());
+        let foreign = tmp.path().join("other.brm");
+        std::fs::write(&foreign, vec![0x5Au8; 8192]).unwrap();
+        assert!(classify_supported_save(&foreign, None).is_none());
+    }
+
+    #[test]
+    fn its_line_key_names_the_device_and_file() {
+        assert_eq!(
+            sega_cd_bram_line_key("retroarch", Path::new("/saves/segacd/scd_U.brm")).as_deref(),
+            Some("segacd-bram:retroarch:scd_u")
+        );
     }
 }

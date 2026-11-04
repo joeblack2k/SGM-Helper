@@ -1474,6 +1474,7 @@ mod tests {
     fn default_windows_source_uses_save_layout() {
         let cfg = AppConfig {
             secure: false,
+            psp_savedata_bundles: false,
             url: "127.0.0.1".to_string(),
             port: 3001,
             email: String::new(),
