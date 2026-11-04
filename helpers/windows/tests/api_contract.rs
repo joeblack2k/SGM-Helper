@@ -251,7 +251,7 @@ fn backend_forced_dry_run_marks_the_summary_and_uploads_nothing() {
     assert!(
         stdout.contains(
             "skipped=1 rejected_n64_controller_pak=0 accepted_not_stored=0 \
-             errors=0 would_upload=1 would_download=0"
+             rejected_permanent=0 errors=0 would_upload=1 would_download=0"
         ),
         "a skipped save was counted as a simulated upload, or the simulation was missed: {stdout}"
     );
@@ -2012,6 +2012,95 @@ fn a_ds_save_names_its_runtime_profile_on_the_latest_check() {
         !stderr.contains("runtimeProfile is required"),
         "the server refused a DS check for its missing profile:\n{stderr}"
     );
+}
+
+#[test]
+fn a_permanently_refused_save_is_not_uploaded_again() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_reject","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"reject@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"success":true,"count":1,"rom":{"sha1":"reject123","md5":"md5v","fileName":"wario.sav"}}"#,
+            );
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(422)
+            .header("content-type", "application/json")
+            .body(r#"{"success":false,"reason":"snes raw save payload is blank"}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("Nintendo/Game Boy/wario.sav"),
+        vec![0x00u8; 32768],
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("reject@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "second sync failed: {stdout}");
+    assert!(
+        stdout.contains("rejected_permanent=1"),
+        "the refused save was not counted as permanently rejected: {stdout}"
+    );
+    assert!(
+        stdout.contains("errors=0"),
+        "the refused save was retried instead of skipped: {stdout}"
+    );
+    assert_eq!(upload.calls(), 1);
 }
 
 fn romroot_helper() -> Command {

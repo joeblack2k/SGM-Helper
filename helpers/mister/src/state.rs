@@ -43,6 +43,19 @@ impl AuthState {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncState {
     pub entries: HashMap<String, SyncedEntry>,
+    /// Saves the server refused in a way that cannot change on its own.
+    /// Keyed by local path; the stored hash is what makes a corrected save
+    /// retry, because a changed payload no longer matches its record.
+    #[serde(default)]
+    pub terminal_rejections: HashMap<String, TerminalRejection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalRejection {
+    pub sha256: String,
+    pub status: u16,
+    pub reason: String,
+    pub recorded_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
