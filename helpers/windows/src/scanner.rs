@@ -1131,19 +1131,24 @@ pub fn classify_supported_save(
         &save_lower,
         &[
             "master system",
+            "mastersystem",
             "/sms/",
             "\\sms\\",
             "game gear",
+            "gamegear",
             "/gg/",
             "\\gg\\",
             "sega 32x",
             "sega-32x",
             "sega32x",
+            "sega32xjp",
+            "sega32xna",
             "/32x/",
             "\\32x\\",
             "mega cd",
             "mega-cd",
             "megacd",
+            "megacdjp",
             "sega cd",
             "sega-cd",
             "segacd",
@@ -1158,11 +1163,13 @@ pub fn classify_supported_save(
             "genesis",
             "mega drive",
             "megadrive",
+            "megadrivejp",
             "/md/",
             "\\md\\",
             "/gen/",
             "\\gen\\",
             "saturn",
+            "saturnjp",
             "dreamcast",
             "sega",
         ],
@@ -1193,6 +1200,54 @@ pub fn classify_supported_save(
                 save_size,
                 "neogeo",
                 format!("path hint neogeo + .{} ({} bytes)", save_ext, save_size),
+            );
+        }
+        return None;
+    }
+
+    if contains_any(
+        &save_lower,
+        &[
+            "pc engine",
+            "pcengine",
+            "pc-engine",
+            "pcenginecd",
+            "pc-engine-cd",
+            "turbografx",
+            "turbo grafx",
+            "turbo-grafx",
+            "tgfx16",
+            "/tg16/",
+            "\\tg16\\",
+            "/tg-cd/",
+            "\\tg-cd\\",
+            "/tg_cd/",
+            "\\tg_cd\\",
+            "supergrafx",
+            "super grafx",
+            "/sgx/",
+            "\\sgx\\",
+            "/pce/",
+            "\\pce\\",
+            "/pce-cd/",
+            "\\pce-cd\\",
+            "/pcecd/",
+            "\\pcecd\\",
+            "nec - pc engine",
+            "nec - turbografx",
+            "mednafen-pce",
+            "beetle pce",
+            "beetle-pce",
+        ],
+    ) {
+        let slug = infer_nec_slug(&save_lower);
+        if is_plausible_save_for_system(&save_ext, save_size, slug) {
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                slug,
+                format!("path hint nec + .{} ({} bytes)", save_ext, save_size),
             );
         }
         return None;
@@ -1467,10 +1522,13 @@ fn infer_sega_slug(haystack: &str) -> &'static str {
     ) {
         return "dreamcast";
     }
-    if contains_any(haystack, &["master system", "/sms/", "\\sms\\"]) {
+    if contains_any(
+        haystack,
+        &["master system", "mastersystem", "/sms/", "\\sms\\"],
+    ) {
         return "master-system";
     }
-    if contains_any(haystack, &["game gear", "/gg/", "\\gg\\"]) {
+    if contains_any(haystack, &["game gear", "gamegear", "/gg/", "\\gg\\"]) {
         return "game-gear";
     }
     if contains_any(
@@ -1517,6 +1575,14 @@ fn infer_sega_slug(haystack: &str) -> &'static str {
         return "sega-32x";
     }
     "genesis"
+}
+
+fn infer_nec_slug(_haystack: &str) -> &'static str {
+    // MiSTer's TurboGrafx-16 core handles both HuCard ROMs and CD-ROM games
+    // under one core (TGFX16). Saves land in /media/fat/saves/TGFX16/ for
+    // both. Future work could split tgfx16-cd if MiSTer's core ever
+    // splits, or if a downstream consumer wants the distinction.
+    "tgfx16"
 }
 
 fn infer_sony_slug(haystack: &str) -> &'static str {
@@ -1641,6 +1707,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "saturn" => matches!(ext, "sav" | "srm" | "ram" | "bkr"),
         "dreamcast" => matches!(ext, "bin" | "vms" | "dci"),
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
+        "tgfx16" => matches!(ext, "sav" | "srm" | "ram" | "bkr" | "brm"),
         "wii" => ext == "bin",
         "psx" => matches!(
             ext,
@@ -1663,10 +1730,18 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             size,
             512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
         ),
-        "gameboy" => matches!(
-            size,
-            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536
-        ),
+        "gameboy" => match ext {
+            // .rtc carries the GBC real-time clock state (Pokemon
+            // Crystal/Gold/Silver, Harvest Moon GBC). It's structurally
+            // different from SRAM — typically 8 bytes (MiSTer Gameboy_MiSTer
+            // canonical layout) up to ~64 bytes for variants with extra
+            // metadata. Don't apply the SRAM size profile to it.
+            "rtc" => (1..=64).contains(&size),
+            _ => matches!(
+                size,
+                512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536
+            ),
+        },
         "gba" => matches!(size, 512 | 8192 | 32768 | 65536 | 131072),
         "n64" => match ext {
             "eep" => size == 512 || size == 2048,
@@ -1710,6 +1785,13 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             // around the 64 KiB payload, so 0x12000 is valid even though it is not
             // a power-of-two size.
             size == 0x12000 || (size.is_power_of_two() && (512..=2_097_152).contains(&size))
+        }
+        "tgfx16" => {
+            // TurboGrafx-16 / PC Engine HuCard battery saves are typically 2KB SRAM.
+            // PCE CD / TGFX-CD adds backup RAM (BRAM) — 2KB stock, 8KB extended,
+            // or up to 32KB on some accessories. Accept the common power-of-two
+            // sizes in that range.
+            matches!(size, 2048 | 4096 | 8192 | 16384 | 32768)
         }
         "wii" => (WII_DATA_BIN_FILE_HEADER_OFFSET + 0x80..=MAX_SAVE_BYTES as usize)
             .contains(&(size as usize)),
@@ -2595,10 +2677,14 @@ fn validate_ps1_raw_memcard(bytes: &[u8]) -> bool {
         }
     }
 
-    let trailing_start = 63 * PS1_FRAME_SIZE;
-    let trailing_end = trailing_start + PS1_FRAME_SIZE;
-    let trailing = &header[trailing_start..trailing_end];
-    trailing.starts_with(b"MC") && frame_checksum_ok(trailing)
+    // Frame 63 ("write test sector") historically duplicates frame 0's MC magic
+    // on real-hardware-formatted cards. Many emulators (SwanStation / Beetle
+    // PSX / Duckstation libretro) do NOT populate it that way — they leave it
+    // zero-filled or write game data through it. Requiring "MC" here was
+    // rejecting every RetroArch/SwanStation memcard as if it were noise.
+    // Frame 0 magic + frames 1-15 checksums are sufficient evidence this is
+    // a real PS1 memcard.
+    true
 }
 
 fn frame_checksum_ok(frame: &[u8]) -> bool {
@@ -3741,6 +3827,193 @@ mod tests {
                     .unwrap();
             assert_eq!(bundles, vec![bundle.clone()], "recursive={recursive}");
             assert!(!files.iter().any(|path| path.starts_with(&bundle)));
+        }
+    }
+
+    #[test]
+    fn ps1_memcard_accepted_when_trailing_frame_lacks_mc_magic() {
+        // Build a valid memcard, then overwrite frame 63 with the "looks like
+        // game data continuation" bytes seen in real SwanStation/RetroArch
+        // memcards (e.g. Tom Clancy's Rainbow Six - Lone Wolf saved on Steam
+        // Deck). Frame 63 historically held the "write test sector" with MC
+        // magic; emulators don't always honor that — they leave it zeroed
+        // OR write actual game state through it. The validator must accept
+        // these. Issue #N (filed alongside this commit).
+        let mut bytes = build_valid_ps1_memcard();
+        let trailing_start = 63 * PS1_FRAME_SIZE;
+        // Wipe to zero, then write the observed bytes from the real-world
+        // SwanStation Rainbow Six memcard at this offset.
+        for b in bytes[trailing_start..trailing_start + PS1_FRAME_SIZE].iter_mut() {
+            *b = 0;
+        }
+        bytes[trailing_start..trailing_start + 8]
+            .copy_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x80, 0x0C, 0x5A, 0x27]);
+        assert!(
+            validate_ps1_raw_memcard(&bytes),
+            "memcard with non-MC trailing frame should be accepted"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_accepted_when_trailing_frame_is_zero_filled() {
+        // Another common emulator pattern: leave frame 63 entirely zeroed.
+        let mut bytes = build_valid_ps1_memcard();
+        let trailing_start = 63 * PS1_FRAME_SIZE;
+        for b in bytes[trailing_start..trailing_start + PS1_FRAME_SIZE].iter_mut() {
+            *b = 0;
+        }
+        assert!(
+            validate_ps1_raw_memcard(&bytes),
+            "memcard with zero-filled trailing frame should be accepted"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_still_rejected_when_size_wrong() {
+        let bytes = vec![0u8; PS1_MEMCARD_SIZE - 1];
+        assert!(
+            !validate_ps1_raw_memcard(&bytes),
+            "memcard with wrong size must still be rejected"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_still_rejected_when_frame0_magic_absent() {
+        let mut bytes = build_valid_ps1_memcard();
+        bytes[0] = b'X';
+        bytes[1] = b'Y';
+        assert!(
+            !validate_ps1_raw_memcard(&bytes),
+            "memcard without MC magic at frame 0 must still be rejected"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_still_rejected_when_directory_frame_checksum_broken() {
+        let mut bytes = build_valid_ps1_memcard();
+        // Corrupt directory frame 3 (intentionally NOT touching frame 0 or
+        // the trailing frame — proves we still require directory frames to
+        // be well-formed even though we relaxed the trailing check).
+        let frame3_start = 3 * PS1_FRAME_SIZE;
+        let checksum_byte_index = frame3_start + PS1_FRAME_SIZE - 1;
+        bytes[checksum_byte_index] = bytes[checksum_byte_index].wrapping_add(1);
+        assert!(
+            !validate_ps1_raw_memcard(&bytes),
+            "memcard with broken directory frame checksum must still be rejected"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_regression_strict_format_still_accepted() {
+        // Regression guard: the original strict-format memcard (with MC at
+        // frame 63) must continue to pass — we only RELAXED the trailing
+        // check, not removed support for it.
+        let bytes = build_valid_ps1_memcard();
+        assert!(
+            validate_ps1_raw_memcard(&bytes),
+            "strict-format memcard with MC at trailing frame should still be accepted"
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_retrodeck_sega_single_word_dirs() {
+        // RetroDECK uses single-word lowercase directory names (gamegear,
+        // mastersystem, megadrive). The Sega classifier historically had
+        // some of these (megadrive, megacd, sega32x) but was missing
+        // gamegear and mastersystem. Issue #5 (filed alongside this commit).
+        // Tests cover both the fix and the previously-broken paths.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Build a 64K non-printable SRAM payload (battery save shape). 0xA5
+        // is binary-looking — using a printable byte like 0x42 ('B') would
+        // trip looks_plain_text() and bail at the early-return guard in
+        // classify_supported_save before any path-hint dispatch runs.
+        let payload = vec![0xA5u8; 65536];
+
+        for (subdir, expected_slug) in &[
+            ("gamegear", "game-gear"),         // FIX — was broken
+            ("mastersystem", "master-system"), // FIX — was broken
+            ("megadrive", "genesis"),          // regression guard
+            ("megacd", "sega-cd"),             // regression guard
+            ("sega32x", "sega-32x"),           // regression guard
+            ("genesis", "genesis"),            // regression guard (English name)
+            ("megacdjp", "sega-cd"),           // FIX — JP variant
+            // saturnjp omitted: Saturn classifier requires a valid backup-RAM
+            // header signature in passes_binary_validation, so a flat 0xA5
+            // payload is rejected before slug assignment. Worth its own test
+            // with a synthesized Saturn Bk-header fixture.
+            ("sega32xjp", "sega-32x"),  // FIX — JP variant
+            ("sega32xna", "sega-32x"),  // FIX — NA variant
+            ("megadrivejp", "genesis"), // FIX — JP variant
+        ] {
+            let dir = tmp.path().join("retrodeck/saves").join(subdir);
+            fs::create_dir_all(&dir).unwrap();
+            let save = dir.join("Test Game.srm");
+            fs::write(&save, &payload).unwrap();
+
+            let classification = classify_supported_save(&save, None);
+            assert!(
+                classification.is_some(),
+                "expected /{subdir}/ to classify (would skip in production with 'outside allowed console families' if None)",
+            );
+            let got = classification.unwrap().system_slug;
+            assert_eq!(
+                got, *expected_slug,
+                "/{subdir}/ classified as {got}, expected {expected_slug}",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_recognizes_pcengine_tgfx16_paths() {
+        // The TurboGrafx-16 / PC Engine block was missing entirely from
+        // classify_supported_save before this PR. Saves under any of the
+        // common dir conventions (RetroDECK / standalone / libretro) were
+        // skipped at "outside allowed console families." Issue (filed
+        // alongside this commit).
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = vec![0xA5u8; 2048]; // 2KB — canonical HuCard SRAM size; 0xA5 avoids looks_plain_text
+
+        for subdir in &[
+            "pcengine",         // RetroDECK convention
+            "pcenginecd",       // RetroDECK CD variant
+            "pc-engine",        // hyphen variant
+            "pc-engine-cd",     // hyphen CD variant
+            "tg16",             // older convention
+            "tg-cd",            // older CD convention
+            "tg_cd",            // underscore CD variant
+            "supergrafx",       // SuperGrafx
+            "super grafx",      // SuperGrafx with space
+            "sgx",              // SuperGrafx slug
+            "pce",              // short PC Engine slug
+            "pce-cd",           // short PCE CD
+            "pcecd",            // short PCE CD packed
+            "PC Engine",        // standalone with space
+            "TurboGrafx",       // standalone English name
+            "turbo grafx",      // English name with space
+            "turbo-grafx",      // English name with hyphen
+            "tgfx16",           // MiSTer slug
+            "nec - pc engine",  // NoIntro DAT naming
+            "nec - turbografx", // NoIntro DAT naming variant
+            "mednafen-pce",     // libretro core name
+            "beetle pce",       // alternate libretro name
+            "beetle-pce",       // hyphen variant
+        ] {
+            let dir = tmp.path().join("retrodeck/saves").join(subdir);
+            fs::create_dir_all(&dir).unwrap();
+            let save = dir.join("Test Game.srm");
+            fs::write(&save, &payload).unwrap();
+
+            let classification = classify_supported_save(&save, None);
+            assert!(
+                classification.is_some(),
+                "expected /{subdir}/ to classify (would skip in production with 'outside allowed console families' if None)",
+            );
+            let got = classification.unwrap().system_slug;
+            assert_eq!(
+                got, "tgfx16",
+                "/{subdir}/ classified as {got}, expected tgfx16",
+            );
         }
     }
 }

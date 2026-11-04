@@ -73,6 +73,11 @@ pub struct LatestSaveResponse {
     pub sha256: Option<String>,
     pub version: Option<i64>,
     pub id: Option<String>,
+    /// The card the server holds the logical save on, when it reports one.
+    /// A server re-home leaves this different from the card being offered
+    /// while the bytes are unchanged, which local state cannot show.
+    #[serde(default, rename = "cardSlot")]
+    pub card_slot: Option<String>,
 }
 
 #[derive(Debug, Clone)]
