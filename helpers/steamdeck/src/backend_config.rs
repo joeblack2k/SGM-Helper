@@ -1195,6 +1195,7 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: root.to_path_buf(),
             config_path: config_path.to_path_buf(),
+            psp_savedata_bundles: false,
         }
     }
 }

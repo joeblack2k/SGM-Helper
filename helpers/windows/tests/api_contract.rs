@@ -445,3 +445,173 @@ fn sync_auto_enrolls_when_gate_is_open_without_login() {
     let auth: Value = serde_json::from_str(&fs::read_to_string(auth_path).unwrap()).unwrap();
     assert_eq!(auth["token"], "RSM-AAAA-BBBB");
 }
+
+/// A PARAM.SFO holding the SAVEDATA_DIRECTORY key, the way PPSSPP writes it.
+fn psp_param_sfo(save_dir: &str) -> Vec<u8> {
+    let mut value = save_dir.as_bytes().to_vec();
+    value.push(0);
+    let key = b"SAVEDATA_DIRECTORY\0\0";
+    let key_offset = 20 + 16;
+    let data_offset = key_offset + key.len();
+    let mut out = b"\0PSF".to_vec();
+    out.extend_from_slice(&0x0101u32.to_le_bytes());
+    out.extend_from_slice(&(key_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0x0204u16.to_le_bytes());
+    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    out.extend_from_slice(&64u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(key);
+    value.resize(64, 0);
+    out.extend_from_slice(&value);
+    out
+}
+
+fn write_ppsspp_savedata(saves: &Path, save_dir: &str) {
+    let dir = saves.join("memstick/PSP/SAVEDATA").join(save_dir);
+    fs::create_dir_all(&dir).unwrap();
+    let mut data = vec![0u8; 286_344];
+    for (index, value) in data.iter_mut().enumerate() {
+        *value = (index % 251) as u8;
+    }
+    fs::write(dir.join("DISSIDIA.BIN"), data).unwrap();
+    fs::write(dir.join("ICON0.PNG"), b"\x89PNG\r\n\x1a\nicon").unwrap();
+    fs::write(dir.join("PARAM.SFO"), psp_param_sfo(save_dir)).unwrap();
+}
+
+fn run_ppsspp_sync(bundles_flag: Option<&str>) -> (usize, usize, usize, String) {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_psp","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"psp@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"psp-rom","md5":"psp-md5"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let bundle_upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("name=\"pspSaveDir\"")
+            .body_includes("ULUS10437GameData00")
+            .body_includes("filename=\"ULUS10437GameData00.pspsave\"")
+            .body_includes("psp-savedir:ULUS10437GAMEDATA00")
+            .body_includes("name=\"system\"");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-psp","sha256":"sha-psp"}}"#);
+    });
+    let loose_upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("filename=\"DISSIDIA.BIN\"");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-bin","sha256":"sha-bin"}}"#);
+    });
+    let any_upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-other","sha256":"sha-other"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("ppsspp_win");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    write_ppsspp_savedata(&saves, "ULUS10437GameData00");
+
+    let config = tmp.path().join("config.ini");
+    let flag_line = bundles_flag
+        .map(|value| format!("PSP_SAVEDATA_BUNDLES=\"{value}\"\n"))
+        .unwrap_or_default();
+    let body = format!(
+        "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n{}\n[source.ppsspp]\nLABEL=\"PPSSPP\"\nKIND=\"custom\"\nPROFILE=\"generic\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"psp\"\nCREATE_MISSING_SYSTEM_DIRS=\"false\"\nMANAGED=\"false\"\nORIGIN=\"test\"\n",
+        server.port(),
+        saves.display(),
+        state_dir.display(),
+        flag_line,
+        saves.display(),
+        saves.display(),
+    );
+    fs::write(&config, body).unwrap();
+
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("psp@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "sync failed: {stderr}");
+    (
+        bundle_upload.calls(),
+        loose_upload.calls(),
+        any_upload.calls(),
+        stderr,
+    )
+}
+
+#[test]
+fn a_ppsspp_savedata_folder_uploads_as_one_bundle() {
+    let (bundles, loose, other, stderr) = run_ppsspp_sync(Some("true"));
+    assert_eq!(
+        bundles, 1,
+        "the SAVEDATA folder was not uploaded as a bundle: {stderr}"
+    );
+    assert_eq!(
+        loose, 0,
+        "the folder's data file still uploaded on its own: {stderr}"
+    );
+    assert_eq!(other, 0, "an unexpected upload was sent: {stderr}");
+}
+
+#[test]
+fn with_psp_savedata_bundles_off_no_bundle_is_uploaded() {
+    for flag in [None, Some("false")] {
+        let (bundles, loose, other, stderr) = run_ppsspp_sync(flag);
+        assert_eq!(
+            bundles, 0,
+            "a bundle was uploaded with the flag {flag:?}: {stderr}"
+        );
+        // Off means exactly the behaviour before: the scanner does not take a
+        // PPSSPP data file as a psp save, so nothing from the folder uploads.
+        assert_eq!(
+            (loose, other),
+            (0, 0),
+            "the folder's files uploaded with the flag {flag:?}: {stderr}"
+        );
+    }
+}

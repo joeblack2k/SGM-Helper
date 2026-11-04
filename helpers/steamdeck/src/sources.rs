@@ -1472,6 +1472,7 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: tmp.path().to_path_buf(),
             config_path: tmp.path().join("config.ini"),
+            psp_savedata_bundles: false,
         }
     }
 

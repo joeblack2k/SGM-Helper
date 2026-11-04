@@ -645,6 +645,8 @@ fn restore_single_cloud_save(
     Ok(())
 }
 
+/// MiSTer has no PSP core, so PSP is not here: a PSP record, a loose file or a PPSSPP SAVEDATA
+/// bundle, has nowhere on this device a game reads it from.
 fn supports_cloud_restore_system(system_slug: &str) -> bool {
     matches!(
         system_slug,
@@ -665,7 +667,6 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "wii"
             | "psx"
             | "ps2"
-            | "psp"
             | "psvita"
             | "ps3"
             | "ps4"
@@ -1244,6 +1245,8 @@ fn process_single_save(
             wii_title_code_from_path(save_path).as_deref(),
             &effective_slot_name,
         ))
+    } else if system_slug == "sega-cd" && crate::scanner::is_sega_cd_shared_bram(save_path) {
+        crate::scanner::sega_cd_bram_line_key(device_type, save_path)
     } else {
         None
     };
@@ -2487,6 +2490,11 @@ fn preferred_save_path(
     if system_slug == "n64" && is_native_n64_extension(current_extension.as_deref()) {
         return save_path.to_path_buf();
     }
+    // A Sega CD backup RAM is read by its own name (scd_U.brm, cart.brm); the
+    // cartridge .srm rule would write a file Genesis Plus GX never opens.
+    if system_slug == "sega-cd" && current_extension.as_deref() == Some("brm") {
+        return save_path.to_path_buf();
+    }
     let Some(preferred_extension) =
         preferred_extension_for_system(source_kind, source_profile, system_slug, canonical_size)
     else {
@@ -3549,5 +3557,13 @@ mod tests {
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
         );
+    }
+
+    #[test]
+    fn mister_never_restores_a_psp_save() {
+        // MiSTer has no PSP core: a PSP record, loose or a PPSSPP SAVEDATA
+        // bundle, has nowhere on this device a game reads it from.
+        assert!(!supports_cloud_restore_system("psp"));
+        assert!(supports_cloud_restore_system("psx"));
     }
 }
