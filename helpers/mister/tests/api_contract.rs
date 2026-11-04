@@ -1364,3 +1364,130 @@ fn writeback_state(state_dir: &std::path::Path, path: &std::path::Path, system_s
     );
     fs::write(state_dir.join("sync_state.json"), state).unwrap();
 }
+
+fn slot_state_synced(
+    state_dir: &std::path::Path,
+    path: &std::path::Path,
+    system_slug: &str,
+    slot: &str,
+    sha256: &str,
+) {
+    let state = format!(
+        r#"{{"entries": {{"{}": {{"sha256": "{}", "rom_sha1": "rom-sha", "version": 3, "system_slug": "{}", "local_container": "native", "adapter_profile": "identity", "source_kind": "retroarch", "source_name": "RetroArch", "slot_name": "{}", "updated_at": "2026-01-01T00:00:00Z"}}}}}}"#,
+        path.display(),
+        sha256,
+        system_slug,
+        slot
+    );
+    fs::write(state_dir.join("sync_state.json"), state).unwrap();
+}
+
+#[test]
+fn a_save_moved_to_a_new_card_is_uploaded_when_this_device_last_synced_the_same_bytes() {
+    // A played PS1 card: real save blocks, the shape the live per-game card has.
+    let bytes = build_valid_ps1_memcard();
+    let sha = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_slot","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"slot@example.com"}}"#);
+    });
+    let latest_body = format!(
+        r#"{{"success":true,"exists":true,"sha256":"{}","version":4,"id":"save-tekken","latestSizeBytes":131072}}"#,
+        sha
+    );
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(latest_body);
+    });
+    let _conflict_check = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"exists":false}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-tekken","sha256":"stored","version":5}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/psx")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let local = root.join("saves/psx/Tekken 3 (USA).srm");
+    fs::write(&local, &bytes).unwrap();
+    // This device last synced the save under the shared card, which is the
+    // live shape: the file now sits on a per-game card.
+    // The live shape: this device last synced exactly these bytes, so
+    // nothing marks the file as edited -- only the card moved.
+    slot_state_synced(&state_dir, &local, "psx", "Memory Card 1", &sha);
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, "psx");
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("slot@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        upload.calls(),
+        1,
+        "the save was not re-offered under its new card, so the server still serves it from the old one:\n{stderr}"
+    );
+}
+
+fn writeback_config_for(
+    tmp: &tempfile::TempDir,
+    server: &MockServer,
+    root: &std::path::Path,
+    state_dir: &std::path::Path,
+    systems: &str,
+) -> std::path::PathBuf {
+    let config = tmp.path().join("config-writeback.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.retroarch]\nLABEL=\"RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"{}\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.join("saves").display(),
+            root.join("roms").display(),
+            systems
+        ),
+    )
+    .unwrap();
+    config
+}

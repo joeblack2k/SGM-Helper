@@ -1815,7 +1815,18 @@ fn process_single_save(
         Err(err) => return Err(err),
     };
 
-    if !latest.exists {
+    // The server holding these bytes means the save is in sync only if this
+    // device last synced it under the card it is offered under now. A save
+    // that moved cards (a per-game card newly holding it) is a different offer
+    // of the same bytes: the server moves the save onto the line the new card
+    // names, so it is uploaded rather than treated as in sync or restored.
+    let moved_to_another_card = prior_entry
+        .and_then(|entry| entry.slot_name.as_deref())
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+        .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+        .unwrap_or(false);
+    if !latest.exists || moved_to_another_card {
         if options.dry_run {
             report.would_upload += 1;
             return Ok(Some(processed_entry(
