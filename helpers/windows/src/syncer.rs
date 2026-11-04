@@ -2341,6 +2341,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_missing_cloud_payload_reference(&err) => {
@@ -2355,6 +2356,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
@@ -2369,6 +2371,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) => return Err(err),
@@ -2384,7 +2387,19 @@ fn process_single_save(
         .map(str::trim)
         .filter(|slot| !slot.is_empty())
         .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        // The device's own state is not the only witness to a move: the server
+        // can re-home a save (another device, a manual repair) while this device
+        // still records the card it last synced. The card the server reports is
+        // compared as well, so an unchanged-bytes offer still uploads and the
+        // save lands on the card this device names.
+        || latest
+            .card_slot
+            .as_deref()
+            .map(str::trim)
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+            .unwrap_or(false);
     if !latest.exists || moved_to_another_card {
         if options.dry_run {
             report.would_upload += 1;
@@ -2977,6 +2992,7 @@ fn process_missing_save(
             sha256: None,
             version: None,
             id: None,
+            card_slot: None,
         },
         Err(err) => return Err(err),
     };
