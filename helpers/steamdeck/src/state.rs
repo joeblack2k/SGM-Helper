@@ -56,6 +56,11 @@ pub struct TerminalRejection {
     pub status: u16,
     pub reason: String,
     pub recorded_at: String,
+    /// The helper release that recorded the refusal. Kept so a later release
+    /// can tell a refusal an older build recorded from one it recorded itself,
+    /// and probe the older ones again instead of discarding the store.
+    #[serde(default)]
+    pub helper_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,5 +331,28 @@ mod tests {
         assert!(entry.system_slug.is_none());
         assert!(entry.local_container.is_none());
         assert!(entry.adapter_profile.is_none());
+    }
+}
+
+#[cfg(test)]
+mod terminal_rejection_tests {
+    use super::*;
+
+    // The record a device already holds: written by an earlier build, with a
+    // helper_version this struct now names. It must load, so the refusal is
+    // honoured after an upgrade instead of re-sent.
+    #[test]
+    fn a_recorded_refusal_with_its_helper_version_loads() {
+        let json = r#"{"entries":{},"terminal_rejections":{"/saves/gba/a.srm":{"sha256":"b5a41c3758763bbec72769fab4a2533bf2db0b6312d93d25a695f9e4b9e02260","status":422,"reason":"POST /saves: status=422","recorded_at":"2026-11-04T13:30:15Z","helper_version":"0.4.16+bef1165c17f9"}}}"#;
+        let state: SyncState = serde_json::from_str(json).unwrap();
+        let record = &state.terminal_rejections["/saves/gba/a.srm"];
+        assert_eq!(record.status, 422);
+        assert_eq!(
+            record.helper_version.as_deref(),
+            Some("0.4.16+bef1165c17f9")
+        );
+        let without = r#"{"entries":{},"terminal_rejections":{"/a":{"sha256":"x","status":400,"reason":"r","recorded_at":"t"}}}"#;
+        let state: SyncState = serde_json::from_str(without).unwrap();
+        assert_eq!(state.terminal_rejections["/a"].helper_version, None);
     }
 }

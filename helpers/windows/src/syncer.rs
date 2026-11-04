@@ -422,6 +422,7 @@ pub fn run_sync(
                                 status,
                                 reason: format!("{err:#}"),
                                 recorded_at: now_rfc3339(),
+                                helper_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                             },
                         );
                     }
@@ -4207,6 +4208,31 @@ fn synced_entry(
 
 #[cfg(test)]
 mod tests {
+
+    // The server's error text is `… status=<code> <reason> body=…`; the parse
+    // has to take the code and decide on it, not on the reason phrase.
+    #[test]
+    fn permanent_rejection_status_reads_the_status_code() {
+        let refused = anyhow::anyhow!(
+            "POST /saves (multipart upload): HTTP request faalde: status=422 Unprocessable Entity body={{}}"
+        );
+        assert_eq!(permanent_rejection_status(&refused), Some(422));
+        let bad = anyhow::anyhow!("HTTP request faalde: status=400 Bad Request body={{}}");
+        assert_eq!(permanent_rejection_status(&bad), Some(400));
+        for later in [
+            "HTTP request faalde: status=408 Request Timeout body={}",
+            "HTTP request faalde: status=429 Too Many Requests body={}",
+            "HTTP request faalde: status=500 Internal Server Error body={}",
+            "HTTP request faalde: status=503 Service Unavailable body={}",
+            "connection refused",
+        ] {
+            assert_eq!(
+                permanent_rejection_status(&anyhow::anyhow!("{later}")),
+                None,
+                "{later}"
+            );
+        }
+    }
     use super::*;
 
     #[test]

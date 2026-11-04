@@ -1932,6 +1932,17 @@ fn a_permanently_refused_save_is_not_uploaded_again() {
         "the refused save was retried instead of skipped: {stdout}"
     );
     assert_eq!(upload.calls(), 1);
+    let state = fs::read_to_string(state_dir.join("sync_state.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&state).unwrap();
+    let recorded = parsed["terminal_rejections"]
+        .as_object()
+        .and_then(|records| records.values().next())
+        .and_then(|record| record["helper_version"].as_str())
+        .unwrap_or("");
+    assert!(
+        !recorded.is_empty(),
+        "the refusal record does not name the release that wrote it: {state}"
+    );
 }
 
 fn romroot_helper() -> Command {
