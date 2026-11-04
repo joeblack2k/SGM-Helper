@@ -15,7 +15,20 @@ jobs:
     # until someone cancels it. Bound both the job and the step that installs
     # the Windows toolchain.
     timeout-minutes: 30
+    # Each helper's build.rs stamps its identity as <version>+SGM_BUILD_ID. A
+    # release is identified by its tag, so two builds of one version are told
+    # apart; without it build.rs falls back to the commit.
+    env:
+      SGM_BUILD_ID: ${{ github.ref_name }}
     steps:
+      - name: Require a build identity
+        run: |
+          if [ -z "${SGM_BUILD_ID:-}" ]; then
+            echo "::error::SGM_BUILD_ID is empty; the release would carry no build identity"
+            exit 1
+          fi
+          echo "Build identity: ${SGM_BUILD_ID}"
+
       - name: Checkout
         uses: actions/checkout@v4
 
