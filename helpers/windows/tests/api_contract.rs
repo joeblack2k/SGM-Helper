@@ -251,7 +251,7 @@ fn backend_forced_dry_run_marks_the_summary_and_uploads_nothing() {
     assert!(
         stdout.contains(
             "skipped=1 rejected_n64_controller_pak=0 accepted_not_stored=0 \
-             rejected_permanent=0 errors=0 would_upload=1 would_download=0"
+             rejected_permanent=0 refused_size_mismatch=0 errors=0 would_upload=1 would_download=0"
         ),
         "a skipped save was counted as a simulated upload, or the simulation was missed: {stdout}"
     );
@@ -2336,6 +2336,145 @@ fn a_restored_sega_save_at_its_cart_size_is_not_restored_again() {
         download.calls(),
         1,
         "the restored save was not read back, so the second pass restored it again:\n{logs}"
+    );
+}
+
+/// Syncs once against a server whose record for the local save differs, and
+/// whose download returns `payload`; returns the local file after, and the log.
+fn local_after_a_download_of(
+    system: &str,
+    dir: &str,
+    file: &str,
+    local: &[u8],
+    payload: &[u8],
+) -> (Vec<u8>, String, Vec<String>) {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_size","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"size@example.com"}}"#);
+    });
+    let _rom = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"rom-size","md5":"md5-size"}}"#);
+    });
+    // The server holds a different save than the device has, and this device has
+    // no sync history for it: the restore case, which downloads.
+    let latest = format!(
+        r#"{{"success":true,"exists":true,"sha256":"server-other","version":3,"id":"save-size","latestSizeBytes":{}}}"#,
+        payload.len()
+    );
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(latest);
+    });
+    let _conflict = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"exists":false}"#);
+    });
+    let body = payload.to_vec();
+    let _download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(body);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join(format!("saves/{dir}"))).unwrap();
+    fs::create_dir_all(root.join(format!("roms/{dir}"))).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let path = root.join(format!("saves/{dir}/{file}"));
+    fs::write(&path, local).unwrap();
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, system);
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "login",
+            "--email",
+            "size@example.com",
+            "--app-password",
+            "pw",
+        ])
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .args(["sync", "--verbose"])
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = fs::read(&path).unwrap_or_default();
+    let mut names: Vec<String> = fs::read_dir(root.join(format!("saves/{dir}")))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    (after, log, names)
+}
+
+// A download never changes the size of the save it would replace. An N64
+// RetroArch projection (296,960 bytes) written over a 32 KiB SRAM save loses the
+// save the game reads, and a device then rewrites it on every pass.
+#[test]
+fn a_download_that_would_change_an_n64_saves_size_is_refused() {
+    let local: Vec<u8> = (0..32_768u32).map(|i| (i % 241) as u8 | 1).collect();
+    let projection = vec![0x5au8; 296_960];
+    let (after, log, names) = local_after_a_download_of(
+        "n64",
+        "n64",
+        "1080 Snowboarding (Japan, USA) (En,Ja).sra",
+        &local,
+        &projection,
+    );
+    assert_eq!(after, local, "the local save was overwritten:\n{log}");
+    assert!(
+        log.contains("refused_size_mismatch=1"),
+        "the refused download was not counted:\n{log}"
+    );
+    assert_eq!(
+        names,
+        vec!["1080 Snowboarding (Japan, USA) (En,Ja).sra".to_string()],
+        "a projection was written beside the save:
+{log}"
+    );
+}
+
+#[test]
+fn a_download_that_would_change_a_master_system_saves_size_is_refused() {
+    let local: Vec<u8> = (0..8_192u32).map(|i| (i % 239) as u8 | 1).collect();
+    let padded = vec![0x33u8; 65_536];
+    let (after, log, _) = local_after_a_download_of(
+        "master-system",
+        "mastersystem",
+        "Phantasy Star (USA, Europe).srm",
+        &local,
+        &padded,
+    );
+    assert_eq!(after, local, "the local save was overwritten:\n{log}");
+    assert!(
+        log.contains("refused_size_mismatch=1"),
+        "the refused download was not counted:\n{log}"
     );
 }
 
