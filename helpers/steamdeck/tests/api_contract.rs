@@ -2211,6 +2211,120 @@ fn a_ps1_card_named_after_no_rom_in_the_index_is_not_uploaded() {
 }
 
 #[test]
+fn a_ps1_card_is_not_refused_by_a_source_whose_rom_root_is_its_save_root() {
+    // The live shape: a second, backend-managed source scans the same saves
+    // folder and uses it as its ROM root. Its ROM index is not empty (an
+    // emulator's own .bin files live there) but holds no PS1 ROM, so a missing
+    // ROM in it says nothing about the card. The card's ROM is in the first
+    // source's ROM tree, and the card must still be offered.
+    let mut bytes = vec![0x00u8; 131072];
+    bytes[..2].copy_from_slice(b"MC");
+    for frame in 0..16usize {
+        let start = frame * 128;
+        let checksum = bytes[start..start + 127]
+            .iter()
+            .fold(0u8, |acc, value| acc ^ value);
+        bytes[start + 127] = checksum;
+    }
+
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_tree","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"tree@example.com"}}"#);
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false}"#);
+    });
+    let _conflict_check = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"exists":false}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-tekken","sha256":"stored","version":1}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let roms = tmp.path().join("roms");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(saves.join("psx")).unwrap();
+    fs::create_dir_all(saves.join("wii/dolphin/shared2")).unwrap();
+    fs::create_dir_all(roms.join("psx")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(roms.join("psx/Tekken 3 (USA).chd"), b"rom").unwrap();
+    // A file with a ROM extension in the saves folder: the second source's
+    // ROM index is non-empty because of it.
+    fs::write(saves.join("wii/dolphin/shared2/misc.bin"), b"dolphin").unwrap();
+    fs::write(saves.join("psx/Tekken 3 (USA).srm"), &bytes).unwrap();
+
+    let config = tmp.path().join("config.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{port}\"\nROOT=\"{saves}\"\nSTATE_DIR=\"{state}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.retrodeck]\nLABEL=\"RetroDeck\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{saves}\"\nROM_PATH=\"{roms}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"psx\"\nMANAGED=\"false\"\nORIGIN=\"manual\"\n\n[source.deck_default]\nLABEL=\"Default\"\nKIND=\"retroarch\"\nPROFILE=\"generic\"\nSAVE_PATH=\"{saves}\"\nROM_PATH=\"{saves}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"psx\"\nMANAGED=\"true\"\nORIGIN=\"autoscan-known\"\n",
+            port = server.port(),
+            saves = saves.display(),
+            roms = roms.display(),
+            state = state_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("tree@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("named after no ROM"),
+        "a source whose ROM root is its save root refused a card whose ROM is in another source's ROM tree:\n{stderr}"
+    );
+    // The card has to reach the server, not just escape the refusal. Both
+    // sources scan the one saves folder and the mock never reports the save as
+    // held, so each pass offers it once: two uploads, and the summary counts
+    // both. Before the fix the second source refused it instead.
+    assert_eq!(
+        upload.calls(),
+        2,
+        "the card was not uploaded by both sources:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(" uploaded=2 "),
+        "the summary does not count both uploads:\n{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn a_save_the_server_holds_on_another_card_is_uploaded_even_when_local_state_agrees() {
     // A played PS1 card: real save blocks, the shape the live per-game card has.
     let bytes = build_valid_ps1_memcard();

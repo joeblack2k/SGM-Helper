@@ -2571,6 +2571,24 @@ fn process_psp_savedata_dir(
     Ok(Some(entry_for(sha256_bytes(&cloud_bytes), latest.version)))
 }
 
+/// Whether a ROM index can say a PS1 ROM is missing: it holds at least one ROM
+/// under a PlayStation folder. A source whose ROM root is its save root indexes
+/// an emulator's own `.bin` files, so its index is not empty yet holds no PS1
+/// ROM, and a card's ROM missing from it says nothing.
+fn rom_index_holds_ps1_roms(rom_index: &HashMap<String, RomIndexEntry>) -> bool {
+    rom_index.values().any(|entry| {
+        entry.path.components().any(|component| {
+            let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+            name == "psx"
+                || name == "ps1"
+                || (name.contains("playstation")
+                    && !name.contains("playstation 2")
+                    && !name.contains("portable")
+                    && !name.contains("vita"))
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_single_save(
     api: &ApiClient,
@@ -2628,7 +2646,7 @@ fn process_single_save(
     // index that loaded can say a ROM is missing; with no ROM root the card
     // syncs as before.
     if rom_entry.is_none()
-        && !rom_index.is_empty()
+        && rom_index_holds_ps1_roms(rom_index)
         && system_slug == "psx"
         && infer_playstation_slot_from_path(save_path).starts_with(PS1_PER_GAME_SLOT_PREFIX)
     {
