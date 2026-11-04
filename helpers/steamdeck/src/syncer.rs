@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +20,7 @@ use crate::scanner::{
     parse_param_sfo_savedir, saturn_skip_reason, sha1_file, sha256_bytes, unpack_psp_savedata,
     wii_skip_reason, wii_title_code_from_path,
 };
-use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
+use crate::sources::{EmulatorProfile, ResolvedSource, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
 
 #[derive(Debug, Clone)]
@@ -358,10 +358,26 @@ pub fn run_sync(
                 &save_files,
                 &rom_index,
             );
+            // How many files share each selection key. The live-directory scan only
+            // runs where it can change the answer: one copy and no declared
+            // directory has nothing to decide.
+            let mut stem_counts: HashMap<String, usize> = HashMap::new();
+            for path in &save_files {
+                *stem_counts.entry(save_selection_key(path)).or_default() += 1;
+            }
             report.scanned += save_files.len();
 
             for save_path in save_files {
                 let selection_key = save_selection_key(&save_path);
+                let needs_live_check = stem_counts.get(&selection_key).copied().unwrap_or(0) > 1
+                    || !source.save_subdirs.is_empty();
+                if needs_live_check
+                    && let Some(reason) = live_upload_blocked(&source, &save_path, &selection_key)
+                {
+                    report.skipped += 1;
+                    eprintln!("{}", reason);
+                    continue;
+                }
                 if let Some(preferred_path) = preferred_save_by_stem.get(&selection_key)
                     && preferred_path != &save_path
                 {
@@ -495,6 +511,7 @@ pub fn run_sync(
             &source.profile,
             &source.save_roots,
             &source.systems,
+            &source.save_subdirs,
             source.create_missing_system_dirs,
             config.psp_savedata_bundles,
             &fingerprint,
@@ -565,6 +582,7 @@ fn restore_cloud_only_saves(
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
     source_systems: &[String],
+    save_subdirs: &BTreeMap<String, PathBuf>,
     create_missing_system_dirs: bool,
     psp_savedata_bundles: bool,
     fingerprint: &str,
@@ -586,12 +604,13 @@ fn restore_cloud_only_saves(
         let page = match api.list_saves(limit, offset, app_password) {
             Ok(page) => page,
             Err(err) => {
-                if verbose {
-                    eprintln!(
-                        "Cloud restore skipped for source '{}': /saves unavailable ({})",
-                        source_name, err
-                    );
-                }
+                // A restore that never ran is the failure mode nobody notices:
+                // the run reports success and the device simply does not
+                // restore. Say it every time, not only under --verbose.
+                eprintln!(
+                    "Cloud restore skipped for source '{}': /saves unavailable ({})",
+                    source_name, err
+                );
                 return Ok(());
             }
         };
@@ -617,6 +636,7 @@ fn restore_cloud_only_saves(
                 source_profile,
                 save_roots,
                 source_systems,
+                save_subdirs,
                 create_missing_system_dirs,
                 psp_savedata_bundles,
                 fingerprint,
@@ -660,6 +680,7 @@ fn restore_single_cloud_save(
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
     source_systems: &[String],
+    save_subdirs: &BTreeMap<String, PathBuf>,
     create_missing_system_dirs: bool,
     psp_savedata_bundles: bool,
     fingerprint: &str,
@@ -748,14 +769,21 @@ fn restore_single_cloud_save(
         .map(|value| crate::scanner::is_sidecar(&value.to_ascii_lowercase()))
         .unwrap_or(false);
     let target_extension = cloud_target_extension(cloud_save, runtime_profile);
-    let provisional_path = cloud_target_path(
+    let Some(provisional_path) = cloud_target_path_with_known(
         cloud_save,
         save_roots,
         source_kind,
         &effective_profile,
         &system_slug,
         target_extension.as_deref(),
-    );
+        sync_entries,
+        save_subdirs,
+    ) else {
+        // Reported by the resolver: the title sits in more than one directory
+        // and nothing says which one the emulator reads.
+        report.skipped += 1;
+        return Ok(());
+    };
 
     if existing_local_save_is_valid(&provisional_path, &system_slug, cloud_is_sidecar) {
         return Ok(());
@@ -1129,6 +1157,10 @@ fn extension_from_filename(filename: &str) -> Option<String> {
         .and_then(normalize_extension_value)
 }
 
+/// The restore target without any record of what has been synced; used by the
+/// tests, which have no state to consult. A real restore goes through
+/// `cloud_target_path_with_known`.
+#[cfg(test)]
 fn cloud_target_path(
     cloud_save: &CloudSaveSummary,
     save_roots: &[PathBuf],
@@ -1136,6 +1168,102 @@ fn cloud_target_path(
     source_profile: &EmulatorProfile,
     system_slug: &str,
     target_extension: Option<&str>,
+) -> PathBuf {
+    cloud_target_path_with_known(
+        cloud_save,
+        save_roots,
+        source_kind,
+        source_profile,
+        system_slug,
+        target_extension,
+        &HashMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap_or_else(|| {
+        // These tests ask about the shape of a path, not about whether the
+        // device has decided where its saves live; a fixture with the same
+        // title in two directories still has to return a path.
+        cloud_target_path_inner(
+            cloud_save,
+            save_roots,
+            source_kind,
+            source_profile,
+            system_slug,
+            target_extension,
+            &HashMap::new(),
+        )
+    })
+}
+
+/// Resolve the restore target, letting the directory the emulator actually
+/// writes decide when a copy of this title already exists.
+///
+/// `None` means the save must not be restored: two copies exist and the
+/// operator has not declared which one is live. Guessing there is exactly the
+/// defect this rule removes, and a save that waits is better than one written
+/// where the game cannot see it.
+#[allow(clippy::too_many_arguments)]
+fn cloud_target_path_with_known(
+    cloud_save: &CloudSaveSummary,
+    save_roots: &[PathBuf],
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    target_extension: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
+    save_subdirs: &BTreeMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    let root = select_cloud_restore_root(save_roots);
+    let filename = cloud_restore_filename(cloud_save, target_extension);
+    let selection_key = save_selection_key(Path::new(filename.trim()));
+    let declared = save_subdirs.get(system_slug).map(|path| path.as_path());
+    match live_target_for(root, system_slug, &selection_key, declared) {
+        LiveTarget::Path { live, strays } => {
+            for stray in strays {
+                eprintln!(
+                    "Stray copy {}: {} is the live directory for {}",
+                    stray.join(&filename).display(),
+                    live.display(),
+                    system_slug
+                );
+            }
+            return Some(live.join(&filename));
+        }
+        LiveTarget::Ambiguous(directories) => {
+            let named: Vec<String> = directories
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect();
+            eprintln!(
+                "Not restoring {} ({}): it exists in {}, and no live directory is declared; set SAVE_SUBDIR_{} on this source",
+                filename,
+                system_slug,
+                named.join(", "),
+                system_slug.to_ascii_uppercase()
+            );
+            return None;
+        }
+        LiveTarget::FallThrough => {}
+    }
+    Some(cloud_target_path_inner(
+        cloud_save,
+        save_roots,
+        source_kind,
+        source_profile,
+        system_slug,
+        target_extension,
+        known_saves,
+    ))
+}
+
+fn cloud_target_path_inner(
+    cloud_save: &CloudSaveSummary,
+    save_roots: &[PathBuf],
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    target_extension: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
 ) -> PathBuf {
     let root = select_cloud_restore_root(save_roots);
     // A PPSSPP SAVEDATA bundle is a folder, and PPSSPP decides where it lives.
@@ -1177,6 +1305,7 @@ fn cloud_target_path(
             source_profile,
             system_slug,
             &filename,
+            known_saves,
         ) {
             return existing_target;
         }
@@ -1498,12 +1627,106 @@ fn cloud_restore_native_target_path(
     )
 }
 
+/// Directories a core-sorted emulator keeps another system's saves in.
+///
+/// Consulted only when looking for a file that already exists, never when
+/// choosing where a new save goes: on most devices the system's own directory
+/// is the right one. RetroArch with `sort_savefiles_enable` files saves by the
+/// core that reads them, and `genesis_plus_gx` serves Genesis and Game Gear
+/// alike, so a Game Gear save lives under `genesis/` and the core reads it
+/// there. This list is deliberately separate from `system_directory_aliases`,
+/// which also decides where new saves are written.
+fn writeback_directory_aliases(system_slug: &str) -> &'static [&'static str] {
+    match system_slug {
+        "game-gear" => &["genesis", "megadrive", "md"],
+        _ => &[],
+    }
+}
+
+/// Which directory a system's saves actually live in.
+///
+/// A device that sorts saves by core writes them under a directory named after
+/// the core (`Mupen64Plus-Next OpenGL`) while the helper's own system
+/// directory is `n64`. Both can hold a copy of one title, and the helper
+/// cannot infer which one the emulator reads: mtime is useless because the
+/// helper's own restores refresh the stale copy, and a table of core names
+/// goes stale. So the evidence is the disk, plus one key the operator may set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveTarget {
+    /// No copy of this title anywhere under the root: keep the existing rules.
+    FallThrough,
+    /// The directory the emulator uses, and the other copies, which are strays.
+    Path { live: PathBuf, strays: Vec<PathBuf> },
+    /// More than one copy and nothing declared: report it and do nothing.
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// Resolve one title's live directory under a source root.
+///
+/// Depth is one level below the root, stated rather than assumed: a layout
+/// nested deeper is not found here and the caller's disagreement line is what
+/// makes that visible. A directory belongs to a system by classifying the
+/// saves inside it, not by its name, so a core nobody has seen yet still works.
+fn live_target_for(
+    root: &Path,
+    system_slug: &str,
+    selection_key: &str,
+    declared: Option<&Path>,
+) -> LiveTarget {
+    let mut copies: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut directories: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        directories.sort();
+        for directory in directories {
+            let Ok(files) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            // Count per directory, not per file: one title's .eep, .sra and
+            // .srm sitting side by side are one copy, not three.
+            let holds_copy = files.flatten().any(|file| {
+                let path = file.path();
+                path.is_file()
+                    && save_selection_key(&path) == selection_key
+                    && classify_supported_save(&path, None)
+                        .map(|classification| classification.system_slug == system_slug)
+                        .unwrap_or(false)
+            });
+            if holds_copy {
+                copies.push(directory);
+            }
+        }
+    }
+
+    if let Some(subdir) = declared {
+        let live = root.join(subdir);
+        let strays: Vec<PathBuf> = copies
+            .into_iter()
+            .filter(|directory| *directory != live)
+            .collect();
+        return LiveTarget::Path { live, strays };
+    }
+
+    match copies.len() {
+        0 => LiveTarget::FallThrough,
+        1 => LiveTarget::Path {
+            live: copies.remove(0),
+            strays: Vec::new(),
+        },
+        _ => LiveTarget::Ambiguous(copies),
+    }
+}
+
 fn existing_cloud_target_for_alias(
     root: &Path,
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
     system_slug: &str,
     filename: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
 ) -> Option<PathBuf> {
     let default_dir = system_directory_for_source(source_kind, source_profile, system_slug);
     let candidates = std::iter::once(default_dir).chain(
@@ -1518,7 +1741,128 @@ fn existing_cloud_target_for_alias(
             return Some(candidate);
         }
     }
+
+    let declared = writeback_directory_aliases(system_slug);
+    let directories: Vec<(String, PathBuf)> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| (name.to_string(), entry.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // A directory the core actually reads from, named by the operator or by the
+    // core itself ("Genesis Plus GX"). The directory says which core reads the
+    // file, not which system it belongs to: Sonic is a Genesis game and a Game
+    // Gear game, and a same-named file already sitting there may be the other
+    // one. Only a file this helper has synced for this system is this save.
+    for (name, path) in &directories {
+        let token = normalize_path_token(name);
+        if !declared
+            .iter()
+            .any(|alias| normalize_path_token(alias) == token)
+        {
+            continue;
+        }
+        let exact = path.join(filename);
+        if known_save_for_system(&exact, system_slug, known_saves) {
+            eprintln!(
+                "Restoring into {}: it already holds this {} save",
+                exact.display(),
+                system_slug
+            );
+            return Some(exact);
+        }
+        if exact.exists() {
+            eprintln!(
+                "Not restoring into {}: it holds a file this helper has not synced as {}",
+                exact.display(),
+                system_slug
+            );
+        }
+
+        // The record's filename carries the extension its profile declares, and
+        // that is not always the one the core writes: genesis-plus-gx is listed
+        // with ".sav" while the device holds ".srm". Matching the stem keeps a
+        // profile that disagrees with the core from silently defeating the
+        // write-back; the state still decides which file is this system's, and
+        // two known files on one stem is a guess this helper does not make.
+        let mut matches: Vec<PathBuf> = std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|entry| entry.is_file())
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| same_save_stem(name, filename))
+                            .unwrap_or(false)
+                    })
+                    .filter(|entry| known_save_for_system(entry, system_slug, known_saves))
+                    .collect()
+            })
+            .unwrap_or_default();
+        matches.sort();
+        match matches.len() {
+            0 => {}
+            1 => {
+                eprintln!(
+                    "Restoring into {}: it already holds this {} save under another extension",
+                    matches[0].display(),
+                    system_slug
+                );
+                return Some(matches[0].clone());
+            }
+            _ => {
+                eprintln!(
+                    "More than one file in {} holds the {} stem: {}; using the system directory instead",
+                    path.display(),
+                    save_stem(filename),
+                    matches
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
     None
+}
+
+/// Whether the helper's own state records `path` as a save of `system_slug`.
+fn known_save_for_system(
+    path: &Path,
+    system_slug: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> bool {
+    known_saves
+        .get(path.to_string_lossy().as_ref())
+        .and_then(|entry| entry.system_slug.as_deref())
+        .map(|slug| slug == system_slug)
+        .unwrap_or(false)
+}
+
+/// The filename without its extension: "Sonic (USA).srm" and "Sonic (USA).sav"
+/// are the same save under two profiles' spellings of it.
+fn save_stem(filename: &str) -> &str {
+    Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(filename)
+}
+
+fn same_save_stem(candidate: &str, reference: &str) -> bool {
+    Path::new(candidate).extension().is_some() && save_stem(candidate) == save_stem(reference)
 }
 
 fn preferred_system_directory_for_root(
@@ -2527,7 +2871,9 @@ fn process_single_save(
         );
         return Ok(Some(processed_entry(
             state_key.clone(),
-            prior_entry.expect("conflict requires a prior entry").clone(),
+            prior_entry
+                .expect("conflict requires a prior entry")
+                .clone(),
         )));
     }
 
@@ -3540,6 +3886,55 @@ fn save_selection_key(save_path: &Path) -> String {
         return format!("wii:{}", title_code.to_ascii_lowercase());
     }
     filename_stem(save_path).to_ascii_lowercase()
+}
+
+/// Whether this copy may upload, and the reason when it may not.
+///
+/// The restore rule and this one are the same rule: the directory the emulator
+/// actually writes is the one that syncs. Declared wins; two copies with
+/// nothing declared is a conflict the helper refuses to resolve, because a
+/// wrong upload replaces a good record rather than merely landing in a place
+/// the game cannot see.
+fn live_upload_blocked(
+    source: &ResolvedSource,
+    save_path: &Path,
+    selection_key: &str,
+) -> Option<String> {
+    let root = source.save_roots.first()?;
+    let classification = classify_supported_save(save_path, None)?;
+    let system_slug = classification.system_slug;
+    let declared = source
+        .save_subdirs
+        .get(&system_slug)
+        .map(|path| path.as_path());
+    match live_target_for(root, &system_slug, selection_key, declared) {
+        LiveTarget::FallThrough => None,
+        LiveTarget::Path { live, .. } => {
+            if save_path.parent() == Some(live.as_path()) {
+                return None;
+            }
+            Some(format!(
+                "Not uploading {}: it is a stray copy, and {} is the live directory for {} in source '{}'",
+                save_path.display(),
+                live.display(),
+                system_slug,
+                source.name
+            ))
+        }
+        LiveTarget::Ambiguous(directories) => {
+            let named: Vec<String> = directories
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect();
+            Some(format!(
+                "Not uploading {}: it exists in {}, and no live directory is declared; set SAVE_SUBDIR_{} on source '{}'",
+                save_path.display(),
+                named.join(", "),
+                system_slug.to_ascii_uppercase(),
+                source.name
+            ))
+        }
+    }
 }
 
 fn select_preferred_save_per_stem(
