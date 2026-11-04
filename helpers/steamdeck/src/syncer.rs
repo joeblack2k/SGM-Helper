@@ -418,15 +418,12 @@ pub fn run_sync(
                 // server, and the record is keyed on bytes that never change. A
                 // fresh refusal re-records it under this release.
                 if let Some(prior) = sync_state.terminal_rejections.get(&save_key)
-                    && prior.helper_version.as_deref() != Some(env!("CARGO_PKG_VERSION"))
+                    && prior.build_id.as_deref() != Some(crate::state::build_identity())
                 {
                     eprintln!(
-                        "Re-probing {}: the refusal was recorded by helper {}",
+                        "Re-probing {}: the refusal was recorded by build {}",
                         save_path.display(),
-                        prior
-                            .helper_version
-                            .as_deref()
-                            .unwrap_or("before versioning")
+                        prior.build_id.as_deref().unwrap_or("before versioning")
                     );
                     sync_state.terminal_rejections.remove(&save_key);
                 }
@@ -490,7 +487,7 @@ pub fn run_sync(
                                     status,
                                     reason: format!("{err:#}"),
                                     recorded_at: now_rfc3339(),
-                                    helper_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                                    build_id: Some(crate::state::build_identity().to_string()),
                                 },
                             );
                         }

@@ -2583,11 +2583,11 @@ fn a_permanently_refused_save_is_not_uploaded_again() {
     let recorded = parsed["terminal_rejections"]
         .as_object()
         .and_then(|records| records.values().next())
-        .and_then(|record| record["helper_version"].as_str())
+        .and_then(|record| record["build_id"].as_str())
         .unwrap_or("");
     assert!(
         !recorded.is_empty(),
-        "the refusal record does not name the release that wrote it: {state}"
+        "the refusal record does not name the build that wrote it: {state}"
     );
 }
 
@@ -2642,6 +2642,8 @@ fn uploads_after_a_refusal_recorded_by(version: Option<&str>) -> (usize, String)
         hasher.update(&bytes);
         format!("{:x}", hasher.finalize())
     };
+    // `helper_version` is the field's old name; records on devices carry it, so
+    // seeding under it also proves the alias.
     let version_field = version
         .map(|value| format!(r#","helper_version":"{value}""#))
         .unwrap_or_default();
@@ -2680,8 +2682,12 @@ fn uploads_after_a_refusal_recorded_by(version: Option<&str>) -> (usize, String)
 // release recorded is asked again once, because the fix that makes a save
 // acceptable usually ships in the helper or the server.
 #[test]
-fn a_refusal_an_older_release_recorded_is_asked_again_once() {
-    for version in [Some("0.0.1+older"), None] {
+fn a_refusal_another_build_recorded_is_asked_again_once() {
+    for version in [
+        Some("0.4.16+0123456789ab"),
+        Some(env!("CARGO_PKG_VERSION")),
+        None,
+    ] {
         let (uploads, stderr) = uploads_after_a_refusal_recorded_by(version);
         assert_eq!(
             uploads, 1,
@@ -2695,8 +2701,8 @@ fn a_refusal_an_older_release_recorded_is_asked_again_once() {
 }
 
 #[test]
-fn a_refusal_this_release_recorded_is_not_asked_again() {
-    let (uploads, stderr) = uploads_after_a_refusal_recorded_by(Some(env!("CARGO_PKG_VERSION")));
+fn a_refusal_this_build_recorded_is_not_asked_again() {
+    let (uploads, stderr) = uploads_after_a_refusal_recorded_by(Some(env!("SGM_BUILD_ID")));
     assert_eq!(
         uploads, 0,
         "a refusal this release recorded was sent again:\n{stderr}"

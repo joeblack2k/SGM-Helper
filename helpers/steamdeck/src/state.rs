@@ -40,6 +40,14 @@ impl AuthState {
     }
 }
 
+/// The identity of this build: the release workflow's SGM_BUILD_ID (the fold
+/// tag), else the commit it was built from, as build.rs exports it. Every fork
+/// build carries the same package version, so the version alone cannot tell a
+/// fixed binary from the one that recorded a refusal.
+pub fn build_identity() -> &'static str {
+    option_env!("SGM_BUILD_ID").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncState {
     pub entries: HashMap<String, SyncedEntry>,
@@ -56,11 +64,12 @@ pub struct TerminalRejection {
     pub status: u16,
     pub reason: String,
     pub recorded_at: String,
-    /// The helper release that recorded the refusal. A refusal is honoured
-    /// only by the release that recorded it; another release (or a record
-    /// with none) asks the server once more.
-    #[serde(default)]
-    pub helper_version: Option<String>,
+    /// The build that recorded the refusal (`build_identity()`). A refusal is
+    /// honoured only by the build that recorded it; another build, or a record
+    /// with none, asks the server once more. Records written before the rename
+    /// carry the same value as `helper_version`.
+    #[serde(default, alias = "helper_version")]
+    pub build_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,17 +351,14 @@ mod terminal_rejection_tests {
     // helper_version this struct now names. It must load, so the refusal is
     // honoured after an upgrade instead of re-sent.
     #[test]
-    fn a_recorded_refusal_with_its_helper_version_loads() {
+    fn a_recorded_refusal_under_the_old_field_name_loads() {
         let json = r#"{"entries":{},"terminal_rejections":{"/saves/gba/a.srm":{"sha256":"b5a41c3758763bbec72769fab4a2533bf2db0b6312d93d25a695f9e4b9e02260","status":422,"reason":"POST /saves: status=422","recorded_at":"2026-11-04T13:30:15Z","helper_version":"0.4.16+bef1165c17f9"}}}"#;
         let state: SyncState = serde_json::from_str(json).unwrap();
         let record = &state.terminal_rejections["/saves/gba/a.srm"];
         assert_eq!(record.status, 422);
-        assert_eq!(
-            record.helper_version.as_deref(),
-            Some("0.4.16+bef1165c17f9")
-        );
+        assert_eq!(record.build_id.as_deref(), Some("0.4.16+bef1165c17f9"));
         let without = r#"{"entries":{},"terminal_rejections":{"/a":{"sha256":"x","status":400,"reason":"r","recorded_at":"t"}}}"#;
         let state: SyncState = serde_json::from_str(without).unwrap();
-        assert_eq!(state.terminal_rejections["/a"].helper_version, None);
+        assert_eq!(state.terminal_rejections["/a"].build_id, None);
     }
 }
