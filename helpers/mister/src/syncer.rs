@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::api::{
     ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveRequest,
-    LatestSaveResponse, RuntimeTarget,
+    LatestSaveResponse, RuntimeTarget, UploadedSave,
 };
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
@@ -1896,7 +1896,7 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(Some(version)) => Some(version),
+            Ok(Some(save)) => save.version,
             Ok(None) => {
                 // 2xx with no `save`: the server accepted the request but stored
                 // nothing.  Counting this as uploaded is how a client reports a
@@ -2007,7 +2007,7 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(Some(version)) => Some(version),
+            Ok(Some(save)) => save.version,
             Ok(None) => {
                 // 2xx with no `save`: the server accepted the request but stored
                 // nothing.  Counting this as uploaded is how a client reports a
@@ -3338,7 +3338,7 @@ fn upload_with_n64_mister_cpk_fallback(
     wii_title_id: Option<&str>,
     runtime_target: &RuntimeTarget,
     verbose: bool,
-) -> Result<Option<i64>> {
+) -> Result<Option<UploadedSave>> {
     let upload_result = api.upload_save(
         filename,
         bytes.to_vec(),
@@ -3382,7 +3382,13 @@ fn upload_with_n64_mister_cpk_fallback(
             }
         }
     };
-    Ok(upload_response.save.and_then(|save| save.version))
+    // A response that names a save is a stored save. The server's success body
+    // carries `id` and `sha256` and, on some paths, no `version` at all; reading
+    // that as "nothing was stored" reported every such upload as accepted and
+    // discarded while the record was on disk.
+    Ok(upload_response
+        .save
+        .filter(|save| save.id.is_some() || save.sha256.is_some()))
 }
 
 fn should_retry_n64_mister_cpk_as_mpk(
