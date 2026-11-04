@@ -3585,7 +3585,27 @@ fn save_selection_key(save_path: &Path) -> String {
     {
         return format!("wii:{}", title_code.to_ascii_lowercase());
     }
-    filename_stem(save_path).to_ascii_lowercase()
+    let stem = filename_stem(save_path).to_ascii_lowercase();
+    // Additive save extensions are NOT alternative formats of the main save —
+    // they carry independent state that must NOT be deduplicated against the
+    // primary battery save. Examples:
+    //   .rtc — GBC real-time clock state (Pokemon Crystal/Gold/Silver,
+    //          Harvest Moon GBC, etc). The .srm is the SRAM; the .rtc is
+    //          the day/night clock. Dropping .rtc loses time-based events
+    //          like Pokemon Crystal evolutions and the in-game day cycle.
+    //   .mpk / .cpk — N64 controller pak / memory pak. Independent of the
+    //          main .eep / .fla / .sra battery save.
+    // Give these their own selection key so select_preferred_save_per_stem
+    // doesn't pick one variant and silently drop the others.
+    if let Some(ext) = save_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        && matches!(ext.as_str(), "rtc" | "mpk" | "cpk")
+    {
+        return format!("{}:{}", stem, ext);
+    }
+    stem
 }
 
 /// Whether this copy may upload, and the reason when it may not.
@@ -4996,6 +5016,65 @@ mod tests {
             .is_err()
         );
         assert!(!tmp.path().join("nowhere").exists());
+    }
+
+    #[test]
+    fn save_selection_key_separates_additive_extensions() {
+        // Pokemon Crystal saves both .srm (battery SRAM) and .rtc (real-time
+        // clock state). They are NOT alternative formats of each other —
+        // dropping .rtc loses time-based events (Pokemon evolutions, day/night
+        // cycle). They must get DIFFERENT selection keys so they don't dedup
+        // against each other in select_preferred_save_per_stem.
+        let srm = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).srm",
+        );
+        let rtc = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).rtc",
+        );
+        let srm_key = save_selection_key(&srm);
+        let rtc_key = save_selection_key(&rtc);
+        assert_ne!(
+            srm_key, rtc_key,
+            ".srm and .rtc must have distinct selection keys (issue: Pokemon Crystal clock state was being dropped)"
+        );
+        // Sanity: same stem still produces deterministic per-extension keys.
+        assert_eq!(
+            rtc_key,
+            "pokemon - crystal version (usa, europe) (rev 1):rtc"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_separates_n64_controller_pak_from_battery_save() {
+        // N64 .mpk / .cpk = controller pak (separate save device, used for
+        // games like Mario Kart 64 ghost data, F-Zero X custom courses).
+        // .eep / .fla / .sra = main battery save. Must not dedup.
+        let eep = PathBuf::from("/saves/n64/Mario Kart 64 (USA).eep");
+        let mpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).mpk");
+        let cpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).cpk");
+        let eep_key = save_selection_key(&eep);
+        let mpk_key = save_selection_key(&mpk);
+        let cpk_key = save_selection_key(&cpk);
+        assert_ne!(eep_key, mpk_key, ".eep and .mpk must have distinct keys");
+        assert_ne!(eep_key, cpk_key, ".eep and .cpk must have distinct keys");
+        assert_ne!(
+            mpk_key, cpk_key,
+            ".mpk and .cpk must have distinct keys (different controller-pak slots)"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_dedups_real_alternative_formats() {
+        // Regression guard: ALTERNATIVE formats of the same save (e.g. a
+        // user with both .sav and .srm versions of the same game) MUST
+        // still collide so dedup picks the preferred one.
+        let sav = PathBuf::from("/saves/snes/Super Mario World.sav");
+        let srm = PathBuf::from("/saves/snes/Super Mario World.srm");
+        assert_eq!(
+            save_selection_key(&sav),
+            save_selection_key(&srm),
+            "true alternative formats (.sav vs .srm of same game) must still dedup"
+        );
     }
 }
 
