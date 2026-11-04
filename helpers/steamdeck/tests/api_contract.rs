@@ -251,7 +251,7 @@ fn backend_forced_dry_run_marks_the_summary_and_uploads_nothing() {
     assert!(
         stdout.contains(
             "skipped=1 rejected_n64_controller_pak=0 accepted_not_stored=0 \
-             errors=0 would_upload=1 would_download=0"
+             rejected_permanent=0 errors=0 would_upload=1 would_download=0"
         ),
         "a skipped save was counted as a simulated upload, or the simulation was missed: {stdout}"
     );
@@ -2207,6 +2207,575 @@ fn a_ps1_card_named_after_no_rom_in_the_index_is_not_uploaded() {
         0,
         "a card naming no ROM was uploaded, so the server opens a line for it and moves the game's save there:
 {stderr}",
+    );
+}
+
+#[test]
+fn a_ps1_card_is_not_refused_by_a_source_whose_rom_root_is_its_save_root() {
+    // The live shape: a second, backend-managed source scans the same saves
+    // folder and uses it as its ROM root. Its ROM index is not empty (an
+    // emulator's own .bin files live there) but holds no PS1 ROM, so a missing
+    // ROM in it says nothing about the card. The card's ROM is in the first
+    // source's ROM tree, and the card must still be offered.
+    let mut bytes = vec![0x00u8; 131072];
+    bytes[..2].copy_from_slice(b"MC");
+    for frame in 0..16usize {
+        let start = frame * 128;
+        let checksum = bytes[start..start + 127]
+            .iter()
+            .fold(0u8, |acc, value| acc ^ value);
+        bytes[start + 127] = checksum;
+    }
+
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_tree","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"tree@example.com"}}"#);
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false}"#);
+    });
+    let _conflict_check = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"exists":false}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-tekken","sha256":"stored","version":1}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let roms = tmp.path().join("roms");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(saves.join("psx")).unwrap();
+    fs::create_dir_all(saves.join("wii/dolphin/shared2")).unwrap();
+    fs::create_dir_all(roms.join("psx")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(roms.join("psx/Tekken 3 (USA).chd"), b"rom").unwrap();
+    // A file with a ROM extension in the saves folder: the second source's
+    // ROM index is non-empty because of it.
+    fs::write(saves.join("wii/dolphin/shared2/misc.bin"), b"dolphin").unwrap();
+    fs::write(saves.join("psx/Tekken 3 (USA).srm"), &bytes).unwrap();
+
+    let config = tmp.path().join("config.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{port}\"\nROOT=\"{saves}\"\nSTATE_DIR=\"{state}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.retrodeck]\nLABEL=\"RetroDeck\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{saves}\"\nROM_PATH=\"{roms}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"psx\"\nMANAGED=\"false\"\nORIGIN=\"manual\"\n\n[source.deck_default]\nLABEL=\"Default\"\nKIND=\"retroarch\"\nPROFILE=\"generic\"\nSAVE_PATH=\"{saves}\"\nROM_PATH=\"{saves}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"psx\"\nMANAGED=\"true\"\nORIGIN=\"autoscan-known\"\n",
+            port = server.port(),
+            saves = saves.display(),
+            roms = roms.display(),
+            state = state_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("tree@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("named after no ROM"),
+        "a source whose ROM root is its save root refused a card whose ROM is in another source's ROM tree:\n{stderr}"
+    );
+    // The card has to reach the server, not just escape the refusal. Both
+    // sources scan the one saves folder and the mock never reports the save as
+    // held, so each pass offers it once: two uploads, and the summary counts
+    // both. Before the fix the second source refused it instead.
+    assert_eq!(
+        upload.calls(),
+        2,
+        "the card was not uploaded by both sources:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains(" uploaded=2 "),
+        "the summary does not count both uploads:\n{stdout}\n{stderr}"
+    );
+}
+
+// The ROM root is dropped before anything reports on it, so a root that is the
+// source's own save directory is never also announced as missing.
+#[test]
+fn a_save_root_used_as_a_rom_root_is_dropped_without_a_missing_warning() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_root","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"root@example.com"}}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    // The directory the source names as both roots does not exist: the arcade's
+    // shape, and the one where a reprimand and a drop could both appear.
+    let config = tmp.path().join("config-root.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.arcade]\nLABEL=\"Arcade\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}/saves\"\nROM_PATH=\"{}/./saves\"\nRECURSIVE=\"true\"\nSYSTEMS=\"genesis\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.display(),
+            root.display()
+        ),
+    )
+    .unwrap();
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("root@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("Ignoring ROM root"),
+        "the ROM root was not dropped:\n{stderr}"
+    );
+    // The line names the source, so two sources' lines for one path can be
+    // told apart in a device log.
+    assert!(
+        stderr.contains("in source 'Arcade'"),
+        "the dropped-root line does not name its source:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("does not exist"),
+        "the dropped root was also reported as missing:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_ds_save_names_its_runtime_profile_on_the_latest_check() {
+    // The server refuses a latest check for a projection-capable system that
+    // names no runtime profile ("runtimeProfile is required for
+    // projection-capable helper latest checks"). DS is one: a RetroArch DS
+    // save has to ask for its melonDS profile.
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_nds","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"nds@example.com"}}"#);
+    });
+    let latest_with_profile = server.mock(|when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("runtimeProfile", "nds/retroarch-melonds");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false}"#);
+    });
+    let _latest_without = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(400)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"Bad Request","message":"runtimeProfile is required for projection-capable helper latest checks","statusCode":400}"#);
+    });
+    let _conflict_check = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"exists":false}"#);
+    });
+    let _upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-nds","sha256":"stored","version":1}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/nds")).unwrap();
+    fs::create_dir_all(root.join("roms/nds")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(root.join("roms/nds/Mario Kart DS (USA).nds"), b"rom").unwrap();
+    let mut save = vec![0x00u8; 512];
+    save[0] = 0x4d;
+    save[1] = 0x4b;
+    fs::write(root.join("saves/nds/Mario Kart DS (USA).sav"), &save).unwrap();
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, "nds");
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("nds@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        latest_with_profile.calls() >= 1,
+        "the DS latest check named no runtime profile, so the server refuses it:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("runtimeProfile is required"),
+        "the server refused a DS check for its missing profile:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_permanently_refused_save_is_not_uploaded_again() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_reject","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"reject@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"success":true,"count":1,"rom":{"sha1":"reject123","md5":"md5v","fileName":"wario.sav"}}"#,
+            );
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(422)
+            .header("content-type", "application/json")
+            .body(r#"{"success":false,"reason":"snes raw save payload is blank"}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("Nintendo/Game Boy/wario.sav"),
+        vec![0x00u8; 32768],
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("reject@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "second sync failed: {stdout}");
+    assert!(
+        stdout.contains("rejected_permanent=1"),
+        "the refused save was not counted as permanently rejected: {stdout}"
+    );
+    assert!(
+        stdout.contains("errors=0"),
+        "the refused save was retried instead of skipped: {stdout}"
+    );
+    assert_eq!(upload.calls(), 1);
+    let state = fs::read_to_string(state_dir.join("sync_state.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&state).unwrap();
+    let recorded = parsed["terminal_rejections"]
+        .as_object()
+        .and_then(|records| records.values().next())
+        .and_then(|record| record["build_id"].as_str())
+        .unwrap_or("");
+    assert!(
+        !recorded.is_empty(),
+        "the refusal record does not name the build that wrote it: {state}"
+    );
+}
+
+/// Seeds a refusal for the save at its current bytes, recorded by `version`,
+/// then syncs once and returns how many uploads the server saw.
+fn uploads_after_a_refusal_recorded_by(version: Option<&str>) -> (usize, String) {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_rev","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"rev@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"success":true,"count":1,"rom":{"sha1":"rev123","md5":"md5v","fileName":"wario.sav"}}"#,
+            );
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(422)
+            .header("content-type", "application/json")
+            .body(r#"{"success":false,"reason":"snes raw save payload is blank"}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let bytes = vec![0x00u8; 32768];
+    let save = root.join("Nintendo/Game Boy/wario.sav");
+    fs::write(&save, &bytes).unwrap();
+    let sha = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    // `helper_version` is the field's old name; records on devices carry it, so
+    // seeding under it also proves the alias.
+    let version_field = version
+        .map(|value| format!(r#","helper_version":"{value}""#))
+        .unwrap_or_default();
+    fs::write(
+        state_dir.join("sync_state.json"),
+        format!(
+            r#"{{"entries":{{}},"terminal_rejections":{{"{}":{{"sha256":"{sha}","status":422,"reason":"POST /saves: status=422","recorded_at":"2026-11-04T00:00:00Z"{version_field}}}}}}}"#,
+            save.display()
+        ),
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("rev@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    (
+        upload.calls(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+// A refusal is honoured only by the release that recorded it. One an older
+// release recorded is asked again once, because the fix that makes a save
+// acceptable usually ships in the helper or the server.
+#[test]
+fn a_refusal_another_build_recorded_is_asked_again_once() {
+    for version in [
+        Some("0.4.16+0123456789ab"),
+        Some(env!("CARGO_PKG_VERSION")),
+        None,
+    ] {
+        let (uploads, stderr) = uploads_after_a_refusal_recorded_by(version);
+        assert_eq!(
+            uploads, 1,
+            "a refusal recorded by {version:?} was not asked again:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Re-probing"),
+            "the re-probe was not named ({version:?}):\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_this_build_recorded_is_not_asked_again() {
+    let (uploads, stderr) = uploads_after_a_refusal_recorded_by(Some(env!("SGM_BUILD_ID")));
+    assert_eq!(
+        uploads, 0,
+        "a refusal this release recorded was sent again:\n{stderr}"
+    );
+}
+
+fn romroot_helper() -> Command {
+    Command::cargo_bin("sgm-steamdeck-helper").unwrap()
+}
+
+// A ROM root that does not exist indexes nothing, and every save then looks like
+// a title the server has never seen. The run reports each root and what came out
+// of it, so the absence is visible instead of inferred from a missing hash.
+#[test]
+fn a_missing_rom_root_is_reported() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_romroot","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"romroot@example.com"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/genesis")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = tmp.path().join("config-romroot.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.genesis]\nLABEL=\"genesis\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"genesis\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.join("saves").display(),
+            root.join("not-mounted").display()
+        ),
+    )
+    .unwrap();
+
+    romroot_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("romroot@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = romroot_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("does not exist"),
+        "a missing ROM root was not reported:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exists=false, indexed=0"),
+        "the ROM root report does not say what it found:\n{stderr}"
     );
 }
 

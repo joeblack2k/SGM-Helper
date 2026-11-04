@@ -242,7 +242,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
 
             if !cli.quiet {
                 println!(
-                    "Sync complete{}: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} accepted_not_stored={} errors={} would_upload={} would_download={}  \
+                    "Sync complete{}: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} accepted_not_stored={} rejected_permanent={} errors={} would_upload={} would_download={}  \
                      (scanned = local saves found once; skipped = per-pass decisions across upload and restore, so it can exceed scanned)",
                     dry_run_marker(&report),
                     report.scanned,
@@ -253,6 +253,7 @@ fn dispatch(cli: Cli, loaded: LoadedConfig) -> Result<()> {
                     report.skipped,
                     report.rejected_n64_controller_pak,
                     report.accepted_not_stored,
+                    report.rejected_permanent,
                     report.errors,
                     report.would_upload,
                     report.would_download
