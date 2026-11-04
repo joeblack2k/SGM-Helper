@@ -2324,6 +2324,155 @@ fn a_ps1_card_is_not_refused_by_a_source_whose_rom_root_is_its_save_root() {
     );
 }
 
+// The ROM root is dropped before anything reports on it, so a root that is the
+// source's own save directory is never also announced as missing.
+#[test]
+fn a_save_root_used_as_a_rom_root_is_dropped_without_a_missing_warning() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_root","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"root@example.com"}}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    // The directory the source names as both roots does not exist: the arcade's
+    // shape, and the one where a reprimand and a drop could both appear.
+    let config = tmp.path().join("config-root.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.arcade]\nLABEL=\"Arcade\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}/saves\"\nROM_PATH=\"{}/./saves\"\nRECURSIVE=\"true\"\nSYSTEMS=\"genesis\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.display(),
+            root.display()
+        ),
+    )
+    .unwrap();
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("root@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("Ignoring ROM root"),
+        "the ROM root was not dropped:\n{stderr}"
+    );
+    // The line names the source, so two sources' lines for one path can be
+    // told apart in a device log.
+    assert!(
+        stderr.contains("in source 'Arcade'"),
+        "the dropped-root line does not name its source:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("does not exist"),
+        "the dropped root was also reported as missing:\n{stderr}"
+    );
+}
+
+fn romroot_helper() -> Command {
+    Command::cargo_bin("sgm-steamdeck-helper").unwrap()
+}
+
+// A ROM root that does not exist indexes nothing, and every save then looks like
+// a title the server has never seen. The run reports each root and what came out
+// of it, so the absence is visible instead of inferred from a missing hash.
+#[test]
+fn a_missing_rom_root_is_reported() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_romroot","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"romroot@example.com"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/genesis")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = tmp.path().join("config-romroot.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.genesis]\nLABEL=\"genesis\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"genesis\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.join("saves").display(),
+            root.join("not-mounted").display()
+        ),
+    )
+    .unwrap();
+
+    romroot_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("romroot@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = romroot_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("does not exist"),
+        "a missing ROM root was not reported:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("exists=false, indexed=0"),
+        "the ROM root report does not say what it found:\n{stderr}"
+    );
+}
+
 #[test]
 fn a_save_the_server_holds_on_another_card_is_uploaded_even_when_local_state_agrees() {
     // A played PS1 card: real save blocks, the shape the live per-game card has.

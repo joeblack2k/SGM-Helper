@@ -366,7 +366,7 @@ pub fn run_sync(
                 }
             }
 
-            let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
+            let rom_index = discover_rom_index(&source.name, &source.rom_roots, source.recursive)?;
             let preferred_save_by_stem = select_preferred_save_per_stem(
                 &source.kind,
                 &source.profile,

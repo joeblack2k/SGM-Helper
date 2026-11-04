@@ -442,10 +442,12 @@ impl Source {
             .iter()
             .map(|path| resolve_path(binary_dir, path))
             .filter(|root| {
-                if save_roots.iter().any(|save| save == root) {
+                let key = directory_key(root);
+                if save_roots.iter().any(|save| directory_key(save) == key) {
                     eprintln!(
-                        "Ignoring ROM root {}: it is the source's own save root",
-                        root.display()
+                        "Ignoring ROM root {} in source '{}': it is the source's own save root",
+                        root.display(),
+                        self.name
                     );
                     false
                 } else {
@@ -691,6 +693,31 @@ pub fn prepare_sources_for_sync(
     }
 
     resolved_sources_or_default(&store, config, default_kind)
+}
+
+/// A comparison key for a directory path.
+///
+/// A stored config can spell the same directory two ways -- `…\.\saves` and
+/// `…\saves` both came from this helper -- and `PathBuf` equality does not see
+/// through the difference. Curdir components are dropped, trailing separators
+/// with them, and case is folded on Windows, where the filesystem does.
+fn directory_key(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_string_lossy().to_string()),
+        }
+    }
+    let joined = parts.join("/");
+    if cfg!(windows) {
+        joined.to_ascii_lowercase()
+    } else {
+        joined
+    }
 }
 
 pub fn resolved_sources_or_default(
@@ -1611,6 +1638,26 @@ SAVE_PATH="/media/fat/saves"
     // An existing config can carry a ROM path that is the source's own save
     // root; the derivation no longer writes one, and this is the half that
     // heals the ones already on disk.
+    // The same directory spelled two ways -- `./saves` and `saves` -- is the
+    // shape the arcade's stored config carries, and PathBuf equality does not
+    // see through it.
+    #[test]
+    fn a_rom_root_spelled_differently_from_the_save_root_is_dropped() {
+        let source = Source::new(
+            "windows".to_string(),
+            SourceKind::Windows,
+            vec![PathBuf::from("./saves")],
+            vec![PathBuf::from("saves")],
+            true,
+        );
+        let resolved = source.resolve(Path::new("/tmp"));
+        assert!(
+            resolved.rom_roots.is_empty(),
+            "a differently spelled save root survived as a ROM root: {:?}",
+            resolved.rom_roots
+        );
+    }
+
     #[test]
     fn a_rom_root_that_is_the_save_root_is_dropped() {
         let source = Source::new(
