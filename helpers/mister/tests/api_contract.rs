@@ -2433,6 +2433,113 @@ fn a_refusal_this_build_recorded_is_not_asked_again() {
     );
 }
 
+// A cloud save the scanner cannot read back is restored again on every pass:
+// it is invisible locally, so it always looks cloud-only. A Sega cart save at
+// a non-power-of-two size (a RetroArch Mega Drive save is 604 bytes) was that
+// case, and a device rewrote it every sync.
+#[test]
+fn a_restored_sega_save_at_its_cart_size_is_not_restored_again() {
+    let mut payload = vec![0x00u8; 604];
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let sha = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        format!("{:x}", hasher.finalize())
+    };
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_md","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"md@example.com"}}"#);
+    });
+    let list = format!(
+        r#"{{"success":true,"total":1,"limit":100,"offset":0,"saves":[{{"id":"save-s3","filename":"Sonic The Hedgehog 3 (USA).srm","displayTitle":"Sonic The Hedgehog 3","systemSlug":"genesis","romSha1":"rom-s3","sha256":"{sha}","version":1,"latestSizeBytes":604}}]}}"#
+    );
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(list);
+    });
+    let latest = format!(
+        r#"{{"success":true,"exists":true,"sha256":"{sha}","version":1,"id":"save-s3","latestSizeBytes":604}}"#
+    );
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(latest);
+    });
+    let _rom = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"rom-s3","md5":"md5-s3"}}"#);
+    });
+    let payload_body = payload.clone();
+    let download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(payload_body);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/megadrive")).unwrap();
+    fs::create_dir_all(root.join("roms/megadrive")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("roms/megadrive/Sonic The Hedgehog 3 (USA).md"),
+        b"rom",
+    )
+    .unwrap();
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, "genesis");
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("md@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let mut logs = String::new();
+    for _ in 0..2 {
+        let output = wb_helper()
+            .arg("--config")
+            .arg(&config)
+            .arg("sync")
+            .arg("--verbose")
+            .output()
+            .unwrap();
+        logs.push_str(&String::from_utf8_lossy(&output.stdout));
+        logs.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    let restored = root.join("saves/megadrive/Sonic The Hedgehog 3 (USA).srm");
+    assert_eq!(
+        fs::read(&restored).ok(),
+        Some(payload),
+        "the save was not restored:\n{logs}"
+    );
+    assert_eq!(
+        download.calls(),
+        1,
+        "the restored save was not read back, so the second pass restored it again:\n{logs}"
+    );
+}
+
 fn romroot_helper() -> Command {
     Command::cargo_bin("sgm-mister-helper").unwrap()
 }

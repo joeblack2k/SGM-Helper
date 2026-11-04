@@ -1779,11 +1779,12 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             _ => false,
         },
         "nds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
+        // A Sega cartridge save is the size its cart's battery RAM holds, which
+        // is often not a power of two. Rejecting those as unsupported made a
+        // restored save invisible to the next pass, so the restore wrote it
+        // again every sync.
         "genesis" | "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
-            matches!(
-                size,
-                64 | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
-            )
+            (64..=131_072).contains(&size)
         }
         "saturn" => matches!(
             size as usize,
