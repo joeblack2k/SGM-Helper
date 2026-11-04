@@ -2211,3 +2211,361 @@ fn writeback_config_for(
     .unwrap();
     config
 }
+
+#[test]
+fn a_success_body_without_a_version_is_still_a_stored_save() {
+    // The server's success body is {"success":true,"save":{"id","sha256"}} --
+    // no version. Reading a missing version as "nothing was stored" reported
+    // every such upload as accepted-and-discarded while the record was on disk.
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_nov","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"noversion@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"nov123","md5":"md5v","fileName":"wario.sav"}}"#);
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _config_sync = server.mock(|when, then| {
+        when.method(POST).path("/helpers/config/sync");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"accepted":true}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-nov","sha256":"sha-nov"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("Nintendo/Game Boy/wario.sav"),
+        vec![0x00u8; 32768],
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("noversion@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(
+        upload.calls(),
+        1,
+        "the save should be uploaded exactly once"
+    );
+    assert!(
+        stdout.contains("uploaded=1"),
+        "a stored save without a version was not counted as uploaded: {stdout}"
+    );
+    assert!(
+        stdout.contains("accepted_not_stored=0"),
+        "a stored save without a version was counted as discarded: {stdout}"
+    );
+}
+
+// A 2xx whose body names no save stored nothing. Every upload path has to read
+// the body the way the main path does; counting the request as uploaded is how
+// a client reports successful uploads while the store never grows.
+const NO_SAVE_BODY: &str = r#"{"success":true}"#;
+
+fn summary_count(stdout: &str, key: &str) -> Option<u64> {
+    let needle = format!(" {key}=");
+    let start = stdout.find(&needle)? + needle.len();
+    stdout[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+#[test]
+fn a_psp_bundle_upload_with_no_save_in_the_body_is_not_counted_as_uploaded() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_psp","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"psp@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"psp-rom","md5":"psp-md5"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("name=\"pspSaveDir\"");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(NO_SAVE_BODY);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    write_ppsspp_savedata(&saves, "ULUS10437GameData00");
+    let config = tmp.path().join("config.ini");
+    let body = format!(
+        "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\nPSP_SAVEDATA_BUNDLES=\"true\"\n\n[source.retrodeck]\nLABEL=\"RetroDECK\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"psp\"\nCREATE_MISSING_SYSTEM_DIRS=\"false\"\nMANAGED=\"false\"\nORIGIN=\"test\"\n",
+        server.port(),
+        saves.display(),
+        state_dir.display(),
+        saves.display(),
+        saves.display(),
+    );
+    fs::write(&config, body).unwrap();
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("psp@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        upload.calls(),
+        1,
+        "the PSP bundle was not offered: {stderr}"
+    );
+    assert_eq!(
+        summary_count(&stdout, "uploaded"),
+        Some(0),
+        "a body with no save was counted as an upload:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        summary_count(&stdout, "accepted_not_stored"),
+        Some(1),
+        "a body with no save was not reported as stored nothing:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Which backend call answers that the PSX projection is missing, sending the
+/// helper down one of its repair uploads.
+#[derive(Clone, Copy)]
+enum PsxRepairTrigger {
+    ConflictCheck,
+    ConflictReport,
+    Download,
+}
+
+fn run_psx_repair_with_no_save_body(trigger: PsxRepairTrigger) -> (usize, String, String) {
+    let bytes = build_valid_ps1_memcard();
+    let projection_missing = r#"{"success":false,"error":"playstation projection not found"}"#;
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_psx","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"psx@example.com"}}"#);
+    });
+    // The server holds a different card, so the save is neither new nor in sync.
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":true,"sha256":"server-card","version":2,"id":"save-psx","latestSizeBytes":131072}"#);
+    });
+    let _check = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        match trigger {
+            PsxRepairTrigger::ConflictCheck => {
+                then.status(404)
+                    .header("content-type", "application/json")
+                    .body(projection_missing);
+            }
+            PsxRepairTrigger::ConflictReport => {
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"exists":true,"conflictId":"c1","cloudSha256":"server-card"}"#);
+            }
+            PsxRepairTrigger::Download => {
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(r#"{"exists":false}"#);
+            }
+        }
+    });
+    let _report = server.mock(|when, then| {
+        when.method(POST).path("/conflicts/report");
+        then.status(404)
+            .header("content-type", "application/json")
+            .body(projection_missing);
+    });
+    let _download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(404)
+            .header("content-type", "application/json")
+            .body(projection_missing);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(NO_SAVE_BODY);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/psx")).unwrap();
+    fs::create_dir_all(root.join("roms/psx")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(root.join("roms/psx/Tekken 3 (USA).chd"), b"rom").unwrap();
+    let local = root.join("saves/psx/Tekken 3 (USA).srm");
+    fs::write(&local, &bytes).unwrap();
+    if matches!(trigger, PsxRepairTrigger::Download) {
+        // The device last synced the server's card and has not edited its own,
+        // so the newer server copy is downloaded -- and that download is what
+        // reports the projection missing.
+        let state = format!(
+            r#"{{"entries": {{"{}": {{"sha256": "{}", "rom_sha1": "rom-sha", "version": 1, "system_slug": "psx", "local_container": "ps1-raw", "adapter_profile": "ps1-raw", "source_kind": "retroarch", "source_name": "RetroArch", "slot_name": "Game: Tekken 3 (USA)", "updated_at": "2026-01-01T00:00:00Z"}}}}}}"#,
+            local.display(),
+            {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                format!("{:x}", hasher.finalize())
+            }
+        );
+        fs::write(state_dir.join("sync_state.json"), state).unwrap();
+    }
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, "psx");
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("psx@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    (
+        upload.calls(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+fn assert_psx_repair_counts_no_save_as_stored_nothing(trigger: PsxRepairTrigger, path: &str) {
+    let (calls, stdout, stderr) = run_psx_repair_with_no_save_body(trigger);
+    assert!(
+        stderr.contains("uploading local card as repair"),
+        "the {path} repair path was not taken:\n{stderr}"
+    );
+    assert_eq!(
+        calls, 1,
+        "the repair upload was not sent ({path}):\n{stderr}"
+    );
+    assert_eq!(
+        summary_count(&stdout, "uploaded"),
+        Some(0),
+        "a repair upload with no save in the body was counted as an upload ({path}):\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        summary_count(&stdout, "accepted_not_stored"),
+        Some(1),
+        "a repair upload with no save in the body was not reported as stored nothing ({path}):\n{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn a_psx_repair_after_a_missing_projection_on_conflict_check_reads_the_body() {
+    assert_psx_repair_counts_no_save_as_stored_nothing(
+        PsxRepairTrigger::ConflictCheck,
+        "conflict check",
+    );
+}
+
+#[test]
+fn a_psx_repair_after_a_missing_projection_on_conflict_report_reads_the_body() {
+    assert_psx_repair_counts_no_save_as_stored_nothing(
+        PsxRepairTrigger::ConflictReport,
+        "conflict report",
+    );
+}
+
+#[test]
+fn a_psx_repair_after_a_missing_projection_on_download_reads_the_body() {
+    assert_psx_repair_counts_no_save_as_stored_nothing(PsxRepairTrigger::Download, "download");
+}
