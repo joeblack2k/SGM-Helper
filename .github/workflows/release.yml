@@ -11,6 +11,10 @@ permissions:
 jobs:
   build-release:
     runs-on: ubuntu-latest
+    # A hung apt-get inside the job leaves a tag with no release: the run waits
+    # until someone cancels it. Bound both the job and the step that installs
+    # the Windows toolchain.
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,8 +22,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Windows cross toolchain
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      # The Windows target builds through zig, which needs no apt step: the
+      # apt-get that installed mingw-w64 timed out in four of the last five
+      # releases and left tags without a release. Kept here, commented, as the
+      # rollback path -- uncomment this step and switch the Windows build below
+      # back to `cargo build` to return to the mingw toolchain.
+      # - name: Install Windows cross toolchain
+      #   timeout-minutes: 10
+      #   run: |
+      #     sudo apt-get -o Acquire::Retries=3 update
+      #     sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends mingw-w64
 
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@cargo-zigbuild
@@ -41,7 +53,7 @@ jobs:
         run: cargo zigbuild -p sgm-mister-helper --release --target aarch64-unknown-linux-musl
 
       - name: Build Windows release binary
-        run: cargo build -p sgm-windows-helper --release --target x86_64-pc-windows-gnu
+        run: cargo zigbuild -p sgm-windows-helper --release --target x86_64-pc-windows-gnu
 
       - name: Build Steam Deck release binary
         run: cargo build -p sgm-steamdeck-helper --release --target x86_64-unknown-linux-gnu
