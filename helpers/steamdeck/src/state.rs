@@ -56,9 +56,9 @@ pub struct TerminalRejection {
     pub status: u16,
     pub reason: String,
     pub recorded_at: String,
-    /// The helper release that recorded the refusal. Kept so a later release
-    /// can tell a refusal an older build recorded from one it recorded itself,
-    /// and probe the older ones again instead of discarding the store.
+    /// The helper release that recorded the refusal. A refusal is honoured
+    /// only by the release that recorded it; another release (or a record
+    /// with none) asks the server once more.
     #[serde(default)]
     pub helper_version: Option<String>,
 }

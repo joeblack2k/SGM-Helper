@@ -413,6 +413,23 @@ pub fn run_sync(
                 }
 
                 let save_key = save_path.to_string_lossy().to_string();
+                // A refusal another release recorded is asked again once: the fix
+                // that makes a save acceptable usually ships in the helper or the
+                // server, and the record is keyed on bytes that never change. A
+                // fresh refusal re-records it under this release.
+                if let Some(prior) = sync_state.terminal_rejections.get(&save_key)
+                    && prior.helper_version.as_deref() != Some(env!("CARGO_PKG_VERSION"))
+                {
+                    eprintln!(
+                        "Re-probing {}: the refusal was recorded by helper {}",
+                        save_path.display(),
+                        prior
+                            .helper_version
+                            .as_deref()
+                            .unwrap_or("before versioning")
+                    );
+                    sync_state.terminal_rejections.remove(&save_key);
+                }
                 if let Some(prior) = sync_state.terminal_rejections.get(&save_key)
                     && sha256_file(&save_path)
                         .map(|current| current == prior.sha256)

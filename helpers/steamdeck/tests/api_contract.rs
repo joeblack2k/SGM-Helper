@@ -2591,6 +2591,118 @@ fn a_permanently_refused_save_is_not_uploaded_again() {
     );
 }
 
+/// Seeds a refusal for the save at its current bytes, recorded by `version`,
+/// then syncs once and returns how many uploads the server saw.
+fn uploads_after_a_refusal_recorded_by(version: Option<&str>) -> (usize, String) {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_rev","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"rev@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"success":true,"count":1,"rom":{"sha1":"rev123","md5":"md5v","fileName":"wario.sav"}}"#,
+            );
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(422)
+            .header("content-type", "application/json")
+            .body(r#"{"success":false,"reason":"snes raw save payload is blank"}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let bytes = vec![0x00u8; 32768];
+    let save = root.join("Nintendo/Game Boy/wario.sav");
+    fs::write(&save, &bytes).unwrap();
+    let sha = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    let version_field = version
+        .map(|value| format!(r#","helper_version":"{value}""#))
+        .unwrap_or_default();
+    fs::write(
+        state_dir.join("sync_state.json"),
+        format!(
+            r#"{{"entries":{{}},"terminal_rejections":{{"{}":{{"sha256":"{sha}","status":422,"reason":"POST /saves: status=422","recorded_at":"2026-11-04T00:00:00Z"{version_field}}}}}}}"#,
+            save.display()
+        ),
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("rev@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    (
+        upload.calls(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+// A refusal is honoured only by the release that recorded it. One an older
+// release recorded is asked again once, because the fix that makes a save
+// acceptable usually ships in the helper or the server.
+#[test]
+fn a_refusal_an_older_release_recorded_is_asked_again_once() {
+    for version in [Some("0.0.1+older"), None] {
+        let (uploads, stderr) = uploads_after_a_refusal_recorded_by(version);
+        assert_eq!(
+            uploads, 1,
+            "a refusal recorded by {version:?} was not asked again:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("Re-probing"),
+            "the re-probe was not named ({version:?}):\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_this_release_recorded_is_not_asked_again() {
+    let (uploads, stderr) = uploads_after_a_refusal_recorded_by(Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        uploads, 0,
+        "a refusal this release recorded was sent again:\n{stderr}"
+    );
+}
+
 fn romroot_helper() -> Command {
     Command::cargo_bin("sgm-steamdeck-helper").unwrap()
 }
