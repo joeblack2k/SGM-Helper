@@ -698,7 +698,8 @@ fn restore_single_cloud_save(
         .system_profile_value
         .as_deref()
         .or(runtime_target.runtime_profile.as_deref());
-    let target_extension = cloud_target_extension(cloud_save, runtime_profile);
+    let target_extension = ps1_per_game_card_extension(cloud_save, source_profile)
+        .or_else(|| cloud_target_extension(cloud_save, runtime_profile));
     let Some(provisional_path) = cloud_target_path_with_known(
         cloud_save,
         save_roots,
@@ -2198,6 +2199,24 @@ fn process_single_save(
     };
     let system_slug = classification.system_slug;
     let classification_evidence = classification.evidence;
+    // A PS1 card is named after its game, and the server keeps one line per
+    // card. A card whose name matches no ROM here (a title-named card a game
+    // or a converter wrote) opens a line of its own on the server, which then
+    // moves the game's save onto it and away from the game's card. Only an
+    // index that loaded can say a ROM is missing; with no ROM root the card
+    // syncs as before.
+    if rom_entry.is_none()
+        && !rom_index.is_empty()
+        && system_slug == "psx"
+        && infer_playstation_slot_from_path(save_path).starts_with(PS1_PER_GAME_SLOT_PREFIX)
+    {
+        report.skipped += 1;
+        eprintln!(
+            "Not uploading {}: a PS1 card named after no ROM in the index would open its own line on the server",
+            save_path.display()
+        );
+        return Ok(None);
+    }
     if !source_allows_system(source_systems, &system_slug) {
         report.skipped += 1;
         if verbose {
@@ -2329,6 +2348,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_missing_cloud_payload_reference(&err) => {
@@ -2343,6 +2363,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
@@ -2357,12 +2378,36 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) => return Err(err),
     };
 
-    if !latest.exists {
+    // The server holding these bytes means the save is in sync only if this
+    // device last synced it under the card it is offered under now. A save
+    // that moved cards (a per-game card newly holding it) is a different offer
+    // of the same bytes: the server moves the save onto the line the new card
+    // names, so it is uploaded rather than treated as in sync or restored.
+    let moved_to_another_card = prior_entry
+        .and_then(|entry| entry.slot_name.as_deref())
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+        .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+        .unwrap_or(false)
+        // The device's own state is not the only witness to a move: the server
+        // can re-home a save (another device, a manual repair) while this device
+        // still records the card it last synced. The card the server reports is
+        // compared as well, so an unchanged-bytes offer still uploads and the
+        // save lands on the card this device names.
+        || latest
+            .card_slot
+            .as_deref()
+            .map(str::trim)
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+            .unwrap_or(false);
+    if !latest.exists || moved_to_another_card {
         if options.dry_run {
             report.uploaded += 1;
             return Ok(Some(processed_entry(
@@ -2936,6 +2981,7 @@ fn process_missing_save(
             sha256: None,
             version: None,
             id: None,
+            card_slot: None,
         },
         Err(err) => return Err(err),
     };
@@ -3402,9 +3448,52 @@ fn parse_playstation_slot(value: &str) -> Option<String> {
     None
 }
 
+/// A PS1 card the emulator keeps per game (RetroArch's Beetle PSX without
+/// shared cards, the MiSTer) is named after that game and holds only its saves.
+/// The server keeps one line per card slot, so such a card gets its own slot,
+/// "Game: <name>"; sharing "Memory Card 1" made each game's card read as a
+/// deletion of every other game's save. A numbered card (memory_card_1, mcd001)
+/// is a shared card and keeps its number, and so does a PS2 card.
+const PS1_PER_GAME_SLOT_PREFIX: &str = "Game: ";
+
 fn infer_playstation_slot_from_path(path: &Path) -> String {
     let text = path.to_string_lossy().to_ascii_lowercase();
-    parse_playstation_slot(&text).unwrap_or_else(|| "Memory Card 1".to_string())
+    if let Some(slot) = parse_playstation_slot(&text) {
+        return slot;
+    }
+    let is_ps1_card = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("ps2"))
+        .unwrap_or(false);
+    match path.file_stem().and_then(|value| value.to_str()) {
+        Some(stem) if is_ps1_card && !stem.trim().is_empty() => {
+            format!("{PS1_PER_GAME_SLOT_PREFIX}{}", stem.trim())
+        }
+        _ => "Memory Card 1".to_string(),
+    }
+}
+
+/// The extension a per-game PS1 card has on this device: the server names the
+/// card after its game but knows only the `.mcr` container, while RetroArch
+/// reads `<game>.srm` and the MiSTer `<game>.sav`.
+fn ps1_per_game_card_extension(
+    cloud_save: &CloudSaveSummary,
+    source_profile: &EmulatorProfile,
+) -> Option<String> {
+    let slot = cloud_save.card_slot.as_deref()?.trim();
+    if !slot.starts_with(PS1_PER_GAME_SLOT_PREFIX)
+        || !cloud_save.system_slug.eq_ignore_ascii_case("psx")
+    {
+        return None;
+    }
+    Some(
+        match source_profile {
+            EmulatorProfile::Mister => "sav",
+            _ => "srm",
+        }
+        .to_string(),
+    )
 }
 
 fn parse_dreamcast_slot(value: &str) -> Option<String> {
@@ -3485,7 +3574,27 @@ fn save_selection_key(save_path: &Path) -> String {
     {
         return format!("wii:{}", title_code.to_ascii_lowercase());
     }
-    filename_stem(save_path).to_ascii_lowercase()
+    let stem = filename_stem(save_path).to_ascii_lowercase();
+    // Additive save extensions are NOT alternative formats of the main save —
+    // they carry independent state that must NOT be deduplicated against the
+    // primary battery save. Examples:
+    //   .rtc — GBC real-time clock state (Pokemon Crystal/Gold/Silver,
+    //          Harvest Moon GBC, etc). The .srm is the SRAM; the .rtc is
+    //          the day/night clock. Dropping .rtc loses time-based events
+    //          like Pokemon Crystal evolutions and the in-game day cycle.
+    //   .mpk / .cpk — N64 controller pak / memory pak. Independent of the
+    //          main .eep / .fla / .sra battery save.
+    // Give these their own selection key so select_preferred_save_per_stem
+    // doesn't pick one variant and silently drop the others.
+    if let Some(ext) = save_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        && matches!(ext.as_str(), "rtc" | "mpk" | "cpk")
+    {
+        return format!("{}:{}", stem, ext);
+    }
+    stem
 }
 
 /// Whether this copy may upload, and the reason when it may not.
@@ -4687,6 +4796,23 @@ mod tests {
     }
 
     #[test]
+    fn a_ps1_card_named_after_its_game_is_its_own_slot() {
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/Tekken 3 (USA).srm")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/PSX/Tekken 3 (USA).sav")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        // Numbered cards are shared and keep their number.
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/memory_card_1.mcr")),
+            "Memory Card 1".to_string()
+        );
+    }
+
+    #[test]
     fn resolves_dreamcast_slot_from_path() {
         assert_eq!(
             resolve_slot_name_for_sync(
@@ -4879,6 +5005,65 @@ mod tests {
             .is_err()
         );
         assert!(!tmp.path().join("nowhere").exists());
+    }
+
+    #[test]
+    fn save_selection_key_separates_additive_extensions() {
+        // Pokemon Crystal saves both .srm (battery SRAM) and .rtc (real-time
+        // clock state). They are NOT alternative formats of each other —
+        // dropping .rtc loses time-based events (Pokemon evolutions, day/night
+        // cycle). They must get DIFFERENT selection keys so they don't dedup
+        // against each other in select_preferred_save_per_stem.
+        let srm = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).srm",
+        );
+        let rtc = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).rtc",
+        );
+        let srm_key = save_selection_key(&srm);
+        let rtc_key = save_selection_key(&rtc);
+        assert_ne!(
+            srm_key, rtc_key,
+            ".srm and .rtc must have distinct selection keys (issue: Pokemon Crystal clock state was being dropped)"
+        );
+        // Sanity: same stem still produces deterministic per-extension keys.
+        assert_eq!(
+            rtc_key,
+            "pokemon - crystal version (usa, europe) (rev 1):rtc"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_separates_n64_controller_pak_from_battery_save() {
+        // N64 .mpk / .cpk = controller pak (separate save device, used for
+        // games like Mario Kart 64 ghost data, F-Zero X custom courses).
+        // .eep / .fla / .sra = main battery save. Must not dedup.
+        let eep = PathBuf::from("/saves/n64/Mario Kart 64 (USA).eep");
+        let mpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).mpk");
+        let cpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).cpk");
+        let eep_key = save_selection_key(&eep);
+        let mpk_key = save_selection_key(&mpk);
+        let cpk_key = save_selection_key(&cpk);
+        assert_ne!(eep_key, mpk_key, ".eep and .mpk must have distinct keys");
+        assert_ne!(eep_key, cpk_key, ".eep and .cpk must have distinct keys");
+        assert_ne!(
+            mpk_key, cpk_key,
+            ".mpk and .cpk must have distinct keys (different controller-pak slots)"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_dedups_real_alternative_formats() {
+        // Regression guard: ALTERNATIVE formats of the same save (e.g. a
+        // user with both .sav and .srm versions of the same game) MUST
+        // still collide so dedup picks the preferred one.
+        let sav = PathBuf::from("/saves/snes/Super Mario World.sav");
+        let srm = PathBuf::from("/saves/snes/Super Mario World.srm");
+        assert_eq!(
+            save_selection_key(&sav),
+            save_selection_key(&srm),
+            "true alternative formats (.sav vs .srm of same game) must still dedup"
+        );
     }
 }
 
