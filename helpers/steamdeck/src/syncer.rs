@@ -55,6 +55,10 @@ pub struct SyncReport {
     /// Saves the server refused permanently. Not re-attempted until the
     /// payload changes.
     pub rejected_permanent: usize,
+    /// Downloads refused because they would change the size of the local save
+    /// they replace: a payload of another length is a different save or a
+    /// canonical form the game never wrote.
+    pub refused_size_mismatch: usize,
     pub errors: usize,
     pub dry_run: bool,
 }
@@ -3494,6 +3498,25 @@ fn process_single_save(
             normalized_save.local_container,
             Some(canonical_bytes.len() as u64),
         );
+        // A save keeps its size. A downloaded payload of another length is a
+        // different save, or a canonical form (an N64 projection, a padded
+        // image) the game never wrote; writing it over the local save loses the
+        // save the game reads and starts a rewrite on every pass.
+        if target_save_path == save_path
+            && let Ok(existing) = std::fs::metadata(&target_save_path)
+            && existing.is_file()
+            && existing.len() != local_bytes.len() as u64
+        {
+            report.refused_size_mismatch += 1;
+            eprintln!(
+                "Refusing to write record {} ({} bytes) over {} ({} bytes): a save keeps its size, so this payload is a different save or a canonical form the game never wrote",
+                save_id,
+                local_bytes.len(),
+                target_save_path.display(),
+                existing.len()
+            );
+            return Ok(None);
+        }
         if let Some(parent) = target_save_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("kan map niet maken: {}", parent.display()))?;

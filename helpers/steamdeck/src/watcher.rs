@@ -84,7 +84,7 @@ pub fn run_watch(
         cycles += 1;
         if !quiet {
             println!(
-                "Watch cycle {} complete{}: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} accepted_not_stored={} rejected_permanent={} errors={} would_upload={} would_download={}",
+                "Watch cycle {} complete{}: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} accepted_not_stored={} rejected_permanent={} refused_size_mismatch={} errors={} would_upload={} would_download={}",
                 cycles,
                 dry_run_marker(&report),
                 report.scanned,
@@ -96,6 +96,7 @@ pub fn run_watch(
                 report.rejected_n64_controller_pak,
                 report.accepted_not_stored,
                 report.rejected_permanent,
+                report.refused_size_mismatch,
                 report.errors,
                 report.would_upload,
                 report.would_download
