@@ -3952,7 +3952,7 @@ fn upload_with_n64_mister_cpk_fallback(
     // discarded while the record was on disk.
     Ok(upload_response
         .save
-        .filter(|save| save.id.is_some() || save.sha256.is_some()))
+        .filter(|save| save.version.is_some() || save.id.is_some() || save.sha256.is_some()))
 }
 
 fn should_retry_n64_mister_cpk_as_mpk(
