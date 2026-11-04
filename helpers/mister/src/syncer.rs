@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::api::{
     ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveRequest,
-    LatestSaveResponse, RuntimeTarget,
+    LatestSaveResponse, RuntimeTarget, UploadSaveResponse, UploadedSave,
 };
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
@@ -1896,7 +1896,7 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(Some(version)) => Some(version),
+            Ok(Some(save)) => save.version,
             Ok(None) => {
                 // 2xx with no `save`: the server accepted the request but stored
                 // nothing.  Counting this as uploaded is how a client reports a
@@ -2007,7 +2007,7 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(Some(version)) => Some(version),
+            Ok(Some(save)) => save.version,
             Ok(None) => {
                 // 2xx with no `save`: the server accepted the request but stored
                 // nothing.  Counting this as uploaded is how a client reports a
@@ -2121,7 +2121,7 @@ fn process_single_save(
                 )));
             }
             let filename = upload_filename_for_sync(save_path, &system_slug);
-            api.upload_save(
+            let response = api.upload_save(
                 &filename,
                 normalized_save.canonical_bytes.clone(),
                 &active_rom_sha1,
@@ -2134,6 +2134,10 @@ fn process_single_save(
                 wii_title_code_from_path(save_path).as_deref(),
                 Some(&runtime_target),
             )?;
+            if stored_save(response).is_none() {
+                report_accepted_not_stored(report, save_path);
+                return Ok(None);
+            }
             report.uploaded += 1;
             return Ok(Some(processed_entry(
                 state_key.clone(),
@@ -2178,7 +2182,7 @@ fn process_single_save(
                     );
                 }
                 let filename = upload_filename_for_sync(save_path, &system_slug);
-                api.upload_save(
+                let response = api.upload_save(
                     &filename,
                     normalized_save.canonical_bytes.clone(),
                     &active_rom_sha1,
@@ -2191,6 +2195,10 @@ fn process_single_save(
                     wii_title_code_from_path(save_path).as_deref(),
                     Some(&runtime_target),
                 )?;
+                if stored_save(response).is_none() {
+                    report_accepted_not_stored(report, save_path);
+                    return Ok(None);
+                }
                 report.uploaded += 1;
                 return Ok(Some(processed_entry(
                     state_key.clone(),
@@ -2270,7 +2278,7 @@ fn process_single_save(
                     );
                 }
                 let filename = upload_filename_for_sync(save_path, &system_slug);
-                api.upload_save(
+                let response = api.upload_save(
                     &filename,
                     normalized_save.canonical_bytes.clone(),
                     &active_rom_sha1,
@@ -2283,6 +2291,10 @@ fn process_single_save(
                     wii_title_code_from_path(save_path).as_deref(),
                     Some(&runtime_target),
                 )?;
+                if stored_save(response).is_none() {
+                    report_accepted_not_stored(report, save_path);
+                    return Ok(None);
+                }
                 report.uploaded += 1;
                 return Ok(Some(processed_entry(
                     state_key.clone(),
@@ -3338,7 +3350,7 @@ fn upload_with_n64_mister_cpk_fallback(
     wii_title_id: Option<&str>,
     runtime_target: &RuntimeTarget,
     verbose: bool,
-) -> Result<Option<i64>> {
+) -> Result<Option<UploadedSave>> {
     let upload_result = api.upload_save(
         filename,
         bytes.to_vec(),
@@ -3382,7 +3394,31 @@ fn upload_with_n64_mister_cpk_fallback(
             }
         }
     };
-    Ok(upload_response.save.and_then(|save| save.version))
+    // A response that names a save is a stored save. The server's success body
+    // carries `id` and `sha256` and, on some paths, no `version` at all; reading
+    // that as "nothing was stored" reported every such upload as accepted and
+    // discarded while the record was on disk.
+    Ok(stored_save(upload_response))
+}
+
+/// The save a successful upload response stored, or `None` when the body names
+/// none. A response that names a save (`version`, `id` or `sha256`) is a stored
+/// save: the server's success body carries `id` and `sha256` and, on some paths,
+/// no `version`. A 2xx with no `save` object stored nothing, and every upload
+/// path has to say so rather than count the request.
+fn stored_save(response: UploadSaveResponse) -> Option<UploadedSave> {
+    response
+        .save
+        .filter(|save| save.version.is_some() || save.id.is_some() || save.sha256.is_some())
+}
+
+/// A 2xx that stored nothing: counted and named, never counted as an upload.
+fn report_accepted_not_stored(report: &mut SyncReport, path: &std::path::Path) {
+    report.accepted_not_stored += 1;
+    eprintln!(
+        "Server accepted {} but returned no save; nothing was stored",
+        path.display()
+    );
 }
 
 fn should_retry_n64_mister_cpk_as_mpk(
