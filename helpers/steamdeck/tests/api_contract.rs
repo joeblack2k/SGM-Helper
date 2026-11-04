@@ -2115,6 +2115,102 @@ fn a_save_moved_to_a_new_card_is_uploaded_when_this_device_last_synced_the_same_
 }
 
 #[test]
+fn a_ps1_card_named_after_no_rom_in_the_index_is_not_uploaded() {
+    // A blank formatted PS1 card: frame 0 carries the "MC" magic and frames
+    // 0-15 each end in their XOR checksum, which is the evidence the scanner
+    // requires before it reads a .srm as a card at all.
+    let mut bytes = vec![0x00u8; 131072];
+    bytes[..2].copy_from_slice(b"MC");
+    for frame in 0..16usize {
+        let start = frame * 128;
+        let checksum = bytes[start..start + 127]
+            .iter()
+            .fold(0u8, |acc, value| acc ^ value);
+        bytes[start + 127] = checksum;
+    }
+    let sha = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    };
+
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_slot","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"slot@example.com"}}"#);
+    });
+    // The server holds nothing for this card, so only the guard stops the upload.
+    let latest_body = r#"{"success":true,"exists":false}"#.to_string();
+    let _ = &sha;
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(latest_body);
+    });
+    let _conflict_check = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"exists":false}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-tekken","sha256":"stored","version":5}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/psx")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    // The ROM index holds the game; the card is named after the title the
+    // game writes inside the card, which names no ROM. Uploading it makes
+    // the server open a line for that name and move the game's save onto it.
+    fs::create_dir_all(root.join("roms/psx")).unwrap();
+    fs::write(root.join("roms/psx/Tekken 3 (USA).chd"), b"rom").unwrap();
+    let local = root.join("saves/psx/[TEKKEN 3] THE BATTLE BEGINS!!.srm");
+    fs::write(&local, &bytes).unwrap();
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, "psx");
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("slot@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        upload.calls(),
+        0,
+        "a card naming no ROM was uploaded, so the server opens a line for it and moves the game's save there:
+{stderr}",
+    );
+}
+
+#[test]
 fn a_save_the_server_holds_on_another_card_is_uploaded_even_when_local_state_agrees() {
     // A played PS1 card: real save blocks, the shape the live per-game card has.
     let bytes = build_valid_ps1_memcard();
