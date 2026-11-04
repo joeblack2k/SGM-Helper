@@ -14,11 +14,13 @@ use crate::scanner::{
     RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
     discover_rom_index, discover_save_files, dreamcast_skip_reason,
     encode_download_for_local_container, filename_stem, md5_file, normalize_save_bytes_for_sync,
-    normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes, wii_skip_reason,
-    wii_title_code_from_path,
+    normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes, sha256_file,
+    wii_skip_reason, wii_title_code_from_path,
 };
 use crate::sources::{EmulatorProfile, ResolvedSource, SourceKind, prepare_sources_for_sync};
-use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
+use crate::state::{
+    AuthState, SyncedEntry, TerminalRejection, load_sync_state, now_rfc3339, save_sync_state,
+};
 
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
@@ -47,6 +49,9 @@ pub struct SyncReport {
     pub rejected_n64_controller_pak: usize,
     /// The server answered 2xx but returned no save, so nothing was stored.
     pub accepted_not_stored: usize,
+    /// Saves the server refused permanently. Not re-attempted until the
+    /// payload changes.
+    pub rejected_permanent: usize,
     pub errors: usize,
     pub dry_run: bool,
 }
@@ -258,7 +263,7 @@ pub fn run_sync(
             );
         }
 
-        let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
+        let rom_index = discover_rom_index(&source.name, &source.rom_roots, source.recursive)?;
         let preferred_save_by_stem =
             select_preferred_save_per_stem(&source.kind, &source.profile, &save_files, &rom_index);
         // How many files share each selection key. The live-directory scan only
@@ -301,6 +306,39 @@ pub fn run_sync(
             }
 
             let save_key = save_path.to_string_lossy().to_string();
+            // A refusal another release recorded is asked again once: the fix
+            // that makes a save acceptable usually ships in the helper or the
+            // server, and the record is keyed on bytes that never change. A
+            // fresh refusal re-records it under this release.
+            if let Some(prior) = sync_state.terminal_rejections.get(&save_key)
+                && prior.build_id.as_deref() != Some(crate::state::build_identity())
+            {
+                eprintln!(
+                    "Re-probing {}: the refusal was recorded by build {}",
+                    save_path.display(),
+                    prior.build_id.as_deref().unwrap_or("before versioning")
+                );
+                sync_state.terminal_rejections.remove(&save_key);
+            }
+            if let Some(prior) = sync_state.terminal_rejections.get(&save_key)
+                && sha256_file(&save_path)
+                    .map(|current| current == prior.sha256)
+                    .unwrap_or(false)
+            {
+                report.rejected_permanent += 1;
+                eprintln!(
+                    "Not retrying {}: the server refused it with {}{}",
+                    save_path.display(),
+                    prior.status,
+                    if prior.reason.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", prior.reason)
+                    }
+                );
+                continue;
+            }
+
             let process_result = process_single_save(
                 &api,
                 &save_path,
@@ -333,6 +371,19 @@ pub fn run_sync(
                 Err(err) => {
                     report.errors += 1;
                     eprintln!("Sync error for {}: {}", save_path.display(), err);
+                    if let Some(status) = permanent_rejection_status(&err) {
+                        let sha = sha256_file(&save_path).unwrap_or_default();
+                        sync_state.terminal_rejections.insert(
+                            save_key.clone(),
+                            TerminalRejection {
+                                sha256: sha,
+                                status,
+                                reason: format!("{err:#}"),
+                                recorded_at: now_rfc3339(),
+                                build_id: Some(crate::state::build_identity().to_string()),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -425,6 +476,20 @@ pub fn run_sync(
 
 fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
+}
+
+/// A 4xx says the request itself was refused, so retrying identical bytes
+/// cannot succeed. 408 and 429 are the exceptions: a timeout or a rate limit
+/// means "later", not "no".
+fn permanent_rejection_status(err: &anyhow::Error) -> Option<u16> {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    let start = message.find("status=")? + "status=".len();
+    let code: u16 = message[start..].split_whitespace().next()?.parse().ok()?;
+    if (400..500).contains(&code) && code != 408 && code != 429 {
+        Some(code)
+    } else {
+        None
+    }
 }
 
 fn source_allows_system(source_systems: &[String], system_slug: &str) -> bool {
@@ -608,6 +673,15 @@ fn restore_single_cloud_save(
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
     let runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
+    if verbose {
+        eprintln!(
+            "Runtime profile on the wire for {}: {:?} (source kind {}, profile {})",
+            system_slug,
+            runtime_target.runtime_profile,
+            source_kind.as_str(),
+            effective_profile.as_str()
+        );
+    }
     let runtime_profile = runtime_target
         .system_profile_value
         .as_deref()
@@ -1601,6 +1675,24 @@ fn local_container_for_cloud_download(
     Ok(normalized.local_container)
 }
 
+/// Whether a ROM index can say a PS1 ROM is missing: it holds at least one ROM
+/// under a PlayStation folder. A source whose ROM root is its save root indexes
+/// an emulator's own `.bin` files, so its index is not empty yet holds no PS1
+/// ROM, and a card's ROM missing from it says nothing.
+fn rom_index_holds_ps1_roms(rom_index: &HashMap<String, RomIndexEntry>) -> bool {
+    rom_index.values().any(|entry| {
+        entry.path.components().any(|component| {
+            let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+            name == "psx"
+                || name == "ps1"
+                || (name.contains("playstation")
+                    && !name.contains("playstation 2")
+                    && !name.contains("portable")
+                    && !name.contains("vita"))
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_single_save(
     api: &ApiClient,
@@ -1658,7 +1750,7 @@ fn process_single_save(
     // index that loaded can say a ROM is missing; with no ROM root the card
     // syncs as before.
     if rom_entry.is_none()
-        && !rom_index.is_empty()
+        && rom_index_holds_ps1_roms(rom_index)
         && system_slug == "psx"
         && infer_playstation_slot_from_path(save_path).starts_with(PS1_PER_GAME_SLOT_PREFIX)
     {
@@ -2714,10 +2806,66 @@ fn projection_runtime_profile_for_system(
             }
             .to_string(),
         ),
+        // The profile is required by the server for every projection-capable
+        // system, on the latest check, the upload and the download alike. A
+        // system with no arm here sent no profile and was refused with
+        // "runtimeProfile is required" -- game boy and DS saves never synced
+        // for that reason alone.
+        "gameboy" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "gameboy/mister",
+                EmulatorProfile::RetroArch => "gameboy/retroarch-gambatte",
+                _ => "gameboy/gambatte",
+            }
+            .to_string(),
+        ),
+        "nds" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "nds/retroarch-melonds",
+                _ => "nds/melonds",
+            }
+            .to_string(),
+        ),
+        "pc-engine" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "pc-engine/mister",
+                EmulatorProfile::RetroArch => "pc-engine/retroarch-beetle-pce",
+                _ => "pc-engine/mednafen",
+            }
+            .to_string(),
+        ),
+        "3do" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "3do/retroarch-opera",
+                _ => "3do/opera",
+            }
+            .to_string(),
+        ),
+        "atari-jaguar" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "atari-jaguar/retroarch-virtual-jaguar",
+                _ => "atari-jaguar/virtual-jaguar",
+            }
+            .to_string(),
+        ),
         "gba" => Some(
             match source_profile {
                 EmulatorProfile::RetroArch => "gba/retroarch-mgba",
                 _ => "gba/mgba",
+            }
+            .to_string(),
+        ),
+        "sega-cd" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sega-cd/retroarch-genesis-plus-gx",
+                _ => "sega-cd/genesis-plus-gx",
+            }
+            .to_string(),
+        ),
+        "sega-32x" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sega-32x/retroarch-genesis-plus-gx",
+                _ => "sega-32x/genesis-plus-gx",
             }
             .to_string(),
         ),
@@ -3510,6 +3658,31 @@ fn synced_entry(
 
 #[cfg(test)]
 mod tests {
+
+    // The server's error text is `… status=<code> <reason> body=…`; the parse
+    // has to take the code and decide on it, not on the reason phrase.
+    #[test]
+    fn permanent_rejection_status_reads_the_status_code() {
+        let refused = anyhow::anyhow!(
+            "POST /saves (multipart upload): HTTP request faalde: status=422 Unprocessable Entity body={{}}"
+        );
+        assert_eq!(permanent_rejection_status(&refused), Some(422));
+        let bad = anyhow::anyhow!("HTTP request faalde: status=400 Bad Request body={{}}");
+        assert_eq!(permanent_rejection_status(&bad), Some(400));
+        for later in [
+            "HTTP request faalde: status=408 Request Timeout body={}",
+            "HTTP request faalde: status=429 Too Many Requests body={}",
+            "HTTP request faalde: status=500 Internal Server Error body={}",
+            "HTTP request faalde: status=503 Service Unavailable body={}",
+            "connection refused",
+        ] {
+            assert_eq!(
+                permanent_rejection_status(&anyhow::anyhow!("{later}")),
+                None,
+                "{later}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -3678,15 +3851,29 @@ mod tests {
 
     #[test]
     fn runtime_target_returns_empty_for_non_projection_systems() {
+        // A system the server publishes no projection for stays empty. DS used
+        // to be in this test, which is how the missing profile became a silent
+        // 400 on every DS save: the assertion encoded the defect.
         let target = runtime_target_for_system(
             &SourceKind::RetroArch,
             &EmulatorProfile::RetroArch,
-            "nds",
+            "neogeo",
             "retroarch",
         );
         assert!(target.runtime_profile.is_none());
         assert!(target.system_profile_key.is_none());
         assert!(target.system_profile_value.is_none());
+
+        let nds = runtime_target_for_system(
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "nds",
+            "retroarch",
+        );
+        assert_eq!(
+            nds.runtime_profile.as_deref(),
+            Some("nds/retroarch-melonds")
+        );
     }
 
     #[test]
@@ -4415,5 +4602,84 @@ mod lock_tests {
             !super::pid_alive(4_194_303),
             "a pid naming no process reads as alive"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_profile_map {
+    use super::*;
+
+    // Every system the server treats as projection-capable needs a profile on
+    // the wire: the latest check, the upload and the download are all refused
+    // without one ("runtimeProfile is required"), which is how game boy and DS
+    // saves silently never synced. This table is the audit: a system with no
+    // arm, or an arm naming a profile the server does not publish, fails here
+    // rather than at a 400 on a device.
+    #[test]
+    fn every_supported_system_maps_to_a_published_profile() {
+        let cases = [
+            ("psx", EmulatorProfile::RetroArch, "psx/retroarch"),
+            ("ps2", EmulatorProfile::RetroArch, "ps2/pcsx2"),
+            ("n64", EmulatorProfile::Mister, "n64/mister"),
+            ("snes", EmulatorProfile::RetroArch, "snes/retroarch-snes9x"),
+            ("nes", EmulatorProfile::RetroArch, "nes/retroarch-nestopia"),
+            (
+                "gameboy",
+                EmulatorProfile::RetroArch,
+                "gameboy/retroarch-gambatte",
+            ),
+            ("gba", EmulatorProfile::RetroArch, "gba/retroarch-mgba"),
+            ("nds", EmulatorProfile::RetroArch, "nds/retroarch-melonds"),
+            (
+                "master-system",
+                EmulatorProfile::RetroArch,
+                "sms/retroarch-genesis-plus-gx",
+            ),
+            (
+                "genesis",
+                EmulatorProfile::RetroArch,
+                "genesis/retroarch-genesis-plus-gx",
+            ),
+            (
+                "game-gear",
+                EmulatorProfile::RetroArch,
+                "gamegear/retroarch-genesis-plus-gx",
+            ),
+            (
+                "sega-cd",
+                EmulatorProfile::RetroArch,
+                "sega-cd/retroarch-genesis-plus-gx",
+            ),
+            ("saturn", EmulatorProfile::RetroArch, "saturn/mednafen"),
+            (
+                "dreamcast",
+                EmulatorProfile::RetroArch,
+                "dreamcast/retroarch-flycast",
+            ),
+            (
+                "pc-engine",
+                EmulatorProfile::RetroArch,
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                "atari-jaguar",
+                EmulatorProfile::RetroArch,
+                "atari-jaguar/retroarch-virtual-jaguar",
+            ),
+            ("3do", EmulatorProfile::RetroArch, "3do/retroarch-opera"),
+        ];
+        for (system, profile, expected) in cases {
+            let got = projection_runtime_profile_for_system(
+                &SourceKind::RetroArch,
+                &profile,
+                system,
+                "retroarch",
+            );
+            assert_eq!(
+                got.as_deref(),
+                Some(expected),
+                "{system} has no profile on the wire"
+            );
+        }
     }
 }
