@@ -539,7 +539,11 @@ fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
     fs::create_dir_all(root.join("Sony/PSX")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     let raw = build_valid_ps1_memcard();
-    fs::write(root.join("Sony/PSX/ff7.gme"), encode_ps1_dexdrive(&raw)).unwrap();
+    fs::write(
+        root.join("Sony/PSX/memory_card_1.gme"),
+        encode_ps1_dexdrive(&raw),
+    )
+    .unwrap();
     let config = write_config(&tmp, &server, &root, &state_dir);
 
     Command::cargo_bin("sgm-steamdeck-helper")
@@ -1852,4 +1856,157 @@ fn writeback_state(state_dir: &std::path::Path, path: &std::path::Path, system_s
         system_slug
     );
     fs::write(state_dir.join("sync_state.json"), state).unwrap();
+}
+
+// RetroArch's Beetle PSX keeps one card per game, named after it. That card is
+// its own line on the server ("Game: <name>"), not the shared Memory Card 1,
+// so one game's card can't read as a deletion of another game's save.
+#[test]
+fn a_per_game_ps1_card_uploads_as_its_own_slot() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_pg","expiresInDays":7}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"pg@example.com"}}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("ps-line:psx:retroarch:game:-tekken-3-(usa)")
+            .body_includes("Game: Tekken 3 (USA)");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-pg","sha256":"sha-pg"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/psx")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("saves/psx/Tekken 3 (USA).srm"),
+        build_valid_ps1_memcard(),
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("pg@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        upload.calls(),
+        1,
+        "the per-game card did not upload as its own slot:\n{stderr}"
+    );
+}
+
+// The restore half: a per-game card's record lands in that game's card, which
+// is the file RetroArch reads, not under the title written inside the save.
+#[test]
+fn a_per_game_ps1_card_restores_into_the_games_card() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_pgr","expiresInDays":7}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"pgr@example.com"}}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-pgr","filename":"Tekken 3 (USA).mcr","displayTitle":"[TEKKEN 3] THE BATTLE BEGINS!!","systemSlug":"psx","cardSlot":"Game: Tekken 3 (USA)","runtimeProfile":"psx/retroarch","sha256":"sha-pgr","version":1,"latestSizeBytes":131072}]}"#);
+    });
+    let card = build_valid_ps1_memcard();
+    let body = card.clone();
+    server.mock(move |when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(body.clone());
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("psx")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("pgr@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("--verbose")
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let restored = fs::read(root.join("psx/Tekken 3 (USA).srm")).ok();
+    let listing: Vec<String> = fs::read_dir(root.join("psx"))
+        .map(|dir| {
+            dir.flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        restored.as_deref() == Some(card.as_slice()),
+        "the per-game card did not restore to Tekken 3 (USA).srm; psx holds {listing:?}:\n{stderr}"
+    );
 }

@@ -458,7 +458,11 @@ fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
     fs::create_dir_all(root.join("Sony/PSX")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
     let raw = build_valid_ps1_memcard();
-    fs::write(root.join("Sony/PSX/ff7.gme"), encode_ps1_dexdrive(&raw)).unwrap();
+    fs::write(
+        root.join("Sony/PSX/memory_card_1.gme"),
+        encode_ps1_dexdrive(&raw),
+    )
+    .unwrap();
     let config = write_config(&tmp, &server, &root, &state_dir);
 
     Command::cargo_bin("sgm-mister-helper")
