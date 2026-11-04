@@ -1757,6 +1757,94 @@ fn a_save_root_used_as_a_rom_root_is_dropped_without_a_missing_warning() {
     );
 }
 
+#[test]
+fn a_ds_save_names_its_runtime_profile_on_the_latest_check() {
+    // The server refuses a latest check for a projection-capable system that
+    // names no runtime profile ("runtimeProfile is required for
+    // projection-capable helper latest checks"). DS is one: a RetroArch DS
+    // save has to ask for its melonDS profile.
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_nds","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"nds@example.com"}}"#);
+    });
+    let latest_with_profile = server.mock(|when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("runtimeProfile", "nds/retroarch-melonds");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false}"#);
+    });
+    let _latest_without = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(400)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"Bad Request","message":"runtimeProfile is required for projection-capable helper latest checks","statusCode":400}"#);
+    });
+    let _conflict_check = server.mock(|when, then| {
+        when.method(GET).path("/conflicts/check");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"exists":false}"#);
+    });
+    let _upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-nds","sha256":"stored","version":1}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/nds")).unwrap();
+    fs::create_dir_all(root.join("roms/nds")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(root.join("roms/nds/Mario Kart DS (USA).nds"), b"rom").unwrap();
+    let mut save = vec![0x00u8; 512];
+    save[0] = 0x4d;
+    save[1] = 0x4b;
+    fs::write(root.join("saves/nds/Mario Kart DS (USA).sav"), &save).unwrap();
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, "nds");
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("nds@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        latest_with_profile.calls() >= 1,
+        "the DS latest check named no runtime profile, so the server refuses it:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("runtimeProfile is required"),
+        "the server refused a DS check for its missing profile:\n{stderr}"
+    );
+}
+
 fn romroot_helper() -> Command {
     Command::cargo_bin("sgm-mister-helper").unwrap()
 }

@@ -765,6 +765,15 @@ fn restore_single_cloud_save(
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
     let runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
+    if verbose {
+        eprintln!(
+            "Runtime profile on the wire for {}: {:?} (source kind {}, profile {})",
+            system_slug,
+            runtime_target.runtime_profile,
+            source_kind.as_str(),
+            effective_profile.as_str()
+        );
+    }
     let runtime_profile = runtime_target
         .system_profile_value
         .as_deref()
@@ -3691,10 +3700,66 @@ fn projection_runtime_profile_for_system(
             }
             .to_string(),
         ),
+        // The profile is required by the server for every projection-capable
+        // system, on the latest check, the upload and the download alike. A
+        // system with no arm here sent no profile and was refused with
+        // "runtimeProfile is required" -- game boy and DS saves never synced
+        // for that reason alone.
+        "gameboy" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "gameboy/mister",
+                EmulatorProfile::RetroArch => "gameboy/retroarch-gambatte",
+                _ => "gameboy/gambatte",
+            }
+            .to_string(),
+        ),
+        "nds" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "nds/retroarch-melonds",
+                _ => "nds/melonds",
+            }
+            .to_string(),
+        ),
+        "pc-engine" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "pc-engine/mister",
+                EmulatorProfile::RetroArch => "pc-engine/retroarch-beetle-pce",
+                _ => "pc-engine/mednafen",
+            }
+            .to_string(),
+        ),
+        "3do" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "3do/retroarch-opera",
+                _ => "3do/opera",
+            }
+            .to_string(),
+        ),
+        "atari-jaguar" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "atari-jaguar/retroarch-virtual-jaguar",
+                _ => "atari-jaguar/virtual-jaguar",
+            }
+            .to_string(),
+        ),
         "gba" => Some(
             match source_profile {
                 EmulatorProfile::RetroArch => "gba/retroarch-mgba",
                 _ => "gba/mgba",
+            }
+            .to_string(),
+        ),
+        "sega-cd" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sega-cd/retroarch-genesis-plus-gx",
+                _ => "sega-cd/genesis-plus-gx",
+            }
+            .to_string(),
+        ),
+        "sega-32x" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sega-32x/retroarch-genesis-plus-gx",
+                _ => "sega-32x/genesis-plus-gx",
             }
             .to_string(),
         ),
@@ -4757,15 +4822,29 @@ mod tests {
 
     #[test]
     fn runtime_target_returns_empty_for_non_projection_systems() {
+        // A system the server publishes no projection for stays empty. DS used
+        // to be in this test, which is how the missing profile became a silent
+        // 400 on every DS save: the assertion encoded the defect.
         let target = runtime_target_for_system(
             &SourceKind::RetroArch,
             &EmulatorProfile::RetroArch,
-            "nds",
+            "neogeo",
             "retroarch",
         );
         assert!(target.runtime_profile.is_none());
         assert!(target.system_profile_key.is_none());
         assert!(target.system_profile_value.is_none());
+
+        let nds = runtime_target_for_system(
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "nds",
+            "retroarch",
+        );
+        assert_eq!(
+            nds.runtime_profile.as_deref(),
+            Some("nds/retroarch-melonds")
+        );
     }
 
     #[test]
@@ -5696,5 +5775,84 @@ mod lock_tests {
             !super::pid_alive(4_194_303),
             "a pid naming no process reads as alive"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_profile_map {
+    use super::*;
+
+    // Every system the server treats as projection-capable needs a profile on
+    // the wire: the latest check, the upload and the download are all refused
+    // without one ("runtimeProfile is required"), which is how game boy and DS
+    // saves silently never synced. This table is the audit: a system with no
+    // arm, or an arm naming a profile the server does not publish, fails here
+    // rather than at a 400 on a device.
+    #[test]
+    fn every_supported_system_maps_to_a_published_profile() {
+        let cases = [
+            ("psx", EmulatorProfile::RetroArch, "psx/retroarch"),
+            ("ps2", EmulatorProfile::RetroArch, "ps2/pcsx2"),
+            ("n64", EmulatorProfile::Mister, "n64/mister"),
+            ("snes", EmulatorProfile::RetroArch, "snes/retroarch-snes9x"),
+            ("nes", EmulatorProfile::RetroArch, "nes/retroarch-nestopia"),
+            (
+                "gameboy",
+                EmulatorProfile::RetroArch,
+                "gameboy/retroarch-gambatte",
+            ),
+            ("gba", EmulatorProfile::RetroArch, "gba/retroarch-mgba"),
+            ("nds", EmulatorProfile::RetroArch, "nds/retroarch-melonds"),
+            (
+                "master-system",
+                EmulatorProfile::RetroArch,
+                "sms/retroarch-genesis-plus-gx",
+            ),
+            (
+                "genesis",
+                EmulatorProfile::RetroArch,
+                "genesis/retroarch-genesis-plus-gx",
+            ),
+            (
+                "game-gear",
+                EmulatorProfile::RetroArch,
+                "gamegear/retroarch-genesis-plus-gx",
+            ),
+            (
+                "sega-cd",
+                EmulatorProfile::RetroArch,
+                "sega-cd/retroarch-genesis-plus-gx",
+            ),
+            ("saturn", EmulatorProfile::RetroArch, "saturn/mednafen"),
+            (
+                "dreamcast",
+                EmulatorProfile::RetroArch,
+                "dreamcast/retroarch-flycast",
+            ),
+            (
+                "pc-engine",
+                EmulatorProfile::RetroArch,
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                "atari-jaguar",
+                EmulatorProfile::RetroArch,
+                "atari-jaguar/retroarch-virtual-jaguar",
+            ),
+            ("3do", EmulatorProfile::RetroArch, "3do/retroarch-opera"),
+        ];
+        for (system, profile, expected) in cases {
+            let got = projection_runtime_profile_for_system(
+                &SourceKind::RetroArch,
+                &profile,
+                system,
+                "retroarch",
+            );
+            assert_eq!(
+                got.as_deref(),
+                Some(expected),
+                "{system} has no profile on the wire"
+            );
+        }
     }
 }
