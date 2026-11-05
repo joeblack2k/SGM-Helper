@@ -2195,6 +2195,11 @@ fn process_missing_save(
     let runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type);
 
+    // The state entry names the system this file was synced as. Sending it
+    // lets the server refuse another system's record under the same ROM key
+    // (a Game Boy ROM's record offered to a GBA file), which this restore
+    // would otherwise write into the wrong system's folder.
+    let latest_context = latest_save_context(save_path, system_slug);
     let latest = match api.latest_save(LatestSaveRequest {
         rom_sha1,
         slot_name: &effective_slot_name,
@@ -2202,7 +2207,7 @@ fn process_missing_save(
         fingerprint,
         app_password,
         runtime_target: Some(&runtime_target),
-        context: None,
+        context: Some(&latest_context),
     }) {
         Ok(value) => value,
         Err(err) if is_missing_cloud_payload_reference(&err) => LatestSaveResponse {

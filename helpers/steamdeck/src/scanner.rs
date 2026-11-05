@@ -1688,7 +1688,7 @@ fn inspect_dreamcast_vmu_image(bytes: &[u8]) -> Option<DreamcastMetadata> {
         if end > bytes.len() {
             return None;
         }
-        for chunk in bytes[start..end].chunks_exact(DC_DIR_ENTRY_SIZE) {
+        for chunk in bytes[start..end].as_chunks::<DC_DIR_ENTRY_SIZE>().0 {
             let entry = parse_dreamcast_dir_entry(chunk)?;
             if entry.file_type != DC_FILETYPE_DATA && entry.file_type != DC_FILETYPE_GAME {
                 continue;
@@ -1748,7 +1748,10 @@ fn inspect_dreamcast_dci_payload(bytes: &[u8]) -> Option<DreamcastMetadata> {
         return None;
     }
     let mut file_bytes = Vec::with_capacity(file_blocks * DC_BLOCK_SIZE);
-    for block in bytes[DC_DCI_HEADER_SIZE..expected_len].chunks_exact(DC_BLOCK_SIZE) {
+    for block in bytes[DC_DCI_HEADER_SIZE..expected_len]
+        .as_chunks::<DC_BLOCK_SIZE>()
+        .0
+    {
         file_bytes.extend_from_slice(&dreamcast_unswap_32bit_chunks(block));
     }
 
@@ -1931,7 +1934,7 @@ fn parse_dreamcast_pkg_header(bytes: &[u8]) -> Option<DreamcastPkgHeader> {
 
 fn dreamcast_unswap_32bit_chunks(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    for chunk in out.chunks_exact_mut(4) {
+    for chunk in out.as_chunks_mut::<4>().0 {
         chunk.reverse();
     }
     out
