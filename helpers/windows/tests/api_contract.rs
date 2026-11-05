@@ -2939,6 +2939,112 @@ fn a_dsv_uploads_as_the_desmume_profile() {
     );
 }
 
+// NDS restores go through the same container rule as uploads: a .dsv is
+// DeSmuME's, and the server refuses a download that does not name the profile.
+// Without this the restore fails with "runtimeProfile is required" and the save
+// never lands on the device.
+#[test]
+fn a_missing_dsv_is_restored_with_the_desmume_profile() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_restore","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"restore@example.com"}}"#);
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":true,"sha256":"remote-sha","version":2,"id":"save-remote"}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-remote","filename":"Mario Kart DS (USA).dsv","displayTitle":"Mario Kart DS","systemSlug":"nds","sha256":"remote-sha","version":2,"latestSizeBytes":262266}]}"#);
+    });
+    let download = server.mock(|when, then| {
+        when.method(GET)
+            .path("/saves/download")
+            .query_param("runtimeProfile", "nds/desmume");
+        then.status(200).body(vec![0xC5u8; 262144]);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/nds")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let missing = root.join("saves/nds/Mario Kart DS (USA).dsv");
+    assert!(!missing.exists());
+
+    let sync_state = format!(
+        r#"{{
+  "entries": {{
+    "{}": {{
+      "sha256": "old-sha",
+      "rom_sha1": "dsv-rom-sha",
+      "version": 1,
+      "system_slug": "nds",
+      "local_container": "native",
+      "adapter_profile": "identity",
+      "source_kind": "steamdeck",
+      "source_name": "default-steamdeck",
+      "updated_at": "2026-01-01T00:00:00Z"
+    }}
+  }}
+}}"#,
+        missing.display()
+    );
+    fs::write(state_dir.join("sync_state.json"), sync_state).unwrap();
+    let config = tmp.path().join("config-nds.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.nds]\nLABEL=\"nds\"\nKIND=\"steamdeck\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"nds\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.join("saves").display(),
+            root.join("roms").display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("restore@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .assert()
+        .success();
+
+    assert!(
+        download.calls() >= 1,
+        "the .dsv restore did not declare the DeSmuME profile; the file exists: {}",
+        missing.exists()
+    );
+    assert!(missing.exists(), "the .dsv was not restored");
+}
+
 fn romroot_helper() -> Command {
     Command::cargo_bin("sgm-windows-helper").unwrap()
 }

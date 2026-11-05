@@ -159,9 +159,10 @@ pub fn run_service(
 
     while !stop_flag.load(Ordering::SeqCst) {
         if let Some(action) = pending_action.take() {
-            if !quiet {
-                println!("Service sync triggered: {}", action.reason);
-            }
+            // Always named: a pass every few seconds has to be traceable to
+            // the thing that asked for it, and --quiet is the normal service
+            // mode.
+            eprintln!("Service sync triggered: {}", action.reason);
 
             runtime.last_event = Some(action.reason.clone());
             runtime.last_sync_started_at = Some(now_rfc3339());

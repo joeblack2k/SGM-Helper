@@ -678,8 +678,11 @@ fn restore_single_cloud_save(
 
     let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
-    let runtime_target =
-        runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
+    let runtime_target = runtime_target_needs_dsv_profile(
+        &system_slug,
+        &cloud_restore_filename(cloud_save, None),
+        runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type),
+    );
     if verbose {
         eprintln!(
             "Runtime profile on the wire for {}: {:?} (source kind {}, profile {})",
@@ -1890,8 +1893,8 @@ fn process_single_save(
     // A .dsv is DeSmuME's container. The server strips its footer only for
     // that profile, so the container decides the profile -- otherwise the file
     // is measured with the footer and refused as an unrecognised size.
-    if system_slug == "nds" && save_extension(save_path).as_deref() == Some("dsv") {
-        runtime_target = runtime_target_for_profile(&system_slug, "nds/desmume");
+    if let Some(filename) = save_path.file_name().and_then(|value| value.to_str()) {
+        runtime_target = runtime_target_needs_dsv_profile(&system_slug, filename, runtime_target);
     }
 
     let mut rom_sha1 = if is_playstation_system(&system_slug) {
@@ -2683,8 +2686,11 @@ fn process_missing_save(
     let effective_profile =
         effective_profile_for_save(source_kind, source_profile, system_slug, save_path);
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, system_slug);
-    let runtime_target =
-        runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type);
+    let runtime_target = runtime_target_needs_dsv_profile(
+        system_slug,
+        &save_path.to_string_lossy(),
+        runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type),
+    );
 
     let latest = match api.latest_save(LatestSaveRequest {
         rom_sha1,
@@ -2876,6 +2882,26 @@ fn runtime_target_for_system(
     };
 
     runtime_target_for_profile(&clean_system, &runtime_profile)
+}
+
+/// A `.dsv` is DeSmuME's container. The server needs that profile to strip the
+/// footer, on upload and on download alike; a request without it is refused
+/// with "runtimeProfile is required", which is what stopped NDS restores.
+fn runtime_target_needs_dsv_profile(
+    system_slug: &str,
+    filename: &str,
+    target: RuntimeTarget,
+) -> RuntimeTarget {
+    if system_slug == "nds"
+        && std::path::Path::new(filename)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("dsv"))
+            .unwrap_or(false)
+    {
+        return runtime_target_for_profile(system_slug, "nds/desmume");
+    }
+    target
 }
 
 /// The wire fields for an explicit runtime profile (`<system>/<emulator>`).
