@@ -809,6 +809,24 @@ fn restore_single_cloud_save(
         return Ok(());
     }
 
+    // A record can carry a name no device uses (another tool's short name for
+    // the game). When this helper already holds this game's save in another
+    // file -- recorded under the record's own ROM, or holding its exact bytes --
+    // that file is the save. Writing the record under its own name would add a
+    // second copy, which the next pass uploads as a new save once the record is
+    // gone, and the pair loops.
+    if let Some(held) = held_elsewhere(&provisional_path, cloud_save, &system_slug, sync_entries) {
+        report.skipped += 1;
+        eprintln!(
+            "Not restoring {} save '{}' as {}: {} already holds this game's save",
+            system_slug,
+            cloud_save.display_name(),
+            provisional_path.display(),
+            held
+        );
+        return Ok(());
+    }
+
     let native_target_path = cloud_restore_native_target_path(
         &provisional_path,
         source_kind,
@@ -1801,6 +1819,50 @@ fn existing_cloud_target_for_alias(
 }
 
 /// Whether the helper's own state records `path` as a save of `system_slug`.
+/// The path of a save this helper already synced for the record's game under
+/// another name: an entry of the same system recorded with the record's ROM
+/// sha1, or one whose recorded bytes are the record's. `target` itself never
+/// counts -- a file at the record's own path is the ordinary update. A
+/// synthetic ROM key (one with a ':') names no ROM, so only bytes decide then.
+fn held_elsewhere(
+    target: &Path,
+    cloud_save: &CloudSaveSummary,
+    system_slug: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> Option<String> {
+    let target_key = target.to_string_lossy();
+    let rom = cloud_save
+        .rom_sha1
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(':'));
+    let sha = cloud_save
+        .sha256
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let digests_match = |left: &str, right: &str| {
+        let (left, right) = (left.trim().to_ascii_lowercase(), right.to_ascii_lowercase());
+        let shorter = left.len().min(right.len());
+        shorter >= 16 && left[..shorter] == right[..shorter]
+    };
+    let mut held: Vec<&String> = known_saves
+        .iter()
+        .filter(|(path, entry)| {
+            path.as_str() != target_key.as_ref()
+                && entry.system_slug.as_deref() == Some(system_slug)
+                && Path::new(path.as_str()).exists()
+                && (rom
+                    .map(|rom| entry.rom_sha1.as_deref().map(str::trim) == Some(rom))
+                    .unwrap_or(false)
+                    || sha.map(|sha| digests_match(&entry.sha256, sha)).unwrap_or(false))
+        })
+        .map(|(path, _)| path)
+        .collect();
+    held.sort();
+    held.first().map(|path| (*path).clone())
+}
+
 fn known_save_for_system(
     path: &Path,
     system_slug: &str,
