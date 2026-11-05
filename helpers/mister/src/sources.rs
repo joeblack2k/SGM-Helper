@@ -47,6 +47,9 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "ps4",
     "ps5",
     "3ds",
+    "neogeo-cd",
+    "ngp",
+    "virtualboy",
 ];
 
 const MISTER_SYNC_SYSTEMS: &[&str] = &[
@@ -55,6 +58,9 @@ const MISTER_SYNC_SYSTEMS: &[&str] = &[
     "gameboy",
     "gba",
     "n64",
+    "neogeo-cd",
+    "ngp",
+    "virtualboy",
     "genesis",
     "master-system",
     "game-gear",
@@ -216,6 +222,9 @@ fn normalize_system_slug(value: &str) -> Option<String> {
         "saturn" | "segasaturn" => "saturn",
         "dreamcast" | "dc" => "dreamcast",
         "neogeo" | "mvs" | "aes" => "neogeo",
+        "neogeocd" | "neocd" => "neogeo-cd",
+        "ngp" | "ngpc" | "neogeopocket" | "neogeopocketcolor" => "ngp",
+        "virtualboy" | "vb" => "virtualboy",
         "wii" | "nintendowii" | "dolphin" => "wii",
         "psx" | "ps1" | "playstation" | "playstation1" => "psx",
         "ps2" | "playstation2" => "ps2",
@@ -1507,6 +1516,40 @@ fn backup_corrupt(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mister_source_defaults_to_ngp_virtualboy_and_neogeo_cd() {
+        // MiSTer has cores for all three and the scanner classifies their saves.
+        let defaults = parse_systems(None, &SourceKind::MisterFpga);
+        for slug in ["neogeo-cd", "ngp", "virtualboy"] {
+            assert!(
+                defaults.iter().any(|s| s == slug),
+                "{slug} missing from {defaults:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_systems_line_naming_ngp_virtualboy_and_neogeo_cd_keeps_them() {
+        // The server's policy names these three; they weren't known systems,
+        // so a SYSTEMS line naming them was dropped and nothing for them synced.
+        assert_eq!(
+            parse_systems(
+                Some(&"ngp,virtualboy,neogeo-cd".to_string()),
+                &SourceKind::RetroArch
+            ),
+            vec![
+                "neogeo-cd".to_string(),
+                "ngp".to_string(),
+                "virtualboy".to_string()
+            ]
+        );
+        assert_eq!(
+            normalize_system_slug("neogeocd").as_deref(),
+            Some("neogeo-cd")
+        );
+        assert_eq!(normalize_system_slug("vb").as_deref(), Some("virtualboy"));
+    }
 
     #[test]
     fn helper_device_type_matches_backend_identity_names() {
