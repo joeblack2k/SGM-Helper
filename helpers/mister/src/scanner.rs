@@ -584,15 +584,7 @@ pub fn classify_supported_save(
     let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
     if contains_any(
         &save_lower,
-        &[
-            "gameboy advance",
-            "game boy advance",
-            "mgba",
-            "visualboyadvance",
-            "vba",
-            "/gba/",
-            "\\gba\\",
-        ],
+        &["gameboy advance", "game boy advance", "/gba/", "\\gba\\"],
     ) {
         if is_plausible_save_for_system(&save_ext, save_size, "gba") {
             return classify_if_valid(
@@ -604,6 +596,31 @@ pub fn classify_supported_save(
             );
         }
         return None;
+    }
+    // mGBA and VisualBoyAdvance run Game Boy and Game Boy Advance games alike,
+    // so their directory names neither system. The size decides when only one
+    // system has a cartridge that size; otherwise the path alone leaves the
+    // save unclassified, and only the ROM can say.
+    if let Some(slugs) = shared_core_systems(&save_lower) {
+        let mut fits = slugs
+            .iter()
+            .copied()
+            .filter(|slug| is_plausible_save_for_system(&save_ext, save_size, slug));
+        return match (fits.next(), fits.next()) {
+            (Some(slug), None) => classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                slug,
+                format!(
+                    "core directory shared by {} + .{} ({} bytes)",
+                    slugs.join(" and "),
+                    save_ext,
+                    save_size
+                ),
+            ),
+            _ => None,
+        };
     }
     if contains_any(
         &save_lower,
@@ -887,6 +904,52 @@ fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
     }
 }
 
+/// `save_path` as a save of `system_slug`, when its path names a core directory
+/// that serves that system among others and the file fits that system.
+///
+/// The path cannot choose between the systems such a core runs, but a caller
+/// that already knows which one the save belongs to (the record it restored,
+/// the system it synced the file as) can ask whether the file is that save.
+pub fn classify_save_in_shared_core_as(
+    save_path: &Path,
+    system_slug: &str,
+) -> Option<SaveClassification> {
+    let save_ext = path_extension(save_path)?;
+    let save_size = save_path.metadata().ok()?.len();
+    if !is_plausible_save_size(save_size) || looks_plain_text(save_path) {
+        return None;
+    }
+    let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
+    let slugs = shared_core_systems(&save_lower)?;
+    let slug = slugs.iter().copied().find(|slug| *slug == system_slug)?;
+    if !is_plausible_save_for_system(&save_ext, save_size, slug) {
+        return None;
+    }
+    classify_if_valid(
+        save_path,
+        &save_ext,
+        save_size,
+        slug,
+        format!(
+            "core directory shared by {}, known as {} + .{} ({} bytes)",
+            slugs.join(" and "),
+            slug,
+            save_ext,
+            save_size
+        ),
+    )
+}
+
+/// The systems a core directory in `haystack` serves, when it serves more than
+/// one. Such a name is evidence for none of them by itself.
+pub fn shared_core_systems(haystack: &str) -> Option<&'static [&'static str]> {
+    let haystack = haystack.to_ascii_lowercase();
+    if contains_any(&haystack, &["mgba", "visualboyadvance", "vba"]) {
+        return Some(&["gameboy", "gba"]);
+    }
+    None
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -900,15 +963,7 @@ fn infer_nintendo_slug(haystack: &str) -> Option<&'static str> {
     }
     if contains_any(
         haystack,
-        &[
-            "gameboy advance",
-            "game boy advance",
-            "mgba",
-            "visualboyadvance",
-            "vba",
-            "/gba/",
-            "\\gba\\",
-        ],
+        &["gameboy advance", "game boy advance", "/gba/", "\\gba\\"],
     ) {
         return Some("gba");
     }
@@ -2246,6 +2301,74 @@ fn looks_plain_text(path: &Path) -> bool {
 mod tests {
     use super::infer_nintendo_slug;
 
+    fn save_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i.wrapping_mul(31) as u8) ^ 0xA5)
+            .collect()
+    }
+
+    fn write_save(dir: &std::path::Path, name: &str, len: usize) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, save_bytes(len)).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_mgba_directory_names_neither_game_boy_system() {
+        // A Game Boy save in RetroArch's mGBA folder is not a GBA save: mGBA
+        // runs both, and 8 KiB is a cartridge size for both.
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(
+            &tmp.path().join("saves/mGBA"),
+            "Kirby's Dream Land 2.srm",
+            8192,
+        );
+        assert_eq!(super::classify_supported_save(&save, None), None);
+        assert_eq!(
+            super::classify_save_in_shared_core_as(&save, "gameboy").map(|c| c.system_slug),
+            Some("gameboy".to_string())
+        );
+        assert_eq!(
+            super::classify_save_in_shared_core_as(&save, "gba").map(|c| c.system_slug),
+            Some("gba".to_string())
+        );
+        assert_eq!(super::classify_save_in_shared_core_as(&save, "snes"), None);
+        let vba = write_save(
+            &tmp.path().join("saves/VisualBoyAdvance"),
+            "Crystal.sav",
+            32768,
+        );
+        assert_eq!(super::classify_supported_save(&vba, None), None);
+    }
+
+    #[test]
+    fn an_mgba_save_only_one_system_can_hold_is_that_system() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/mGBA");
+        let gba = write_save(&dir, "Minish Cap.srm", 131072);
+        assert_eq!(
+            super::classify_supported_save(&gba, None).map(|c| c.system_slug),
+            Some("gba".to_string())
+        );
+        let gb = write_save(&dir, "Link's Awakening.srm", 2048);
+        assert_eq!(
+            super::classify_supported_save(&gb, None).map(|c| c.system_slug),
+            Some("gameboy".to_string())
+        );
+    }
+
+    #[test]
+    fn a_rom_still_names_the_system_of_an_mgba_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(&tmp.path().join("saves/mGBA"), "Crystal.srm", 32768);
+        let rom = tmp.path().join("roms/gbc/Crystal.gbc");
+        assert_eq!(
+            super::classify_supported_save(&save, Some(&rom)).map(|c| c.system_slug),
+            Some("gameboy".to_string())
+        );
+    }
+
     #[test]
     fn core_directory_names_resolve_to_their_system() {
         // The directory list admits core names, so the classifier has to know them
@@ -2254,7 +2377,8 @@ mod tests {
         assert_eq!(infer_nintendo_slug("/saves/snes9x"), Some("snes"));
         assert_eq!(infer_nintendo_slug("/saves/bsnes"), Some("snes"));
         assert_eq!(infer_nintendo_slug("/saves/fceumm"), Some("nes"));
-        assert_eq!(infer_nintendo_slug("/saves/mgba"), Some("gba"));
+        // mGBA runs Game Boy and Game Boy Advance games: its name is neither.
+        assert_eq!(infer_nintendo_slug("/saves/mgba"), None);
         assert_eq!(infer_nintendo_slug("/saves/desmume"), Some("nds"));
         assert_eq!(
             infer_nintendo_slug("/saves/mupen64plus-next opengl"),
@@ -2560,11 +2684,9 @@ mod tests {
     #[test]
     fn game_boy_advance_path_hints_classify_as_gba() {
         let tmp = tempfile::tempdir().unwrap();
-        for hint in [
-            "saves/Game Boy Advance",
-            "saves/gba",
-            "saves/VisualBoyAdvance",
-        ] {
+        // VisualBoyAdvance runs Game Boy games too, and 32 KiB is a Game Boy
+        // cartridge size: its folder names neither system.
+        for hint in ["saves/Game Boy Advance", "saves/gba"] {
             let save = tmp.path().join(hint).join("Metroid Fusion.sav");
             fs::create_dir_all(save.parent().unwrap()).unwrap();
             fs::write(&save, [0x00u8; 32768]).unwrap();
