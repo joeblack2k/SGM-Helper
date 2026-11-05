@@ -683,6 +683,12 @@ fn apply_source_writeback(store: &mut SourceStore, response: &BackendConfigSyncR
 /// which only adds and updates, keeps it forever and the helper goes on syncing through it.
 /// Manual and backend-authored sources are never dropped here, and a response that names no
 /// sources at all (an old server, or none sent) drops nothing.
+///
+/// "Listed" means named in ANY of the response's source lists (`sources`, `policy.sources`,
+/// `desiredConfig.sources`, `effectiveConfig.sources`; see `source_policies`). The union is
+/// deliberate: a partial response that fills only some of those fields keeps more sources, not
+/// fewer. Reading a single field instead would invert that and drop sources a partial response
+/// simply didn't repeat.
 fn drop_unlisted_autoscan_sources(store: &mut SourceStore, response: &BackendConfigSyncResponse) {
     let policies = source_policies(response);
     if policies.is_empty() {
@@ -1247,6 +1253,32 @@ mod tests {
                 .iter()
                 .any(|source| source.id == "steamdeck_default")
         );
+    }
+
+    #[test]
+    fn a_source_named_only_in_the_top_level_list_is_kept_when_desired_config_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.ini");
+        fs::write(&config_path, DUPLICATE_AUTOSCAN_INI).unwrap();
+        let mut store = load_source_store(&config_path).unwrap();
+        let response: BackendConfigSyncResponse = serde_json::from_value(serde_json::json!({
+            "sources": [
+                { "id": "retrodeck", "systems": ["gameboy"] },
+                { "id": "steamdeck_default", "systems": ["gameboy"] }
+            ],
+            "desiredConfig": { "sources": [] }
+        }))
+        .unwrap();
+
+        apply_source_writeback(&mut store, &response);
+
+        assert!(
+            store
+                .sources
+                .iter()
+                .any(|source| source.id == "steamdeck_default")
+        );
+        assert_eq!(store.sources.len(), 2);
     }
 
     #[test]
