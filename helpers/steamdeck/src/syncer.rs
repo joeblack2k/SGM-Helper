@@ -239,6 +239,10 @@ pub fn run_sync(
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| source.kind.as_str().to_string());
 
+        // A restore places a title by its ROM's folder only where a
+        // SAVE_SUBDIR names `{content}`; every other source keeps an empty
+        // index and resolves exactly as before.
+        let mut content_rom_index: HashMap<String, RomIndexEntry> = HashMap::new();
         if matches!(source.kind, SourceKind::Ports) {
             let port_saves = discover_port_save_matches(&source.save_roots)?;
             if verbose {
@@ -358,6 +362,13 @@ pub fn run_sync(
                 &save_files,
                 &rom_index,
             );
+            if source
+                .save_subdirs
+                .values()
+                .any(|subdir| subdir.to_string_lossy().contains("{content}"))
+            {
+                content_rom_index = rom_index.clone();
+            }
             // How many files share each selection key. The live-directory scan only
             // runs where it can change the answer: one copy and no declared
             // directory has nothing to decide.
@@ -372,7 +383,8 @@ pub fn run_sync(
                 let needs_live_check = stem_counts.get(&selection_key).copied().unwrap_or(0) > 1
                     || !source.save_subdirs.is_empty();
                 if needs_live_check
-                    && let Some(reason) = live_upload_blocked(&source, &save_path, &selection_key)
+                    && let Some(reason) =
+                        live_upload_blocked(&source, &save_path, &selection_key, &rom_index)
                 {
                     report.skipped += 1;
                     eprintln!("{}", reason);
@@ -512,6 +524,7 @@ pub fn run_sync(
             &source.save_roots,
             &source.systems,
             &source.save_subdirs,
+            &content_rom_index,
             source.create_missing_system_dirs,
             config.psp_savedata_bundles,
             &fingerprint,
@@ -583,6 +596,7 @@ fn restore_cloud_only_saves(
     save_roots: &[PathBuf],
     source_systems: &[String],
     save_subdirs: &BTreeMap<String, PathBuf>,
+    rom_index: &HashMap<String, RomIndexEntry>,
     create_missing_system_dirs: bool,
     psp_savedata_bundles: bool,
     fingerprint: &str,
@@ -637,6 +651,7 @@ fn restore_cloud_only_saves(
                 save_roots,
                 source_systems,
                 save_subdirs,
+                rom_index,
                 create_missing_system_dirs,
                 psp_savedata_bundles,
                 fingerprint,
@@ -681,6 +696,7 @@ fn restore_single_cloud_save(
     save_roots: &[PathBuf],
     source_systems: &[String],
     save_subdirs: &BTreeMap<String, PathBuf>,
+    rom_index: &HashMap<String, RomIndexEntry>,
     create_missing_system_dirs: bool,
     psp_savedata_bundles: bool,
     fingerprint: &str,
@@ -797,6 +813,7 @@ fn restore_single_cloud_save(
         target_extension.as_deref(),
         sync_entries,
         save_subdirs,
+        rom_index,
     ) else {
         // Reported by the resolver: the title sits in more than one directory
         // and nothing says which one the emulator reads.
@@ -1197,6 +1214,7 @@ fn cloud_target_path(
         target_extension,
         &HashMap::new(),
         &BTreeMap::new(),
+        &HashMap::new(),
     )
     .unwrap_or_else(|| {
         // These tests ask about the shape of a path, not about whether the
@@ -1231,12 +1249,18 @@ fn cloud_target_path_with_known(
     target_extension: Option<&str>,
     known_saves: &HashMap<String, SyncedEntry>,
     save_subdirs: &BTreeMap<String, PathBuf>,
+    rom_index: &HashMap<String, RomIndexEntry>,
 ) -> Option<PathBuf> {
     let root = select_cloud_restore_root(save_roots);
     let filename = cloud_restore_filename(cloud_save, target_extension);
     let selection_key = save_selection_key(Path::new(filename.trim()));
-    let declared = save_subdirs.get(system_slug).map(|path| path.as_path());
-    match live_target_for(root, system_slug, &selection_key, declared) {
+    let declared = declared_live_subdir(
+        rom_index,
+        save_subdirs,
+        system_slug,
+        &filename_stem(Path::new(filename.trim())),
+    );
+    match live_target_for(root, system_slug, &selection_key, declared.as_deref()) {
         LiveTarget::Path { live, strays } => {
             for stray in strays {
                 eprintln!(
@@ -1678,6 +1702,35 @@ enum LiveTarget {
     Path { live: PathBuf, strays: Vec<PathBuf> },
     /// More than one copy and nothing declared: report it and do nothing.
     Ambiguous(Vec<PathBuf>),
+}
+
+/// The operator's `SAVE_SUBDIR_<system>` for one title, with `{content}`
+/// replaced by the name of the directory the title's ROM is in. RetroArch
+/// sorting saves by content directory files a Game Boy Color game's save under
+/// `gbc` and a Game Boy game's under `gb`, though the server calls both
+/// `gameboy`; on a device launched from frontend platform folders the same
+/// option gives `Super Nintendo Entertainment System/Snes9x`. A `{content}`
+/// value whose ROM isn't found, or whose stem is in two folders, declares
+/// nothing, and the copies on disk decide as before.
+fn declared_live_subdir(
+    rom_index: &HashMap<String, RomIndexEntry>,
+    save_subdirs: &BTreeMap<String, PathBuf>,
+    system_slug: &str,
+    stem: &str,
+) -> Option<PathBuf> {
+    let declared = save_subdirs
+        .get(system_slug)?
+        .to_string_lossy()
+        .into_owned();
+    if !declared.contains("{content}") {
+        return Some(PathBuf::from(declared));
+    }
+    let entry = rom_index.get(&stem.to_ascii_lowercase())?;
+    if entry.ambiguous {
+        return None;
+    }
+    let content = entry.path.parent()?.file_name()?.to_str()?;
+    Some(PathBuf::from(declared.replace("{content}", content)))
 }
 
 /// Resolve one title's live directory under a source root.
@@ -3965,15 +4018,18 @@ fn live_upload_blocked(
     source: &ResolvedSource,
     save_path: &Path,
     selection_key: &str,
+    rom_index: &HashMap<String, RomIndexEntry>,
 ) -> Option<String> {
     let root = source.save_roots.first()?;
     let classification = classify_supported_save(save_path, None)?;
     let system_slug = classification.system_slug;
-    let declared = source
-        .save_subdirs
-        .get(&system_slug)
-        .map(|path| path.as_path());
-    match live_target_for(root, &system_slug, selection_key, declared) {
+    let declared = declared_live_subdir(
+        rom_index,
+        &source.save_subdirs,
+        &system_slug,
+        &filename_stem(save_path),
+    );
+    match live_target_for(root, &system_slug, selection_key, declared.as_deref()) {
         LiveTarget::FallThrough => None,
         LiveTarget::Path { live, .. } => {
             if save_path.parent() == Some(live.as_path()) {

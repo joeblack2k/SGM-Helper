@@ -82,6 +82,10 @@ const ROM_EXTENSIONS: &[&str] = &[
 pub struct RomIndexEntry {
     pub stem: String,
     pub path: PathBuf,
+    /// The stem is held by ROMs in more than one folder, so `path` is only the
+    /// first one found: anything that places a save by its ROM's folder must
+    /// not trust it.
+    pub ambiguous: bool,
 }
 
 pub fn discover_save_files(roots: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
@@ -100,7 +104,20 @@ pub fn discover_rom_index(
             continue;
         }
         let key = stem.to_ascii_lowercase();
-        index.entry(key).or_insert(RomIndexEntry { stem, path });
+        match index.entry(key) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(RomIndexEntry {
+                    stem,
+                    path,
+                    ambiguous: false,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if slot.get().path.parent() != path.parent() {
+                    slot.get_mut().ambiguous = true;
+                }
+            }
+        }
     }
     Ok(index)
 }
