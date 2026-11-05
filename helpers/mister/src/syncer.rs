@@ -619,6 +619,14 @@ fn restore_single_cloud_save(
         return Ok(());
     };
 
+    // A clock and SRAM written the wrong way round are each invalid for their
+    // extension, so neither is a save the scanner sees and the pair is never
+    // repaired. Put each back where its content belongs before either record
+    // is compared with or written over it.
+    if system_slug == "gameboy" {
+        heal_gameboy_rtc_srm_swap(&provisional_path);
+    }
+
     if existing_local_save_is_valid(&provisional_path, &system_slug) {
         return Ok(());
     }
@@ -1109,6 +1117,53 @@ fn wii_title_code_from_candidate(candidate: &str) -> Option<String> {
         return Some(clean);
     }
     None
+}
+
+/// Whether `bytes` long is a Game Boy real-time clock rather than SRAM: a clock
+/// is at most 64 bytes, and no SRAM size is that small.
+fn gameboy_clock_sized(len: u64) -> bool {
+    (1..=64).contains(&len)
+}
+
+fn gameboy_sram_sized(len: u64) -> bool {
+    matches!(len, 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536)
+}
+
+/// Moves a Game Boy stem's `.srm` and `.rtc` to the extensions their content
+/// belongs to: SRAM in `.srm`, the clock in `.rtc`. Only a file in the wrong
+/// slot moves, and only into a slot that is empty or holds the other one, so
+/// a correct pair and an unrelated file are left alone.
+fn heal_gameboy_rtc_srm_swap(target: &Path) {
+    let srm = target.with_extension("srm");
+    let rtc = target.with_extension("rtc");
+    let size = |path: &Path| {
+        fs::metadata(path)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
+    };
+    let (srm_len, rtc_len) = (size(&srm), size(&rtc));
+    let srm_holds_clock = srm_len.is_some_and(gameboy_clock_sized);
+    let rtc_holds_sram = rtc_len.is_some_and(gameboy_sram_sized);
+    let moved = match (srm_holds_clock, rtc_holds_sram) {
+        (true, true) => {
+            let swap = srm.with_extension("srm-rtc-swap");
+            fs::rename(&srm, &swap)
+                .and_then(|_| fs::rename(&rtc, &srm))
+                .and_then(|_| fs::rename(&swap, &rtc))
+                .is_ok()
+        }
+        (true, false) if rtc_len.is_none() => fs::rename(&srm, &rtc).is_ok(),
+        (false, true) if srm_len.is_none() => fs::rename(&rtc, &srm).is_ok(),
+        _ => return,
+    };
+    if moved {
+        eprintln!(
+            "Moved {} and {} to the extensions their content belongs to: SRAM in .srm, the clock in .rtc",
+            srm.display(),
+            rtc.display()
+        );
+    }
 }
 
 fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
@@ -3154,6 +3209,14 @@ fn preferred_save_path(
     };
     let current_extension = save_extension(save_path);
     if system_slug == "n64" && is_native_n64_extension(current_extension.as_deref()) {
+        return save_path.to_path_buf();
+    }
+    // A sidecar is its own file, not another spelling of the save: renaming a
+    // restored `.rtc` to the cartridge's `.srm` writes the clock over the SRAM.
+    if current_extension
+        .as_deref()
+        .is_some_and(crate::scanner::is_sidecar)
+    {
         return save_path.to_path_buf();
     }
     // A Sega CD backup RAM is read by its own name (scd_U.brm, cart.brm); the
