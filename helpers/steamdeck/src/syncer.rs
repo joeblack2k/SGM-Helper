@@ -534,6 +534,17 @@ pub fn run_sync(
             .collect();
 
         for (save_key, entry) in missing_entries {
+            if let Some((held, arm)) =
+                missing_entry_held_elsewhere(&save_key, &entry, &sync_state.entries)
+            {
+                report.skipped += 1;
+                eprintln!(
+                    "Not restoring missing save {}: this save is already held at {} (matched by {}); dropping its entry",
+                    save_key, held, arm
+                );
+                sync_state.entries.remove(&save_key);
+                continue;
+            }
             let save_path = PathBuf::from(&save_key);
             let restore = process_missing_save(
                 &api,
@@ -1946,6 +1957,50 @@ fn existing_cloud_target_for_alias(
         }
     }
     None
+}
+
+/// Another file this helper holds as the same save as a missing entry.
+///
+/// A save synced under a second name (another tool's short name for the game)
+/// and then deleted is not lost while this helper still holds the game's save
+/// in another file: the same system and, on a one-save-per-ROM system, the same
+/// ROM, or the same bytes. Restoring the missing name would write a second copy
+/// beside the save the emulator reads, the same pair `held_elsewhere` keeps a
+/// cloud restore from creating.
+fn missing_entry_held_elsewhere(
+    missing_key: &str,
+    missing: &SyncedEntry,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> Option<(String, &'static str)> {
+    let system_slug = missing.system_slug.as_deref()?;
+    let rom = missing
+        .rom_sha1
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.contains(':'))
+        .filter(|_| one_save_per_rom(system_slug) && !is_sidecar_path(missing_key));
+    let sha = missing.sha256.trim();
+    let mut held: Vec<(&String, &'static str)> = known_saves
+        .iter()
+        .filter(|(path, entry)| {
+            path.as_str() != missing_key
+                && entry.system_slug.as_deref() == Some(system_slug)
+                && Path::new(path.as_str()).exists()
+        })
+        .filter_map(|(path, entry)| {
+            if rom.is_some_and(|rom| entry.rom_sha1.as_deref().map(str::trim) == Some(rom))
+                && !is_sidecar_path(path)
+            {
+                Some((path, "rom_sha1"))
+            } else if !sha.is_empty() && same_save_digest(&entry.sha256, sha) {
+                Some((path, "bytes"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    held.sort();
+    held.first().map(|(path, arm)| ((*path).clone(), *arm))
 }
 
 /// Whether the helper's own state records `path` as a save of `system_slug`.
