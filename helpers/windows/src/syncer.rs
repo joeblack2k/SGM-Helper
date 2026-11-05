@@ -1476,7 +1476,7 @@ fn wii_title_code_from_candidate(candidate: &str) -> Option<String> {
 
 fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
     path.exists()
-        && classify_supported_save(path, None)
+        && classify_with_known_system(path, None, Some(system_slug))
             .map(|classification| classification.system_slug == system_slug)
             .unwrap_or(false)
 }
@@ -1562,7 +1562,7 @@ fn live_target_for(
                 let path = file.path();
                 path.is_file()
                     && save_selection_key(&path) == selection_key
-                    && classify_supported_save(&path, None)
+                    && classify_with_known_system(&path, None, Some(system_slug))
                         .map(|classification| classification.system_slug == system_slug)
                         .unwrap_or(false)
             });
@@ -1734,6 +1734,23 @@ fn save_stem(filename: &str) -> &str {
 
 fn same_save_stem(candidate: &str, reference: &str) -> bool {
     Path::new(candidate).extension().is_some() && save_stem(candidate) == save_stem(reference)
+}
+
+/// What `path` is, letting a system already known for it settle what the path
+/// cannot. A folder whose core runs two systems (RetroArch's mGBA serves Game
+/// Boy and GBA) names neither, so the record being restored, or the system this
+/// helper last synced the file as, decides. It never overrides a path or ROM
+/// that does name a system.
+fn classify_with_known_system(
+    path: &Path,
+    rom_path: Option<&Path>,
+    known_system: Option<&str>,
+) -> Option<crate::scanner::SaveClassification> {
+    classify_supported_save(path, rom_path).or_else(|| {
+        known_system.and_then(|system_slug| {
+            crate::scanner::classify_save_in_shared_core_as(path, system_slug)
+        })
+    })
 }
 
 fn preferred_system_directory_for_root(
@@ -2170,9 +2187,11 @@ fn process_single_save(
     let stem_key = stem.to_ascii_lowercase();
     let rom_entry = rom_index.get(&stem_key);
     let mut state_key = save_key.to_string();
-    let Some(classification) =
-        classify_supported_save(save_path, rom_entry.map(|entry| entry.path.as_path()))
-    else {
+    let Some(classification) = classify_with_known_system(
+        save_path,
+        rom_entry.map(|entry| entry.path.as_path()),
+        prior_entry.and_then(|entry| entry.system_slug.as_deref()),
+    ) else {
         report.skipped += 1;
         if let Some(reason) =
             dreamcast_skip_reason(save_path, rom_entry.map(|entry| entry.path.as_path()))

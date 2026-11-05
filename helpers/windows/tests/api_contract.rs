@@ -1389,6 +1389,129 @@ fn writeback_config(
     config
 }
 
+/// The arcade's RetroArch: mGBA runs Game Boy and GBA, and the operator files
+/// Game Boy saves under it with SAVE_SUBDIR_GAMEBOY. The server holds one
+/// 8 KiB Game Boy record; 8 KiB is a cartridge size for both systems.
+fn mgba_gameboy_harness() -> (
+    MockServer,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_mgba","expiresInDays":7}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"mgba@example.com"}}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":true,"sha256":"KIRBY_SHA","version":1,"id":"save-kirby"}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-kirby","filename":"Kirby's Dream Land 2.srm","displayTitle":"Kirby's Dream Land 2","systemSlug":"gameboy","sha256":"KIRBY_SHA","version":1,"latestSizeBytes":8192}]}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/saves/download")
+            .query_param("id", "save-kirby");
+        then.status(200).body(snes_save_bytes(0x11));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/mGBA")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = tmp.path().join("config-mgba.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\n\n[source.retroarch]\nLABEL=\"RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"gameboy,gba\"\nSAVE_SUBDIR_GAMEBOY=\"mGBA\"\nSAVE_SUBDIR_GBA=\"mGBA\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.join("saves").display(),
+            root.join("roms").display()
+        ),
+    )
+    .unwrap();
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("mgba@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    (server, tmp, root.join("saves/mGBA"), config)
+}
+
+fn mgba_sync(config: &std::path::Path) -> String {
+    let output = wb_helper()
+        .arg("--config")
+        .arg(config)
+        .arg("sync")
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn a_game_boy_save_restored_into_mgba_is_present_on_the_next_pass_and_never_uploaded_as_gba() {
+    let (server, _tmp, dir, config) = mgba_gameboy_harness();
+    let any_upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-up","sha256":"x","version":1}}"#);
+    });
+    let first = mgba_sync(&config);
+    let target = dir.join("Kirby's Dream Land 2.srm");
+    assert_eq!(
+        fs::read(&target).ok(),
+        Some(snes_save_bytes(0x11)),
+        "the Game Boy record was not restored into mGBA: {first}"
+    );
+    let written = fs::metadata(&target).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let second = mgba_sync(&config);
+    assert!(
+        !second.contains("Restored cloud-only"),
+        "the second pass restored again: {second}"
+    );
+    assert_eq!(
+        fs::metadata(&target).unwrap().modified().unwrap(),
+        written,
+        "the second pass rewrote the file: {second}"
+    );
+    assert!(
+        !second.contains("Detected gba savegame"),
+        "the restored Game Boy save was read as GBA: {second}"
+    );
+    any_upload.assert_calls(0);
+}
+
 /// A save root with one title in two directories: the system directory an
 /// older helper wrote and a core-named one. `declared` is the SAVE_SUBDIR line
 /// an operator may add, or empty.
