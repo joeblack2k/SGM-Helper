@@ -3964,6 +3964,11 @@ fn projection_runtime_profile_for_system(
             }
             .to_string(),
         ),
+        // The server publishes exactly one profile for each of these three
+        // (RetroSaveManager#56), so every source asks for it.
+        "ngp" => Some("ngp/mednafen".to_string()),
+        "virtualboy" => Some("virtualboy/mednafen".to_string()),
+        "neogeo-cd" => Some("neogeo-cd/retroarch".to_string()),
         "gba" => Some(
             match source_profile {
                 EmulatorProfile::RetroArch => "gba/retroarch-mgba",
@@ -6138,6 +6143,18 @@ mod runtime_profile_map {
                 "atari-jaguar/retroarch-virtual-jaguar",
             ),
             ("3do", EmulatorProfile::RetroArch, "3do/retroarch-opera"),
+            // RSM#56 made these projection-capable and publishes one profile each.
+            ("ngp", EmulatorProfile::RetroArch, "ngp/mednafen"),
+            (
+                "virtualboy",
+                EmulatorProfile::RetroArch,
+                "virtualboy/mednafen",
+            ),
+            (
+                "neogeo-cd",
+                EmulatorProfile::RetroArch,
+                "neogeo-cd/retroarch",
+            ),
         ];
         for (system, profile, expected) in cases {
             let got = projection_runtime_profile_for_system(
