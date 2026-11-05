@@ -1157,6 +1157,236 @@ fn a_restore_lands_in_the_declared_directory() {
     );
 }
 
+// A local file that cannot be any save of its system (a truncated .srm, a few
+// bytes long) does not count as present, so the server's save is restored over
+// it; that is what heals a truncated save. A local file that is a valid save and
+// differs from the server's is not overwritten by the restore: it goes through
+// the sync, where a change on both sides is a conflict.
+#[test]
+fn an_unclassifiable_local_file_is_replaced_and_a_valid_one_is_kept() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_heal","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"heal@example.com"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":2,"limit":100,"offset":0,"saves":[{"id":"save-trunc","filename":"Truncated Quest (USA).srm","displayTitle":"Truncated Quest","systemSlug":"snes","sha256":"sha-trunc","version":2,"latestSizeBytes":8192},{"id":"save-kept","filename":"Kept Quest (USA).srm","displayTitle":"Kept Quest","systemSlug":"snes","sha256":"sha-kept","version":2,"latestSizeBytes":8192}]}"#);
+    });
+    let _download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(snes_save_bytes(7));
+    });
+    let _upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-kept","sha256":"x","version":3}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/snes")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let truncated = root.join("saves/snes/Truncated Quest (USA).srm");
+    let kept = root.join("saves/snes/Kept Quest (USA).srm");
+    fs::write(&truncated, vec![0x31u8; 8]).unwrap();
+    fs::write(&kept, snes_save_bytes(11)).unwrap();
+    let config = live_directory_config(&tmp, &server, &root, &state_dir, "");
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("heal@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        fs::read(&truncated).unwrap(),
+        snes_save_bytes(7),
+        "an unclassifiable local file was not replaced by the server's save:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        snes_save_bytes(11),
+        "a valid local save that differs from the server's was overwritten by the restore:\n{stderr}"
+    );
+}
+
+// A small file that some other system's profile accepts is a save, not junk:
+// it classifies there, so a restore for this system must not write over it.
+#[test]
+fn a_file_this_helper_synced_as_another_system_is_not_overwritten() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_other","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"other@example.com"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-other","filename":"Other Quest (USA).srm","displayTitle":"Other Quest","systemSlug":"snes","sha256":"sha-other","version":2,"latestSizeBytes":8192}]}"#);
+    });
+    let _download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(snes_save_bytes(7));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/snes")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    // 64 bytes of non-blank binary: SNES rejects it, a Genesis cart save can be
+    // 64 bytes, and this helper's state records the file as a genesis save, so a
+    // snes record is not written over it.
+    let other: Vec<u8> = (0..64u32)
+        .map(|i| (i.wrapping_mul(7) ^ 0xa5) as u8)
+        .collect();
+    let path = root.join("saves/snes/Other Quest (USA).srm");
+    fs::write(&path, &other).unwrap();
+    writeback_state(&state_dir, &path, "genesis");
+    let config = live_directory_config(&tmp, &server, &root, &state_dir, "");
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("other@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        other,
+        "a file this helper synced as a genesis save was overwritten by a snes record:\n{stderr}"
+    );
+}
+
+#[test]
+fn a_file_this_system_cannot_use_is_replaced_without_other_evidence() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_other","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"other@example.com"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-other","filename":"Other Quest (USA).srm","displayTitle":"Other Quest","systemSlug":"snes","sha256":"sha-other","version":2,"latestSizeBytes":8192}]}"#);
+    });
+    let _download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(snes_save_bytes(7));
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/snes")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    // The same 64 bytes with no state entry: nothing says it is another
+    // system's save, and SNES can't use it, so the server's snes save replaces it.
+    let other: Vec<u8> = (0..64u32)
+        .map(|i| (i.wrapping_mul(7) ^ 0xa5) as u8)
+        .collect();
+    let path = root.join("saves/snes/Other Quest (USA).srm");
+    fs::write(&path, &other).unwrap();
+    let config = live_directory_config(&tmp, &server, &root, &state_dir, "");
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("other@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        snes_save_bytes(7),
+        "a file nothing marks as another system's save was not replaced:\n{stderr}"
+    );
+}
+
 fn wb_helper() -> Command {
     Command::cargo_bin("sgm-windows-helper").unwrap()
 }

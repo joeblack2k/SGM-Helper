@@ -1232,6 +1232,41 @@ fn is_plausible_save_size(size: u64) -> bool {
     size > 0 && size <= MAX_SAVE_BYTES
 }
 
+/// Whether any system's save profile accepts a file of this extension and size.
+/// A file no profile accepts cannot be a save of any system (a truncated
+/// `.srm` a few bytes long, say). One some profile accepts is a save, of this
+/// system or another, even when its directory says otherwise.
+pub fn some_save_profile_accepts(ext: &str, size: u64) -> bool {
+    [
+        "nes",
+        "snes",
+        "gameboy",
+        "gba",
+        "n64",
+        "nds",
+        "3ds",
+        "genesis",
+        "master-system",
+        "game-gear",
+        "sega-cd",
+        "sega-32x",
+        "saturn",
+        "dreamcast",
+        "neogeo",
+        "tgfx16",
+        "wii",
+        "psx",
+        "ps2",
+        "psp",
+        "psvita",
+        "ps3",
+        "ps4",
+        "ps5",
+    ]
+    .iter()
+    .any(|slug| is_plausible_save_for_system(ext, size, slug))
+}
+
 fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
     if !is_plausible_save_size(size) {
         return false;

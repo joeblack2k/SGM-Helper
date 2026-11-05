@@ -791,6 +791,26 @@ fn restore_single_cloud_save(
     if existing_local_save_is_valid(&target_path, &system_slug) {
         return Ok(());
     }
+    // A local file this system cannot use is restored over: it is a truncated
+    // or damaged copy, and the server's save is the one to keep. The exception
+    // is a file this helper's own state records as a save of another system
+    // that some system profile accepts (a stem two systems share, such as a
+    // Genesis save where a 32X record has the same name): writing this
+    // system's record over it would replace one system's save with another's.
+    // "Can't be a save" means no system profile accepts the file, never only
+    // that it is too small for this system.
+    if local_file_is_some_save(&target_path)
+        && recorded_as_other_system(&target_path, &system_slug, sync_entries)
+    {
+        report.skipped += 1;
+        eprintln!(
+            "Not restoring {} save '{}' over {}: this helper synced that file as a save of another system",
+            system_slug,
+            cloud_save.display_name(),
+            target_path.display()
+        );
+        return Ok(());
+    }
     if !target_parent_allowed(&target_path, save_roots, create_missing_system_dirs) {
         report.skipped += 1;
         if verbose {
@@ -1210,6 +1230,19 @@ fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Whether some system's save profile accepts the file at `path`.
+fn local_file_is_some_save(path: &Path) -> bool {
+    let Some(ext) = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    let size = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+    crate::scanner::some_save_profile_accepts(&ext, size)
+}
+
 fn cloud_restore_native_target_path(
     provisional_path: &Path,
     source_kind: &SourceKind,
@@ -1449,6 +1482,20 @@ fn known_save_for_system(
         .get(path.to_string_lossy().as_ref())
         .and_then(|entry| entry.system_slug.as_deref())
         .map(|slug| slug == system_slug)
+        .unwrap_or(false)
+}
+
+/// Whether the helper's own state records `path` as a save of a system other
+/// than `system_slug`.
+fn recorded_as_other_system(
+    path: &Path,
+    system_slug: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> bool {
+    known_saves
+        .get(path.to_string_lossy().as_ref())
+        .and_then(|entry| entry.system_slug.as_deref())
+        .map(|slug| !slug.is_empty() && slug != system_slug)
         .unwrap_or(false)
 }
 
