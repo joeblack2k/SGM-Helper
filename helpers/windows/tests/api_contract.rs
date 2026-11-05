@@ -1241,6 +1241,89 @@ fn an_unclassifiable_local_file_is_replaced_and_a_valid_one_is_kept() {
     );
 }
 
+#[test]
+fn a_truncated_game_boy_save_is_replaced_by_the_cloud_copy() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_heal","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"heal@example.com"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":2,"limit":100,"offset":0,"saves":[{"id":"save-trunc","filename":"Truncated Quest (USA).srm","displayTitle":"Truncated Quest","systemSlug":"gameboy","sha256":"sha-trunc","version":2,"latestSizeBytes":8192},{"id":"save-kept","filename":"Kept Quest (USA).srm","displayTitle":"Kept Quest","systemSlug":"gameboy","sha256":"sha-kept","version":2,"latestSizeBytes":8192}]}"#);
+    });
+    let _download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(snes_save_bytes(7));
+    });
+    let _upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-kept","sha256":"x","version":3}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/gbc")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let truncated = root.join("saves/gbc/Truncated Quest (USA).srm");
+    let kept = root.join("saves/gbc/Kept Quest (USA).srm");
+    fs::write(&truncated, vec![0x31u8; 8]).unwrap();
+    fs::write(&kept, snes_save_bytes(11)).unwrap();
+    let config = live_directory_config(&tmp, &server, &root, &state_dir, "");
+    let text = fs::read_to_string(&config)
+        .unwrap()
+        .replace("SYSTEMS=\"snes\"", "SYSTEMS=\"gameboy\"");
+    fs::write(&config, text).unwrap();
+
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("heal@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        fs::read(&truncated).unwrap(),
+        snes_save_bytes(7),
+        "an unclassifiable local file was not replaced by the server's save:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        snes_save_bytes(11),
+        "a valid local save that differs from the server's was overwritten by the restore:\n{stderr}"
+    );
+}
+
 // A small file that some other system's profile accepts is a save, not junk:
 // it classifies there, so a restore for this system must not write over it.
 #[test]

@@ -3058,11 +3058,14 @@ fn process_single_save(
         // A save keeps its size. A downloaded payload of another length is a
         // different save, or a canonical form (an N64 projection, a padded
         // image) the game never wrote; writing it over the local save loses the
-        // save the game reads and starts a rewrite on every pass.
+        // save the game reads and starts a rewrite on every pass. A local file
+        // no system profile accepts is not a save at all (a truncated stub),
+        // so there is no size to keep and the server's save replaces it.
         if target_save_path == save_path
             && let Ok(existing) = std::fs::metadata(&target_save_path)
             && existing.is_file()
             && existing.len() != local_bytes.len() as u64
+            && local_file_is_some_save(&target_save_path)
         {
             report.refused_size_mismatch += 1;
             eprintln!(
