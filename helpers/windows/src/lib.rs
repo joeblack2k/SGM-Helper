@@ -63,6 +63,7 @@ pub fn run() -> Result<()> {
         force_upload: None,
         dry_run: None,
         route_prefix: cli.route_prefix.clone(),
+        secure: cli.secure,
     };
 
     let loaded = LoadedConfig::load(cli.config.clone(), &global_overrides)?;
