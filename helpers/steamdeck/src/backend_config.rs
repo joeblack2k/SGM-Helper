@@ -664,6 +664,7 @@ fn append_missing_globals(
 }
 
 fn apply_source_writeback(store: &mut SourceStore, response: &BackendConfigSyncResponse) {
+    drop_unlisted_autoscan_sources(store, response);
     for policy in source_policies(response) {
         if let Some(source) = store
             .sources
@@ -675,6 +676,25 @@ fn apply_source_writeback(store: &mut SourceStore, response: &BackendConfigSyncR
             store.sources.push(source);
         }
     }
+}
+
+/// A source autoscan added (MANAGED, origin `autoscan-*`) lives only while the backend still
+/// lists it. When the backend's source list no longer names it, as when it holds a save root a
+/// configured source already covers, it is dropped from config.ini; otherwise this writeback,
+/// which only adds and updates, keeps it forever and the helper goes on syncing through it.
+/// Manual and backend-authored sources are never dropped here, and a response that names no
+/// sources at all (an old server, or none sent) drops nothing.
+fn drop_unlisted_autoscan_sources(store: &mut SourceStore, response: &BackendConfigSyncResponse) {
+    let policies = source_policies(response);
+    if policies.is_empty() {
+        return;
+    }
+    store.sources.retain(|source| {
+        !(source.managed && source.origin.starts_with("autoscan"))
+            || policies
+                .iter()
+                .any(|policy| source_policy_matches_source(source, policy))
+    });
 }
 
 fn source_policy_matches_source(source: &Source, policy: &BackendSourcePolicy) -> bool {
@@ -1179,6 +1199,71 @@ mod tests {
         assert!(body.contains("SYSTEMS=\"none\""));
         let store = load_source_store(&config_path).unwrap();
         assert!(store.sources[0].systems.is_empty());
+    }
+
+    // A source autoscan added lives only while the backend lists it: once the policy stops
+    // naming it, the writeback drops it, and a configured (manual) source is never dropped.
+    const DUPLICATE_AUTOSCAN_INI: &str = "URL=\"192.168.2.10\"\nPORT=\"80\"\n\n[source.retrodeck]\nLABEL=\"RetroDeck\"\nKIND=\"retroarch\"\nSAVE_PATH=\"/home/deck/retrodeck/saves\"\nROM_PATH=\"/home/deck/retrodeck/roms\"\nRECURSIVE=\"true\"\nSYSTEMS=\"gameboy\"\nMANAGED=\"false\"\nORIGIN=\"manual\"\n\n[source.steamdeck_default]\nLABEL=\"steamdeck Default\"\nKIND=\"custom\"\nSAVE_PATH=\"/home/deck/retrodeck/saves\"\nROM_PATH=\"/home/deck/retrodeck/saves\"\nRECURSIVE=\"true\"\nSYSTEMS=\"gameboy\"\nMANAGED=\"true\"\nORIGIN=\"autoscan-known\"\n";
+
+    #[test]
+    fn a_managed_autoscan_source_the_policy_stops_listing_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.ini");
+        fs::write(&config_path, DUPLICATE_AUTOSCAN_INI).unwrap();
+        let config = test_config(&config_path, tmp.path());
+        let response: BackendConfigSyncResponse = serde_json::from_value(serde_json::json!({
+            "policy": { "sources": [{ "id": "retrodeck", "systems": ["gameboy"] }] }
+        }))
+        .unwrap();
+
+        write_backend_policy_to_config(&config, &response, false).unwrap();
+
+        let ids: Vec<String> = load_source_store(&config_path)
+            .unwrap()
+            .sources
+            .into_iter()
+            .map(|source| source.id)
+            .collect();
+        assert_eq!(ids, vec!["retrodeck".to_string()]);
+    }
+
+    #[test]
+    fn a_manual_source_the_policy_does_not_list_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.ini");
+        fs::write(&config_path, DUPLICATE_AUTOSCAN_INI).unwrap();
+        let config = test_config(&config_path, tmp.path());
+        let response: BackendConfigSyncResponse = serde_json::from_value(serde_json::json!({
+            "policy": { "sources": [{ "id": "steamdeck_default", "systems": ["gameboy"] }] }
+        }))
+        .unwrap();
+
+        write_backend_policy_to_config(&config, &response, false).unwrap();
+
+        let store = load_source_store(&config_path).unwrap();
+        assert!(store.sources.iter().any(|source| source.id == "retrodeck"));
+        assert!(
+            store
+                .sources
+                .iter()
+                .any(|source| source.id == "steamdeck_default")
+        );
+    }
+
+    #[test]
+    fn a_response_that_lists_no_sources_drops_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.ini");
+        fs::write(&config_path, DUPLICATE_AUTOSCAN_INI).unwrap();
+        let mut store = load_source_store(&config_path).unwrap();
+        let response: BackendConfigSyncResponse = serde_json::from_value(serde_json::json!({
+            "policy": { "global": { "dryRun": false } }
+        }))
+        .unwrap();
+
+        apply_source_writeback(&mut store, &response);
+
+        assert_eq!(store.sources.len(), 2);
     }
 
     fn test_config(config_path: &Path, root: &Path) -> AppConfig {
