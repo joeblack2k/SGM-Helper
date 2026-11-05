@@ -773,7 +773,8 @@ fn restore_single_cloud_save(
         );
     }
 
-    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
+    let effective_profile =
+        effective_profile_for_cloud_restore(source_kind, source_profile, save_roots);
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
     let runtime_target = runtime_target_needs_dsv_profile(
         &system_slug,
@@ -1063,7 +1064,7 @@ fn restore_cloud_psp_bundle(
         return Ok(());
     }
 
-    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
+    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile, &[]);
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, "psp");
     let bundle = api.download_save(&cloud_save.id, device_type, fingerprint, app_password, None)?;
     let files = restore_psp_savedata_bundle(&target, &bundle)?;
@@ -1127,18 +1128,43 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
 fn effective_profile_for_cloud_restore(
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
+    save_roots: &[PathBuf],
 ) -> EmulatorProfile {
     match source_kind {
         SourceKind::MisterFpga => EmulatorProfile::Mister,
         SourceKind::RetroArch => EmulatorProfile::RetroArch,
+        // A Deck or Windows source configured as Generic is still a RetroArch
+        // tree when its saves live in one: RetroDECK and EmuDeck put the cores
+        // behind RetroArch, and calling that Generic chose `n64/mupen-family`
+        // for a device whose core reads the combined bundle. The root path is
+        // the evidence; a source that says otherwise keeps its own profile.
+        SourceKind::SteamDeck | SourceKind::Windows
+            if matches!(source_profile, EmulatorProfile::Generic) =>
+        {
+            save_roots
+                .first()
+                .and_then(|root| infer_profile_from_path("n64", root))
+                .unwrap_or_else(|| source_profile.clone())
+        }
         _ => source_profile.clone(),
     }
 }
-
 fn cloud_target_extension(
     cloud_save: &CloudSaveSummary,
     runtime_profile: Option<&str>,
 ) -> Option<String> {
+    // Under `n64/retroarch` the core reads one combined bundle, and the record's
+    // own filename may still name a component it was uploaded as. A component
+    // extension is not a file that core loads, so the target is the profile's
+    // `.srm`; the alternative is writing a 296,960-byte bundle over a 2 KiB
+    // eeprom, which the size guard refuses every pass.
+    if let Some(target) = n64_bundle_target(
+        &cloud_save.system_slug,
+        runtime_profile,
+        extension_from_filename(&cloud_save.filename).as_deref(),
+    ) {
+        return Some(target.to_string());
+    }
     let profile_extension = profile_target_extension(cloud_save, runtime_profile);
     // A sidecar must never land on a primary target: an `.rtc` mapped onto a
     // `.srm` overwrites the real cartridge save with seconds of clock state.
@@ -2170,7 +2196,7 @@ fn process_psp_savedata_dir(
     let rom_key = psp_line_key(&save_dir);
     let filename = psp_bundle_filename(&save_dir);
     let slot_name = PSP_BUNDLE_SLOT;
-    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
+    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile, &[]);
     let device_type =
         helper_device_type_for_upload(source_kind, &effective_profile, PSP_SYSTEM_SLUG);
     let entry_for = |sha: String, version: Option<i64>| {
@@ -3189,6 +3215,53 @@ fn process_single_save(
     Ok(None)
 }
 
+/// The target extension a bundle-profile source gives an N64 save.
+///
+/// `n64/retroarch` loads one combined bundle per game, and the record or the
+/// state can still name a component the core never reads (`.eep`, `.sra`,
+/// `.fla`, and the controller pak containers). Both restore paths ask this one
+/// function, so they cannot disagree about what the target is.
+fn n64_bundle_target(
+    system_slug: &str,
+    runtime_profile: Option<&str>,
+    extension: Option<&str>,
+) -> Option<&'static str> {
+    if !system_slug.eq_ignore_ascii_case("n64") {
+        return None;
+    }
+    if !matches!(
+        runtime_profile
+            .map(|profile| profile.to_ascii_lowercase())
+            .as_deref(),
+        Some("n64/retroarch")
+    ) {
+        return None;
+    }
+    match extension.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("eep" | "sra" | "fla" | "mpk" | "cpk") => Some("srm"),
+        _ => None,
+    }
+}
+
+/// Where a missing save is restored for this system.
+///
+/// The state records the path a save was last synced from, and that path can be
+/// a component the core never reads: an `n64/retroarch` device loads one combined
+/// bundle per game, so restoring a recorded `.eep` recreates a stray and leaves
+/// the bundle untouched. Under the bundle profile the target is `<stem>.srm`;
+/// everything else keeps its recorded path.
+fn missing_save_restore_path(
+    save_path: &Path,
+    system_slug: &str,
+    runtime_profile: Option<&str>,
+) -> PathBuf {
+    let extension = save_path.extension().and_then(|value| value.to_str());
+    match n64_bundle_target(system_slug, runtime_profile, extension) {
+        Some(target) => save_path.with_extension(target),
+        None => save_path.to_path_buf(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_missing_save(
     api: &ApiClient,
@@ -3239,6 +3312,52 @@ fn process_missing_save(
         }
         return Ok(None);
     }
+    let effective_profile =
+        effective_profile_for_save(source_kind, source_profile, system_slug, save_path);
+    let device_type = helper_device_type_for_upload(source_kind, &effective_profile, system_slug);
+    let runtime_target =
+        runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type);
+    // A recorded component is not a file this core loads. Restoring it recreates
+    // the stray that the bundle rule exists to prevent, and the state entry
+    // never moves; the target is the bundle for the same stem instead, and the
+    // entry is re-keyed to it by the caller.
+    let restore_path = missing_save_restore_path(
+        save_path,
+        system_slug,
+        runtime_target
+            .system_profile_value
+            .as_deref()
+            .or(runtime_target.runtime_profile.as_deref()),
+    );
+    let save_path = restore_path.as_path();
+
+    // The recorded component is not a file this core loads. If the bundle for
+    // the same stem is already here, the save is present and the entry is what
+    // is stale: re-key it to the bundle and leave both files alone.
+    if restore_path != save_path && existing_local_save_is_valid(&restore_path, system_slug) {
+        if verbose {
+            eprintln!(
+                "Missing save {} is the bundle {}; re-keying the entry",
+                save_path.display(),
+                restore_path.display()
+            );
+        }
+        return Ok(Some(processed_entry(
+            restore_path.to_string_lossy().to_string(),
+            synced_entry(
+                existing_entry.sha256.clone(),
+                Some(rom_sha1.to_string()),
+                existing_entry.version,
+                Some(system_slug),
+                existing_entry.local_container,
+                existing_entry.adapter_profile,
+                Some(source_kind),
+                Some(source_name),
+                existing_entry.slot_name.as_deref(),
+            ),
+        )));
+    }
+
     if !target_parent_allowed(save_path, save_roots, create_missing_system_dirs) {
         report.skipped += 1;
         if verbose {
@@ -3254,14 +3373,8 @@ fn process_missing_save(
         .slot_name
         .clone()
         .unwrap_or_else(|| resolve_slot_name_for_sync(system_slug, save_path, &options.slot_name));
-    let effective_profile =
-        effective_profile_for_save(source_kind, source_profile, system_slug, save_path);
-    let device_type = helper_device_type_for_upload(source_kind, &effective_profile, system_slug);
-    let runtime_target = runtime_target_needs_dsv_profile(
-        system_slug,
-        &save_path.to_string_lossy(),
-        runtime_target_for_system(source_kind, &effective_profile, system_slug, device_type),
-    );
+    let runtime_target =
+        runtime_target_needs_dsv_profile(system_slug, &save_path.to_string_lossy(), runtime_target);
 
     let latest = match api.latest_save(LatestSaveRequest {
         rom_sha1,
@@ -3718,6 +3831,11 @@ fn infer_profile_from_path(system_slug: &str, save_path: &Path) -> Option<Emulat
         "retroarch",
         "/retroarch/",
         "\\retroarch\\",
+        // RetroDECK is RetroArch with a fixed layout; its saves are the
+        // core's saves, and a source profile of Generic on such a device has
+        // been choosing the wrong N64 form.
+        "retrodeck",
+        "/retrodeck/",
         "/emulation/saves/",
         "\\emulation\\saves\\",
     ]) {
@@ -4551,6 +4669,29 @@ mod tests {
         assert_eq!(
             cloud_target_extension(&save, Some("gameboy/retroarch-gambatte")).as_deref(),
             Some("srm")
+        );
+    }
+
+    #[test]
+    fn a_retrodeck_save_root_gives_a_cloud_restore_the_retroarch_profile() {
+        // Generic on a Deck is RetroDECK in practice: the n64 core behind
+        // RetroArch reads the combined bundle, and a Generic profile asked the
+        // server for `n64/mupen-family` and a component instead.
+        assert_eq!(
+            effective_profile_for_cloud_restore(
+                &SourceKind::SteamDeck,
+                &EmulatorProfile::Generic,
+                &[PathBuf::from("/home/deck/retrodeck/saves")],
+            ),
+            EmulatorProfile::RetroArch
+        );
+        assert_eq!(
+            effective_profile_for_cloud_restore(
+                &SourceKind::SteamDeck,
+                &EmulatorProfile::Generic,
+                &[PathBuf::from("/home/deck/saves")],
+            ),
+            EmulatorProfile::Generic
         );
     }
 
