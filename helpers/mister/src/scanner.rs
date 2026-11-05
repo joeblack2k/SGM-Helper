@@ -189,9 +189,10 @@ pub fn sha1_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// The ROM's md5, read in 8 KiB blocks. A ROM can be a whole CD image
-/// (hundreds of MiB), so reading it into memory at once can exhaust a small
-/// device: the kernel kills the helper mid-sync.
+/// The ROM's md5, read in 8 KiB blocks. A ROM can be a whole CD image, and
+/// reading it into memory at once exhausts a small device: on a 468 MB CHD the
+/// whole-buffer version peaked at 457,644 KB resident against 1,444 KB for this
+/// loop (same md5), and a 492 MiB MiSTer's kernel killed the helper mid-sync.
 pub fn md5_file(path: &Path) -> Result<String> {
     let file =
         File::open(path).with_context(|| format!("kan ROM niet openen: {}", path.display()))?;
