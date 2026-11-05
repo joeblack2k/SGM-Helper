@@ -54,11 +54,7 @@ struct SyncLock {
 impl SyncLock {
     fn acquire(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("sync.lock");
-        let lock_content = format!(
-            "pid={}\\nstarted_at={}\\n",
-            std::process::id(),
-            now_rfc3339()
-        );
+        let lock_content = format!("pid={}\nstarted_at={}\n", std::process::id(), now_rfc3339());
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -120,11 +116,15 @@ impl SyncLock {
     }
 }
 
-/// The pid a `sync.lock` names on its `pid=` line.
+/// The pid a `sync.lock` names on its `pid=` line. Locks written before the
+/// format was fixed hold a literal backslash-n instead of a newline, all on one
+/// line; the pid is the digits after `pid=` either way, so such a lock can
+/// still be taken over once its owner is gone.
 fn lock_owner(contents: &str) -> Option<u32> {
     contents
         .lines()
-        .find_map(|line| line.strip_prefix("pid="))
+        .flat_map(|line| line.split("\\n"))
+        .find_map(|field| field.trim().strip_prefix("pid="))
         .and_then(|pid| pid.trim().parse().ok())
 }
 
@@ -3663,6 +3663,8 @@ mod lock_tests {
         assert_eq!(super::lock_owner("pid=1234\nstarted_at=x\n"), Some(1234));
         assert_eq!(super::lock_owner("started_at=x\n"), None);
         assert_eq!(super::lock_owner("pid=abc\n"), None);
+        // The one-line form earlier releases wrote, with a literal backslash-n.
+        assert_eq!(super::lock_owner("pid=1234\\nstarted_at=x\\n"), Some(1234));
     }
 
     #[test]

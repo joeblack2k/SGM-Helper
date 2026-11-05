@@ -230,6 +230,63 @@ fn sync_uploads_when_no_cloud_save_exists() {
     assert_eq!(upload.calls(), 1);
 }
 
+// The lock as this helper wrote it before: the format string held an escaped
+// newline, so the file is one line, "pid=N\\nstarted_at=T\\n". Its owner is
+// gone, so it must be taken over like any other dead lock.
+#[test]
+fn a_dead_lock_in_the_old_one_line_form_is_taken_over() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_lock1","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"lock1@example.com"}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("lock1@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    // A pid no process holds: above the default Linux pid_max, and not a multiple of 4 (Windows).
+    let lock = state_dir.join("sync.lock");
+    fs::write(&lock, "pid=4194303\\nstarted_at=2026-10-31T00:00:00Z\\n").unwrap();
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a dead sync's one-line lock still stopped the sync:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !lock.exists(),
+        "the taken-over lock was not released when the sync ended"
+    );
+}
+
 #[test]
 fn sync_reports_conflict_when_backend_marks_conflict() {
     let server = MockServer::start();
