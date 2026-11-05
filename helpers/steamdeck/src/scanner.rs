@@ -67,6 +67,9 @@ const SATURN_COMBINED_INTERLEAVED_SIZE: usize =
 const SATURN_INTERNAL_BLOCK_SIZE: usize = 0x40;
 const SATURN_CARTRIDGE_BLOCK_SIZE: usize = 0x200;
 const SATURN_ARCHIVE_ENTRY_MARKER: u32 = 0x8000_0000;
+/// DeSmuME appends a marker and a 40-byte footer to the raw backup.
+const DESMUME_FOOTER_SIZE: usize = 122;
+
 const N64_RETROARCH_SRM_SIZE: u64 = 0x48800;
 const WII_DATA_BIN_BACKUP_HEADER_OFFSET: usize = 0xF0C0;
 const WII_DATA_BIN_FILE_HEADER_OFFSET: usize = 0xF140;
@@ -1705,7 +1708,16 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             "srm" => size == N64_RETROARCH_SRM_SIZE,
             _ => false,
         },
-        "nds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
+        // DeSmuME writes a .dsv: the raw backup followed by a 122-byte footer,
+        // so the file's own length is not a power of two. The backup it wraps
+        // is, and that is the size the system's chips come in.
+        "nds" => match ext {
+            "dsv" => {
+                let backup = size.saturating_sub(DESMUME_FOOTER_SIZE as u64);
+                backup.is_power_of_two() && (512..=16_777_216).contains(&backup)
+            }
+            _ => size.is_power_of_two() && (512..=16_777_216).contains(&size),
+        },
         // A Sega cartridge save is the size its cart's battery RAM holds, which
         // is often not a power of two. Rejecting those as unsupported made a
         // restored save invisible to the next pass, so the restore wrote it

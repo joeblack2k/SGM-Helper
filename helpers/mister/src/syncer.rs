@@ -1885,8 +1885,14 @@ fn process_single_save(
     let effective_slot_name =
         resolve_slot_name_for_sync(&system_slug, save_path, &options.slot_name);
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
-    let runtime_target =
+    let mut runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
+    // A .dsv is DeSmuME's container. The server strips its footer only for
+    // that profile, so the container decides the profile -- otherwise the file
+    // is measured with the footer and refused as an unrecognised size.
+    if system_slug == "nds" && save_extension(save_path).as_deref() == Some("dsv") {
+        runtime_target = runtime_target_for_profile(&system_slug, "nds/desmume");
+    }
 
     let mut rom_sha1 = if is_playstation_system(&system_slug) {
         Some(playstation_line_key(
@@ -2869,16 +2875,20 @@ fn runtime_target_for_system(
         return RuntimeTarget::default();
     };
 
+    runtime_target_for_profile(&clean_system, &runtime_profile)
+}
+
+/// The wire fields for an explicit runtime profile (`<system>/<emulator>`).
+fn runtime_target_for_profile(system_slug: &str, runtime_profile: &str) -> RuntimeTarget {
     let profile_name = runtime_profile
         .split_once('/')
         .map(|(_, value)| value.to_string())
-        .unwrap_or_else(|| runtime_profile.clone());
-
+        .unwrap_or_else(|| runtime_profile.to_string());
     RuntimeTarget {
-        runtime_profile: Some(runtime_profile.clone()),
+        runtime_profile: Some(runtime_profile.to_string()),
         emulator_profile: Some(profile_name),
-        system_profile_key: Some(system_profile_field_key(&clean_system)),
-        system_profile_value: Some(runtime_profile),
+        system_profile_key: Some(system_profile_field_key(system_slug)),
+        system_profile_value: Some(runtime_profile.to_string()),
     }
 }
 

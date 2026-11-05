@@ -3324,6 +3324,98 @@ fn a_longer_save_whose_tail_is_not_ff_padding_is_still_refused() {
     );
 }
 
+// A DeSmuME .dsv is the raw backup plus a 122-byte footer, so its own length is
+// not a power of two and it is not the size the server's raw check knows. The
+// container decides the profile: .dsv means nds/desmume, and the server strips
+// the footer for that profile only.
+#[test]
+fn a_dsv_uploads_as_the_desmume_profile() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_dsv","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"dsv@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"dsv123","md5":"md5v","fileName":"mkds.rom"}}"#);
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("nds/desmume");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-dsv","sha256":"sha-dsv","version":1}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/nds")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("saves/nds/Mario Kart DS (USA).dsv"),
+        vec![0xC5u8; 262144 + 122],
+    )
+    .unwrap();
+    let config = tmp.path().join("config-nds.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.nds]\nLABEL=\"nds\"\nKIND=\"mister-fpga\"\nPROFILE=\"mister\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"nds\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.join("saves").display(),
+            root.join("roms").display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("dsv@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        upload.calls(),
+        1,
+        "a .dsv was not uploaded with the DeSmuME profile: {stdout}\nSTDERR: {stderr}"
+    );
+}
+
 fn romroot_helper() -> Command {
     Command::cargo_bin("sgm-steamdeck-helper").unwrap()
 }
