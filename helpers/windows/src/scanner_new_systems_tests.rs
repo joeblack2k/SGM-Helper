@@ -63,3 +63,12 @@ fn a_neo_geo_save_stays_neogeo() {
         Some("neogeo")
     );
 }
+
+// `.flash` is discovered everywhere now, but only an `ngp` path makes it a
+// save: one outside any hinted folder is classified as nothing, so it is
+// skipped rather than uploaded under some other system.
+#[test]
+fn a_flash_file_outside_a_neo_geo_pocket_folder_is_not_a_save() {
+    let (_tmp, path) = save_with("misc", "Firmware.flash", 536);
+    assert_eq!(infer_supported_console_slug(&path, None), None);
+}
