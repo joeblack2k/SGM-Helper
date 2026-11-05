@@ -72,6 +72,39 @@ const WII_DATA_BIN_BACKUP_HEADER_OFFSET: usize = 0xF0C0;
 const WII_DATA_BIN_FILE_HEADER_OFFSET: usize = 0xF140;
 const WII_DATA_BIN_FILE_HEADER_MAGIC: u32 = 0x03AD_F17E;
 
+/// Kept here beside the other lists, not by is_plausible_save_for_system:
+/// placed there it conflicts with #63 and the fold rolls back the N64 chain.
+/// Every system this scanner can classify a save as. A SYSTEMS line or a
+/// SAVE_SUBDIR key naming one of these is honoured whatever the source's kind;
+/// `every_scanner_slug_is_a_known_system` keeps it in step with the match in
+/// `is_plausible_save_for_system`.
+pub const SCANNER_SYSTEM_SLUGS: &[&str] = &[
+    "nes",
+    "snes",
+    "gameboy",
+    "gba",
+    "n64",
+    "nds",
+    "genesis",
+    "master-system",
+    "game-gear",
+    "sega-cd",
+    "sega-32x",
+    "saturn",
+    "dreamcast",
+    "neogeo",
+    "wii",
+    "psx",
+    "ps2",
+    "psp",
+    "psvita",
+    "ps3",
+    "ps4",
+    "ps5",
+    // Not "3ds": it has an extension arm but no size arm in
+    // is_plausible_save_for_system, so no 3DS save is ever accepted.
+];
+
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "32x",
     "sms", "gg", "cue", "iso", "chd", "gdi", "cdi", "rvz", "wbfs", "wad", "pce", "a26", "a78",
@@ -2885,6 +2918,27 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn every_scanner_slug_is_a_known_system() {
+        // Each listed slug has an arm in is_plausible_save_for_system, so a
+        // slug listed without an arm fails here.
+        for slug in SCANNER_SYSTEM_SLUGS {
+            let any_ext = [
+                "sav", "srm", "eep", "bin", "dsv", "mcr", "ps2", "vms", "dat",
+            ];
+            let any_size = [512u64, 2048, 8192, 32768, 131072, 8 * 1024 * 1024];
+            let accepted = any_ext.iter().any(|ext| {
+                any_size
+                    .iter()
+                    .any(|size| is_plausible_save_for_system(ext, *size, slug))
+            });
+            assert!(
+                accepted,
+                "{slug} is listed but the scanner never accepts a save for it"
+            );
+        }
+    }
     use std::fs;
     use std::io::Write;
 

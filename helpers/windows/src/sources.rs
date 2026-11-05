@@ -38,6 +38,7 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "saturn",
     "dreamcast",
     "neogeo",
+    "pc-engine",
     "wii",
     "psx",
     "ps2",
@@ -49,6 +50,10 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "3ds",
 ];
 
+/// A MiSTer source's default systems: the ones MiSTer has cores for. From
+/// joeblack2k 867d314b: "MiSTer defaults now exclude non-MiSTer systems such
+/// as Wii and PS2". Those stay out unless SYSTEMS names them; PC Engine is in
+/// because MiSTer has a TurboGrafx-16 core.
 const MISTER_SYNC_SYSTEMS: &[&str] = &[
     "nes",
     "snes",
@@ -62,6 +67,7 @@ const MISTER_SYNC_SYSTEMS: &[&str] = &[
     "sega-32x",
     "saturn",
     "neogeo",
+    "pc-engine",
     "psx",
 ];
 
@@ -210,6 +216,7 @@ fn normalize_system_slug(value: &str) -> Option<String> {
         "nds" | "nintendods" | "ds" => "nds",
         "genesis" | "megadrive" | "md" => "genesis",
         "mastersystem" | "sms" => "master-system",
+        "pcengine" | "pce" | "tgfx16" | "tg16" | "turbografx" | "turbografx16" => "pc-engine",
         "gamegear" | "gg" => "game-gear",
         "segacd" | "megacd" | "megadrivecd" => "sega-cd",
         "sega32x" | "32x" | "megadrive32x" => "sega-32x",
@@ -228,6 +235,7 @@ fn normalize_system_slug(value: &str) -> Option<String> {
             let candidate = token.split_whitespace().collect::<Vec<_>>().join("-");
             if ALL_SYNC_SYSTEMS.contains(&candidate.as_str())
                 || MISTER_SYNC_SYSTEMS.contains(&candidate.as_str())
+                || crate::scanner::SCANNER_SYSTEM_SLUGS.contains(&candidate.as_str())
             {
                 return Some(candidate);
             }
@@ -1201,6 +1209,61 @@ pub fn resolve_path(binary_dir: &Path, value: &Path) -> PathBuf {
     }
 }
 
+/// Names one system goes by: the server's slug first, then the names a
+/// scanner or a device folder uses for it. The PC Engine scanner files a save
+/// as `tgfx16`, MiSTer's core name, while the server and its policy write
+/// `SAVE_SUBDIR_PC-ENGINE`, so without this a declared live directory for
+/// either name is never consulted for the other.
+const SAVE_SUBDIR_ALIASES: &[&[&str]] = &[
+    &[
+        "pc-engine",
+        "tgfx16",
+        "pcengine",
+        "pce",
+        "tg16",
+        "turbografx",
+    ],
+    &["genesis", "megadrive", "md"],
+    &["game-gear", "gamegear", "gg"],
+    &["master-system", "mastersystem", "sms"],
+    &["sega-cd", "segacd", "megacd"],
+    &["sega-32x", "sega32x", "32x"],
+    &["gameboy", "gb"],
+];
+
+/// The declared `SAVE_SUBDIR_*` directory for `system_slug`, looked up by
+/// any of the system's names. The name asked for wins if the operator wrote
+/// it; otherwise the first written name in the group's order, so the
+/// server's slug wins over a folder name when both are set. The stored map
+/// keeps only what was written: the config rewrite re-emits it verbatim, and
+/// renaming either key would break configs written with the other.
+pub fn declared_save_subdir<'a>(
+    save_subdirs: &'a BTreeMap<String, PathBuf>,
+    system_slug: &str,
+) -> Option<&'a PathBuf> {
+    let slug = system_slug.to_ascii_lowercase();
+    if let Some(found) = save_subdirs.get(&slug) {
+        return Some(found);
+    }
+    let group = SAVE_SUBDIR_ALIASES
+        .iter()
+        .find(|group| group.contains(&slug.as_str()))?;
+    group.iter().find_map(|name| save_subdirs.get(*name))
+}
+
+/// Whether two names refer to one system, by the same alias groups as
+/// `declared_save_subdir`.
+pub fn same_system(left: &str, right: &str) -> bool {
+    let left = left.trim().to_ascii_lowercase();
+    let right = right.trim().to_ascii_lowercase();
+    if left == right {
+        return true;
+    }
+    SAVE_SUBDIR_ALIASES
+        .iter()
+        .any(|group| group.contains(&left.as_str()) && group.contains(&right.as_str()))
+}
+
 fn source_from_section(section: &SourceSection) -> Option<Source> {
     let kind = section
         .values
@@ -1488,6 +1551,137 @@ fn backup_corrupt(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mister_source_keeps_pc_engine() {
+        // MiSTer has a TurboGrafx-16 core; its default systems and a SYSTEMS
+        // line naming pc-engine both keep it.
+        assert!(
+            default_systems_for_kind(&SourceKind::MisterFpga).contains(&"pc-engine".to_string())
+        );
+        assert_eq!(
+            parse_systems(Some(&"pc-engine".to_string()), &SourceKind::MisterFpga),
+            vec!["pc-engine".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_systems_line_naming_pc_engine_keeps_it() {
+        // SYSTEMS from the server's policy names pc-engine. It wasn't in the
+        // helper's known list, so it was dropped and the source synced no PC
+        // Engine at all.
+        assert_eq!(
+            parse_systems(Some(&"nes,pc-engine".to_string()), &SourceKind::RetroArch),
+            vec!["nes".to_string(), "pc-engine".to_string()]
+        );
+        assert_eq!(
+            normalize_system_slug("tgfx16").as_deref(),
+            Some("pc-engine")
+        );
+    }
+
+    #[test]
+    fn a_source_listing_pc_engine_admits_a_save_the_scanner_calls_tgfx16() {
+        assert!(same_system("pc-engine", "tgfx16"));
+        assert!(same_system("genesis", "megadrive"));
+        // Distinct systems stay distinct.
+        assert!(!same_system("genesis", "sega-32x"));
+        assert!(!same_system("gameboy", "gba"));
+        assert!(!same_system("master-system", "game-gear"));
+    }
+
+    #[test]
+    fn a_pc_engine_live_directory_answers_the_scanner_slug() {
+        // The server's policy writes SAVE_SUBDIR_PC-ENGINE; the PC Engine
+        // scanner files those saves as `tgfx16`. A save in both pcengine/ and
+        // pcenginecd/ was refused as having no declared live directory.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            "[source.retrodeck]\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"/tmp/saves\"\nSAVE_SUBDIR_PC-ENGINE=\"{content}\"\n",
+        )
+        .unwrap();
+        let store = load_source_store(&config_path).unwrap();
+        let subdirs = &store.sources[0].save_subdirs;
+        assert_eq!(
+            declared_save_subdir(subdirs, "tgfx16"),
+            Some(&PathBuf::from("{content}")),
+            "SAVE_SUBDIR_PC-ENGINE must answer the scanner's tgfx16"
+        );
+        assert_eq!(
+            declared_save_subdir(subdirs, "pc-engine"),
+            Some(&PathBuf::from("{content}"))
+        );
+
+        // The rewrite keeps only what was written: no alias keys appear.
+        save_source_store(&config_path, &store).unwrap();
+        let rewritten = std::fs::read_to_string(&config_path).unwrap();
+        assert!(rewritten.contains("SAVE_SUBDIR_PC-ENGINE="));
+        assert!(!rewritten.contains("SAVE_SUBDIR_TGFX16"), "{rewritten}");
+    }
+
+    #[test]
+    fn the_name_asked_for_wins_and_the_server_slug_wins_over_a_folder_name() {
+        let mut subdirs = BTreeMap::new();
+        subdirs.insert("tgfx16".to_string(), PathBuf::from("TGFX16"));
+        subdirs.insert("pc-engine".to_string(), PathBuf::from("pcengine"));
+        assert_eq!(
+            declared_save_subdir(&subdirs, "tgfx16"),
+            Some(&PathBuf::from("TGFX16"))
+        );
+        assert_eq!(
+            declared_save_subdir(&subdirs, "pc-engine"),
+            Some(&PathBuf::from("pcengine"))
+        );
+        // Neither written as `pce`: the server slug comes first in the group.
+        assert_eq!(
+            declared_save_subdir(&subdirs, "pce"),
+            Some(&PathBuf::from("pcengine"))
+        );
+        // A system with no alias group still resolves by its own name only.
+        assert_eq!(declared_save_subdir(&subdirs, "n64"), None);
+    }
+
+    #[test]
+    fn every_scanner_slug_has_a_documented_save_subdir_key() {
+        // A slug the scanner can produce that no SAVE_SUBDIR key reaches would
+        // make an operator's declared live directory silently unused, which is
+        // how PC Engine broke. Each slug must be its own key or in an alias
+        // group whose first name is the server's slug.
+        let scanner_slugs = crate::scanner::SCANNER_SYSTEM_SLUGS;
+        // Names that aren't the server's: each must alias one that is.
+        let server_only: &[&str] = &["tgfx16"];
+        for slug in scanner_slugs
+            .iter()
+            .copied()
+            .chain(server_only.iter().copied())
+        {
+            let grouped = SAVE_SUBDIR_ALIASES
+                .iter()
+                .find(|group| group.contains(&slug));
+            if server_only.contains(&slug) {
+                let group = grouped.unwrap_or_else(|| panic!("{slug} needs an alias group"));
+                assert_ne!(
+                    group[0], slug,
+                    "{slug} is not the server's name; it must alias one"
+                );
+            }
+            if let Some(group) = grouped {
+                assert!(
+                    !group[0].is_empty() && group.iter().filter(|name| **name == slug).count() == 1,
+                    "{slug} appears once in its group"
+                );
+            }
+        }
+        // No name is in two groups: a lookup must have one answer.
+        let mut seen = std::collections::BTreeSet::new();
+        for group in SAVE_SUBDIR_ALIASES {
+            for name in group.iter() {
+                assert!(seen.insert(*name), "{name} is in two alias groups");
+            }
+        }
+    }
 
     #[test]
     fn helper_device_type_matches_backend_identity_names() {

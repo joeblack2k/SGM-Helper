@@ -552,9 +552,11 @@ fn source_allows_system(source_systems: &[String], system_slug: &str) -> bool {
     if clean.is_empty() {
         return false;
     }
+    // A source's SYSTEMS uses the server's names; a scanner may file the same
+    // system under another (PC Engine as `tgfx16`), so match any alias.
     source_systems
         .iter()
-        .any(|system| system == "*" || system.eq_ignore_ascii_case(&clean))
+        .any(|system| system == "*" || crate::sources::same_system(system, &clean))
 }
 
 fn target_parent_allowed(
@@ -1718,8 +1720,7 @@ fn declared_live_subdir(
     system_slug: &str,
     stem: &str,
 ) -> Option<PathBuf> {
-    let declared = save_subdirs
-        .get(system_slug)?
+    let declared = crate::sources::declared_save_subdir(save_subdirs, system_slug)?
         .to_string_lossy()
         .into_owned();
     if !declared.contains("{content}") {

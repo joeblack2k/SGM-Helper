@@ -419,9 +419,11 @@ fn source_allows_system(source_systems: &[String], system_slug: &str) -> bool {
     if clean.is_empty() {
         return false;
     }
+    // A source's SYSTEMS uses the server's names; a scanner may file the same
+    // system under another (PC Engine as `tgfx16`), so match any alias.
     source_systems
         .iter()
-        .any(|system| system == "*" || system.eq_ignore_ascii_case(&clean))
+        .any(|system| system == "*" || crate::sources::same_system(system, &clean))
 }
 
 fn target_parent_allowed(
@@ -959,7 +961,8 @@ fn cloud_target_path_with_known(
     let root = select_cloud_restore_root(save_roots);
     let filename = cloud_restore_filename(cloud_save, target_extension);
     let selection_key = save_selection_key(Path::new(filename.trim()));
-    let declared = save_subdirs.get(system_slug).map(|path| path.as_path());
+    let declared =
+        crate::sources::declared_save_subdir(save_subdirs, system_slug).map(|path| path.as_path());
     match live_target_for(root, system_slug, &selection_key, declared) {
         LiveTarget::Path { live, strays } => {
             for stray in strays {
@@ -3007,9 +3010,7 @@ fn live_upload_blocked(
     let root = source.save_roots.first()?;
     let classification = classify_supported_save(save_path, None)?;
     let system_slug = classification.system_slug;
-    let declared = source
-        .save_subdirs
-        .get(&system_slug)
+    let declared = crate::sources::declared_save_subdir(&source.save_subdirs, &system_slug)
         .map(|path| path.as_path());
     match live_target_for(root, &system_slug, selection_key, declared) {
         LiveTarget::FallThrough => None,
