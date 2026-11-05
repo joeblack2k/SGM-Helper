@@ -1183,6 +1183,7 @@ mod tests {
 
     fn test_config(config_path: &Path, root: &Path) -> AppConfig {
         AppConfig {
+            secure: false,
             url: "192.168.2.10".to_string(),
             port: 80,
             email: String::new(),
