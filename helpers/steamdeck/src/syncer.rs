@@ -1593,6 +1593,28 @@ fn process_single_save(
     };
     let mut rom_md5: Option<String> = None;
 
+    // A ROM this helper holds is hashed here. /rom/lookup answers every stem,
+    // with a sha1 derived from the name when the server has no ROM, so asking it
+    // first keys the save on that made-up sha1: /save/latest then misses the
+    // record kept under the ROM's real sha1 and the save is uploaded every pass.
+    // The lookup is only for a save whose ROM is not on this device.
+    if rom_sha1.is_none()
+        && let Some(rom_entry) = rom_entry
+    {
+        if let Some((cached_sha1, cached_md5)) = rom_hash_cache.get(&stem_key).cloned() {
+            rom_sha1 = Some(cached_sha1);
+            rom_md5 = Some(cached_md5);
+        } else {
+            let local_rom_sha1 = sha1_file(&rom_entry.path)?;
+            let local_rom_md5 = md5_file(&rom_entry.path)?;
+            rom_hash_cache.insert(
+                stem_key.clone(),
+                (local_rom_sha1.clone(), local_rom_md5.clone()),
+            );
+            rom_sha1 = Some(local_rom_sha1);
+            rom_md5 = Some(local_rom_md5);
+        }
+    }
     if rom_sha1.is_none() {
         let lookup = api.lookup_rom(&stem).ok();
         rom_sha1 = lookup
@@ -1603,24 +1625,6 @@ fn process_single_save(
             .as_ref()
             .and_then(|value| value.rom.as_ref())
             .and_then(|value| value.md5.clone());
-
-        if rom_sha1.is_none()
-            && let Some(rom_entry) = rom_entry
-        {
-            if let Some((cached_sha1, cached_md5)) = rom_hash_cache.get(&stem_key).cloned() {
-                rom_sha1 = Some(cached_sha1);
-                rom_md5 = Some(cached_md5);
-            } else {
-                let local_rom_sha1 = sha1_file(&rom_entry.path)?;
-                let local_rom_md5 = md5_file(&rom_entry.path)?;
-                rom_hash_cache.insert(
-                    stem_key.clone(),
-                    (local_rom_sha1.clone(), local_rom_md5.clone()),
-                );
-                rom_sha1 = Some(local_rom_sha1);
-                rom_md5 = Some(local_rom_md5);
-            }
-        }
     }
 
     let Some(active_rom_sha1) = rom_sha1 else {

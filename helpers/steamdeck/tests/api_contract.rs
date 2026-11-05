@@ -161,6 +161,127 @@ fn login_with_password_uses_login_and_token_endpoints() {
     assert_eq!(auth["token"], "tok_password");
 }
 
+// RetroSaveManager's /rom/lookup answers every stem, with a sha1 it derives from
+// the name when it has no ROM. A helper that asks it before hashing the ROM it
+// holds keys the save on that made-up sha1, /save/latest misses the record the
+// server keeps under the ROM's real sha1, and the save is uploaded every pass.
+#[test]
+fn a_local_rom_is_hashed_before_the_server_lookup_is_asked() {
+    use sha1::{Digest as _, Sha1};
+    use sha2::Sha256;
+
+    let rom_bytes = b"MADDEN NFL 94 ROM BYTES".repeat(64);
+    let real_sha1 = format!("{:x}", Sha1::digest(&rom_bytes));
+    let save_bytes: Vec<u8> = (0..8192u32)
+        .map(|i| (i.wrapping_mul(31) ^ 0x9e) as u8)
+        .collect();
+    let save_sha256 = format!("{:x}", Sha256::digest(&save_bytes));
+
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_rom","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"rom@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"8043ef4bca0c4cdbdb15d99186f5c976b1ce3ce8","md5":"fake","fileName":"Madden NFL '94 (USA, Europe).srm"}}"#);
+    });
+    let latest_real = server.mock(|when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("romSha1", real_sha1.as_str());
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"success":true,"exists":true,"sha256":"{save_sha256}","version":1,"id":"save-madden"}}"#
+            ));
+    });
+    let _latest_other = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-madden","sha256":"x","version":2}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let roms = tmp.path().join("roms");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(saves.join("Sega")).unwrap();
+    fs::create_dir_all(roms.join("megadrive")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        saves.join("Sega/Madden NFL '94 (USA, Europe).srm"),
+        &save_bytes,
+    )
+    .unwrap();
+    fs::write(
+        roms.join("megadrive/Madden NFL '94 (USA, Europe).md"),
+        &rom_bytes,
+    )
+    .unwrap();
+    let config = tmp.path().join("config.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\n\n[source.retro]\nLABEL=\"Retro\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"genesis\"\n",
+            server.port(),
+            saves.display(),
+            state_dir.display(),
+            saves.display(),
+            roms.display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("rom@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        latest_real.calls() >= 1,
+        "the save was not looked up under its ROM's real sha1: {stdout}{stderr}"
+    );
+    assert_eq!(
+        upload.calls(),
+        0,
+        "a save the server holds under the ROM's real sha1 was uploaded again: {stdout}{stderr}"
+    );
+}
+
 #[test]
 fn sync_uploads_when_no_cloud_save_exists() {
     let server = MockServer::start();
