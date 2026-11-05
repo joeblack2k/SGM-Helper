@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,7 @@ use crate::scanner::{
     normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes, wii_skip_reason,
     wii_title_code_from_path,
 };
-use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
+use crate::sources::{EmulatorProfile, ResolvedSource, SourceKind, prepare_sources_for_sync};
 use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
 
 #[derive(Debug, Clone)]
@@ -71,11 +71,99 @@ impl SyncLock {
                 Ok(Self { path })
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display());
+                // A sync that died leaves its lock behind, and every later sync would stop here for
+                // good. The lock names its owner; one whose process is gone is taken over, once.
+                let existing = fs::read_to_string(&path).unwrap_or_default();
+                match lock_owner(&existing) {
+                    Some(pid) if !pid_alive(pid) => Self::take_over(&path, pid, &lock_content),
+                    _ => anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display()),
+                }
             }
             Err(err) => Err(err)
                 .with_context(|| format!("kan sync lockfile niet maken: {}", path.display())),
         }
+    }
+}
+
+impl SyncLock {
+    /// Take over a lock whose owner `dead` is gone. Two syncs can find the same dead lock: a rename
+    /// to a name of this process's own moves the file once, so only one of them gets it, and a
+    /// remove by path could delete the lock the other has just created. The renamed file must still
+    /// name `dead`; one naming anyone else is a live lock, put back.
+    fn take_over(path: &Path, dead: u32, lock_content: &str) -> Result<Self> {
+        let busy = || anyhow::anyhow!("sync is al actief (lockfile bestaat): {}", path.display());
+        let stale = path.with_extension(format!("lock.stale.{}", std::process::id()));
+        if fs::rename(path, &stale).is_err() {
+            return Err(busy());
+        }
+        if lock_owner(&fs::read_to_string(&stale).unwrap_or_default()) != Some(dead) {
+            let _ = fs::rename(&stale, path);
+            return Err(busy());
+        }
+        let _ = fs::remove_file(&stale);
+        eprintln!(
+            "oude sync.lock van pid={} verwijderd (proces draait niet meer): {}",
+            dead,
+            path.display()
+        );
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| busy())?;
+        use std::io::Write;
+        file.write_all(lock_content.as_bytes())
+            .with_context(|| format!("kan lockfile niet schrijven: {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// The pid a `sync.lock` names on its `pid=` line.
+fn lock_owner(contents: &str) -> Option<u32> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.trim().parse().ok())
+}
+
+/// Whether a process with this pid is running. A process that exists but this user may not
+/// signal or open (another user's) counts as running, so its lock is never taken.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess only reads the pid; the handle is closed below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: reads this thread's last error, set by OpenProcess.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        // SAFETY: the handle is open and valid; code is a valid out pointer.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+        // SAFETY: closes the handle opened above, once.
+        unsafe { CloseHandle(handle) };
+        !ok || code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -156,6 +244,13 @@ pub fn run_sync(
         let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
         let preferred_save_by_stem =
             select_preferred_save_per_stem(&source.kind, &source.profile, &save_files, &rom_index);
+        // How many files share each selection key. The live-directory scan only
+        // runs where it can change the answer: one copy and no declared
+        // directory has nothing to decide.
+        let mut stem_counts: HashMap<String, usize> = HashMap::new();
+        for path in &save_files {
+            *stem_counts.entry(save_selection_key(path)).or_default() += 1;
+        }
         report.scanned += save_files.len();
 
         let fingerprint = hostname::get()
@@ -165,6 +260,15 @@ pub fn run_sync(
 
         for save_path in save_files {
             let selection_key = save_selection_key(&save_path);
+            let needs_live_check = stem_counts.get(&selection_key).copied().unwrap_or(0) > 1
+                || !source.save_subdirs.is_empty();
+            if needs_live_check
+                && let Some(reason) = live_upload_blocked(&source, &save_path, &selection_key)
+            {
+                report.skipped += 1;
+                eprintln!("{}", reason);
+                continue;
+            }
             if let Some(preferred_path) = preferred_save_by_stem.get(&selection_key)
                 && preferred_path != &save_path
             {
@@ -184,6 +288,7 @@ pub fn run_sync(
                 &api,
                 &save_path,
                 &save_key,
+                sync_state.entries.get(&save_key),
                 &fingerprint,
                 &source.name,
                 &source.kind,
@@ -287,6 +392,7 @@ pub fn run_sync(
             &source.profile,
             &source.save_roots,
             &source.systems,
+            &source.save_subdirs,
             source.create_missing_system_dirs,
             &fingerprint,
             app_password,
@@ -356,6 +462,7 @@ fn restore_cloud_only_saves(
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
     source_systems: &[String],
+    save_subdirs: &BTreeMap<String, PathBuf>,
     create_missing_system_dirs: bool,
     fingerprint: &str,
     app_password: Option<&str>,
@@ -376,12 +483,13 @@ fn restore_cloud_only_saves(
         let page = match api.list_saves(limit, offset, app_password) {
             Ok(page) => page,
             Err(err) => {
-                if verbose {
-                    eprintln!(
-                        "Cloud restore skipped for source '{}': /saves unavailable ({})",
-                        source_name, err
-                    );
-                }
+                // A restore that never ran is the failure mode nobody notices:
+                // the run reports success and the device simply does not
+                // restore. Say it every time, not only under --verbose.
+                eprintln!(
+                    "Cloud restore skipped for source '{}': /saves unavailable ({})",
+                    source_name, err
+                );
                 return Ok(());
             }
         };
@@ -407,6 +515,7 @@ fn restore_cloud_only_saves(
                 source_profile,
                 save_roots,
                 source_systems,
+                save_subdirs,
                 create_missing_system_dirs,
                 fingerprint,
                 app_password,
@@ -449,6 +558,7 @@ fn restore_single_cloud_save(
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
     source_systems: &[String],
+    save_subdirs: &BTreeMap<String, PathBuf>,
     create_missing_system_dirs: bool,
     fingerprint: &str,
     app_password: Option<&str>,
@@ -491,15 +601,23 @@ fn restore_single_cloud_save(
         .system_profile_value
         .as_deref()
         .or(runtime_target.runtime_profile.as_deref());
-    let target_extension = cloud_target_extension(cloud_save, runtime_profile);
-    let provisional_path = cloud_target_path(
+    let target_extension = ps1_per_game_card_extension(cloud_save, source_profile)
+        .or_else(|| cloud_target_extension(cloud_save, runtime_profile));
+    let Some(provisional_path) = cloud_target_path_with_known(
         cloud_save,
         save_roots,
         source_kind,
         &effective_profile,
         &system_slug,
         target_extension.as_deref(),
-    );
+        sync_entries,
+        save_subdirs,
+    ) else {
+        // Reported by the resolver: the title sits in more than one directory
+        // and nothing says which one the emulator reads.
+        report.skipped += 1;
+        return Ok(());
+    };
 
     if existing_local_save_is_valid(&provisional_path, &system_slug) {
         return Ok(());
@@ -645,6 +763,8 @@ fn restore_single_cloud_save(
     Ok(())
 }
 
+/// MiSTer has no PSP core, so PSP is not here: a PSP record, a loose file or a PPSSPP SAVEDATA
+/// bundle, has nowhere on this device a game reads it from.
 fn supports_cloud_restore_system(system_slug: &str) -> bool {
     matches!(
         system_slug,
@@ -665,7 +785,6 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "wii"
             | "psx"
             | "ps2"
-            | "psp"
             | "psvita"
             | "ps3"
             | "ps4"
@@ -685,6 +804,29 @@ fn effective_profile_for_cloud_restore(
 }
 
 fn cloud_target_extension(
+    cloud_save: &CloudSaveSummary,
+    runtime_profile: Option<&str>,
+) -> Option<String> {
+    let profile_extension = profile_target_extension(cloud_save, runtime_profile);
+    // A sidecar must never land on a primary target: an `.rtc` mapped onto a
+    // `.srm` overwrites the real cartridge save with seconds of clock state.
+    // The cloud record carries no format field, so sidecar-ness comes from the
+    // filename it stored. Sidecar-to-sidecar is a container conversion the
+    // profile may legitimately ask for (a MiSTer controller pak writes `.cpk`
+    // for a record stored as `.mpk`), so only a sidecar heading for a
+    // non-sidecar target is redirected.
+    if let (Some(ext), Some(target)) = (
+        extension_from_filename(&cloud_save.filename),
+        profile_extension.as_deref(),
+    ) && crate::scanner::is_sidecar(&ext)
+        && !crate::scanner::is_sidecar(target)
+    {
+        return Some(ext);
+    }
+    profile_extension
+}
+
+fn profile_target_extension(
     cloud_save: &CloudSaveSummary,
     runtime_profile: Option<&str>,
 ) -> Option<String> {
@@ -740,6 +882,10 @@ fn extension_from_filename(filename: &str) -> Option<String> {
         .and_then(normalize_extension_value)
 }
 
+/// The restore target without any record of what has been synced; used by the
+/// tests, which have no state to consult. A real restore goes through
+/// `cloud_target_path_with_known`.
+#[cfg(test)]
 fn cloud_target_path(
     cloud_save: &CloudSaveSummary,
     save_roots: &[PathBuf],
@@ -747,6 +893,102 @@ fn cloud_target_path(
     source_profile: &EmulatorProfile,
     system_slug: &str,
     target_extension: Option<&str>,
+) -> PathBuf {
+    cloud_target_path_with_known(
+        cloud_save,
+        save_roots,
+        source_kind,
+        source_profile,
+        system_slug,
+        target_extension,
+        &HashMap::new(),
+        &BTreeMap::new(),
+    )
+    .unwrap_or_else(|| {
+        // These tests ask about the shape of a path, not about whether the
+        // device has decided where its saves live; a fixture with the same
+        // title in two directories still has to return a path.
+        cloud_target_path_inner(
+            cloud_save,
+            save_roots,
+            source_kind,
+            source_profile,
+            system_slug,
+            target_extension,
+            &HashMap::new(),
+        )
+    })
+}
+
+/// Resolve the restore target, letting the directory the emulator actually
+/// writes decide when a copy of this title already exists.
+///
+/// `None` means the save must not be restored: two copies exist and the
+/// operator has not declared which one is live. Guessing there is exactly the
+/// defect this rule removes, and a save that waits is better than one written
+/// where the game cannot see it.
+#[allow(clippy::too_many_arguments)]
+fn cloud_target_path_with_known(
+    cloud_save: &CloudSaveSummary,
+    save_roots: &[PathBuf],
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    target_extension: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
+    save_subdirs: &BTreeMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    let root = select_cloud_restore_root(save_roots);
+    let filename = cloud_restore_filename(cloud_save, target_extension);
+    let selection_key = save_selection_key(Path::new(filename.trim()));
+    let declared = save_subdirs.get(system_slug).map(|path| path.as_path());
+    match live_target_for(root, system_slug, &selection_key, declared) {
+        LiveTarget::Path { live, strays } => {
+            for stray in strays {
+                eprintln!(
+                    "Stray copy {}: {} is the live directory for {}",
+                    stray.join(&filename).display(),
+                    live.display(),
+                    system_slug
+                );
+            }
+            return Some(live.join(&filename));
+        }
+        LiveTarget::Ambiguous(directories) => {
+            let named: Vec<String> = directories
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect();
+            eprintln!(
+                "Not restoring {} ({}): it exists in {}, and no live directory is declared; set SAVE_SUBDIR_{} on this source",
+                filename,
+                system_slug,
+                named.join(", "),
+                system_slug.to_ascii_uppercase()
+            );
+            return None;
+        }
+        LiveTarget::FallThrough => {}
+    }
+    Some(cloud_target_path_inner(
+        cloud_save,
+        save_roots,
+        source_kind,
+        source_profile,
+        system_slug,
+        target_extension,
+        known_saves,
+    ))
+}
+
+fn cloud_target_path_inner(
+    cloud_save: &CloudSaveSummary,
+    save_roots: &[PathBuf],
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    target_extension: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
 ) -> PathBuf {
     let root = select_cloud_restore_root(save_roots);
     if system_slug == "wii"
@@ -775,6 +1017,7 @@ fn cloud_target_path(
             source_profile,
             system_slug,
             &filename,
+            known_saves,
         ) {
             return existing_target;
         }
@@ -892,12 +1135,106 @@ fn cloud_restore_native_target_path(
     )
 }
 
+/// Directories a core-sorted emulator keeps another system's saves in.
+///
+/// Consulted only when looking for a file that already exists, never when
+/// choosing where a new save goes: on most devices the system's own directory
+/// is the right one. RetroArch with `sort_savefiles_enable` files saves by the
+/// core that reads them, and `genesis_plus_gx` serves Genesis and Game Gear
+/// alike, so a Game Gear save lives under `genesis/` and the core reads it
+/// there. This list is deliberately separate from `system_directory_aliases`,
+/// which also decides where new saves are written.
+fn writeback_directory_aliases(system_slug: &str) -> &'static [&'static str] {
+    match system_slug {
+        "game-gear" => &["genesis", "megadrive", "md"],
+        _ => &[],
+    }
+}
+
+/// Which directory a system's saves actually live in.
+///
+/// A device that sorts saves by core writes them under a directory named after
+/// the core (`Mupen64Plus-Next OpenGL`) while the helper's own system
+/// directory is `n64`. Both can hold a copy of one title, and the helper
+/// cannot infer which one the emulator reads: mtime is useless because the
+/// helper's own restores refresh the stale copy, and a table of core names
+/// goes stale. So the evidence is the disk, plus one key the operator may set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveTarget {
+    /// No copy of this title anywhere under the root: keep the existing rules.
+    FallThrough,
+    /// The directory the emulator uses, and the other copies, which are strays.
+    Path { live: PathBuf, strays: Vec<PathBuf> },
+    /// More than one copy and nothing declared: report it and do nothing.
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// Resolve one title's live directory under a source root.
+///
+/// Depth is one level below the root, stated rather than assumed: a layout
+/// nested deeper is not found here and the caller's disagreement line is what
+/// makes that visible. A directory belongs to a system by classifying the
+/// saves inside it, not by its name, so a core nobody has seen yet still works.
+fn live_target_for(
+    root: &Path,
+    system_slug: &str,
+    selection_key: &str,
+    declared: Option<&Path>,
+) -> LiveTarget {
+    let mut copies: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut directories: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        directories.sort();
+        for directory in directories {
+            let Ok(files) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            // Count per directory, not per file: one title's .eep, .sra and
+            // .srm sitting side by side are one copy, not three.
+            let holds_copy = files.flatten().any(|file| {
+                let path = file.path();
+                path.is_file()
+                    && save_selection_key(&path) == selection_key
+                    && classify_supported_save(&path, None)
+                        .map(|classification| classification.system_slug == system_slug)
+                        .unwrap_or(false)
+            });
+            if holds_copy {
+                copies.push(directory);
+            }
+        }
+    }
+
+    if let Some(subdir) = declared {
+        let live = root.join(subdir);
+        let strays: Vec<PathBuf> = copies
+            .into_iter()
+            .filter(|directory| *directory != live)
+            .collect();
+        return LiveTarget::Path { live, strays };
+    }
+
+    match copies.len() {
+        0 => LiveTarget::FallThrough,
+        1 => LiveTarget::Path {
+            live: copies.remove(0),
+            strays: Vec::new(),
+        },
+        _ => LiveTarget::Ambiguous(copies),
+    }
+}
+
 fn existing_cloud_target_for_alias(
     root: &Path,
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
     system_slug: &str,
     filename: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
 ) -> Option<PathBuf> {
     let default_dir = system_directory_for_source(source_kind, source_profile, system_slug);
     let candidates = std::iter::once(default_dir).chain(
@@ -912,7 +1249,128 @@ fn existing_cloud_target_for_alias(
             return Some(candidate);
         }
     }
+
+    let declared = writeback_directory_aliases(system_slug);
+    let directories: Vec<(String, PathBuf)> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| (name.to_string(), entry.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // A directory the core actually reads from, named by the operator or by the
+    // core itself ("Genesis Plus GX"). The directory says which core reads the
+    // file, not which system it belongs to: Sonic is a Genesis game and a Game
+    // Gear game, and a same-named file already sitting there may be the other
+    // one. Only a file this helper has synced for this system is this save.
+    for (name, path) in &directories {
+        let token = normalize_path_token(name);
+        if !declared
+            .iter()
+            .any(|alias| normalize_path_token(alias) == token)
+        {
+            continue;
+        }
+        let exact = path.join(filename);
+        if known_save_for_system(&exact, system_slug, known_saves) {
+            eprintln!(
+                "Restoring into {}: it already holds this {} save",
+                exact.display(),
+                system_slug
+            );
+            return Some(exact);
+        }
+        if exact.exists() {
+            eprintln!(
+                "Not restoring into {}: it holds a file this helper has not synced as {}",
+                exact.display(),
+                system_slug
+            );
+        }
+
+        // The record's filename carries the extension its profile declares, and
+        // that is not always the one the core writes: genesis-plus-gx is listed
+        // with ".sav" while the device holds ".srm". Matching the stem keeps a
+        // profile that disagrees with the core from silently defeating the
+        // write-back; the state still decides which file is this system's, and
+        // two known files on one stem is a guess this helper does not make.
+        let mut matches: Vec<PathBuf> = std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|entry| entry.is_file())
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| same_save_stem(name, filename))
+                            .unwrap_or(false)
+                    })
+                    .filter(|entry| known_save_for_system(entry, system_slug, known_saves))
+                    .collect()
+            })
+            .unwrap_or_default();
+        matches.sort();
+        match matches.len() {
+            0 => {}
+            1 => {
+                eprintln!(
+                    "Restoring into {}: it already holds this {} save under another extension",
+                    matches[0].display(),
+                    system_slug
+                );
+                return Some(matches[0].clone());
+            }
+            _ => {
+                eprintln!(
+                    "More than one file in {} holds the {} stem: {}; using the system directory instead",
+                    path.display(),
+                    save_stem(filename),
+                    matches
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
     None
+}
+
+/// Whether the helper's own state records `path` as a save of `system_slug`.
+fn known_save_for_system(
+    path: &Path,
+    system_slug: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> bool {
+    known_saves
+        .get(path.to_string_lossy().as_ref())
+        .and_then(|entry| entry.system_slug.as_deref())
+        .map(|slug| slug == system_slug)
+        .unwrap_or(false)
+}
+
+/// The filename without its extension: "Sonic (USA).srm" and "Sonic (USA).sav"
+/// are the same save under two profiles' spellings of it.
+fn save_stem(filename: &str) -> &str {
+    Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(filename)
+}
+
+fn same_save_stem(candidate: &str, reference: &str) -> bool {
+    Path::new(candidate).extension().is_some() && save_stem(candidate) == save_stem(reference)
 }
 
 fn preferred_system_directory_for_root(
@@ -1137,6 +1595,7 @@ fn process_single_save(
     api: &ApiClient,
     save_path: &std::path::Path,
     save_key: &str,
+    prior_entry: Option<&SyncedEntry>,
     fingerprint: &str,
     source_name: &str,
     source_kind: &SourceKind,
@@ -1181,6 +1640,24 @@ fn process_single_save(
     };
     let system_slug = classification.system_slug;
     let classification_evidence = classification.evidence;
+    // A PS1 card is named after its game, and the server keeps one line per
+    // card. A card whose name matches no ROM here (a title-named card a game
+    // or a converter wrote) opens a line of its own on the server, which then
+    // moves the game's save onto it and away from the game's card. Only an
+    // index that loaded can say a ROM is missing; with no ROM root the card
+    // syncs as before.
+    if rom_entry.is_none()
+        && !rom_index.is_empty()
+        && system_slug == "psx"
+        && infer_playstation_slot_from_path(save_path).starts_with(PS1_PER_GAME_SLOT_PREFIX)
+    {
+        report.skipped += 1;
+        eprintln!(
+            "Not uploading {}: a PS1 card named after no ROM in the index would open its own line on the server",
+            save_path.display()
+        );
+        return Ok(None);
+    }
     if !source_allows_system(source_systems, &system_slug) {
         report.skipped += 1;
         if verbose {
@@ -1244,13 +1721,50 @@ fn process_single_save(
             wii_title_code_from_path(save_path).as_deref(),
             &effective_slot_name,
         ))
+    } else if system_slug == "sega-cd" && crate::scanner::is_sega_cd_shared_bram(save_path) {
+        crate::scanner::sega_cd_bram_line_key(device_type, save_path)
     } else {
         None
     };
     let mut rom_md5: Option<String> = None;
 
+    // A ROM this helper holds is hashed here. /rom/lookup answers every stem,
+    // with a sha1 derived from the name when the server has no ROM, so asking it
+    // first keys the save on that made-up sha1: /save/latest then misses the
+    // record kept under the ROM's real sha1 and the save is uploaded every pass.
+    // The lookup is only for a save whose ROM is not on this device, or whose
+    // ROM is a container (an archive or a disc image): hashing one gives the
+    // container's sha1, which no ROM record is keyed on, so those still ask
+    // the lookup.
+    if rom_sha1.is_none()
+        && let Some(rom_entry) = rom_entry
+        && !rom_is_container(&rom_entry.path)
+    {
+        if let Some((cached_sha1, cached_md5)) = rom_hash_cache.get(&stem_key).cloned() {
+            rom_sha1 = Some(cached_sha1);
+            rom_md5 = Some(cached_md5);
+        } else {
+            let local_rom_sha1 = sha1_file(&rom_entry.path)?;
+            let local_rom_md5 = md5_file(&rom_entry.path)?;
+            rom_hash_cache.insert(
+                stem_key.clone(),
+                (local_rom_sha1.clone(), local_rom_md5.clone()),
+            );
+            rom_sha1 = Some(local_rom_sha1);
+            rom_md5 = Some(local_rom_md5);
+        }
+    }
+    // Set when the ROM key came from the server's lookup scoped to this
+    // system: a record uploaded before the scoped key existed sits under the
+    // stem's key instead, and is asked for once if the scoped key finds nothing.
+    let mut rom_key_from_scoped_lookup = false;
     if rom_sha1.is_none() {
-        let lookup = api.lookup_rom(&stem).ok();
+        let lookup = api.lookup_rom(&stem, Some(&system_slug)).ok();
+        rom_key_from_scoped_lookup = lookup
+            .as_ref()
+            .and_then(|value| value.rom.as_ref())
+            .and_then(|value| value.sha1.as_ref())
+            .is_some();
         rom_sha1 = lookup
             .as_ref()
             .and_then(|value| value.rom.as_ref())
@@ -1259,27 +1773,9 @@ fn process_single_save(
             .as_ref()
             .and_then(|value| value.rom.as_ref())
             .and_then(|value| value.md5.clone());
-
-        if rom_sha1.is_none()
-            && let Some(rom_entry) = rom_entry
-        {
-            if let Some((cached_sha1, cached_md5)) = rom_hash_cache.get(&stem_key).cloned() {
-                rom_sha1 = Some(cached_sha1);
-                rom_md5 = Some(cached_md5);
-            } else {
-                let local_rom_sha1 = sha1_file(&rom_entry.path)?;
-                let local_rom_md5 = md5_file(&rom_entry.path)?;
-                rom_hash_cache.insert(
-                    stem_key.clone(),
-                    (local_rom_sha1.clone(), local_rom_md5.clone()),
-                );
-                rom_sha1 = Some(local_rom_sha1);
-                rom_md5 = Some(local_rom_md5);
-            }
-        }
     }
 
-    let Some(active_rom_sha1) = rom_sha1 else {
+    let Some(mut active_rom_sha1) = rom_sha1 else {
         report.skipped += 1;
         if verbose {
             eprintln!("No ROM mapping found for save {}", stem);
@@ -1288,7 +1784,7 @@ fn process_single_save(
     };
 
     let latest_context = latest_save_context(save_path, &system_slug);
-    let latest = match api.latest_save(LatestSaveRequest {
+    let mut latest = match api.latest_save(LatestSaveRequest {
         rom_sha1: &active_rom_sha1,
         slot_name: &effective_slot_name,
         device_type,
@@ -1310,6 +1806,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_missing_cloud_payload_reference(&err) => {
@@ -1324,6 +1821,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
@@ -1338,12 +1836,90 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) => return Err(err),
     };
 
-    if !latest.exists {
+    // The scoped ROM key found no record. A record uploaded before the scoped
+    // key existed sits under the stem's key: ask for it once. The request still
+    // names this system, so the server offers that record only when it is this
+    // system's save, never another system's that shares the stem.
+    if !latest.exists && rom_key_from_scoped_lookup {
+        let legacy_sha1 = api
+            .lookup_rom(&stem, None)
+            .ok()
+            .and_then(|value| value.rom)
+            .and_then(|value| value.sha1);
+        if let Some(legacy_sha1) = legacy_sha1.filter(|value| value != &active_rom_sha1) {
+            match api.latest_save(LatestSaveRequest {
+                rom_sha1: &legacy_sha1,
+                slot_name: &effective_slot_name,
+                device_type,
+                fingerprint,
+                app_password,
+                runtime_target: Some(&runtime_target),
+                context: Some(&latest_context),
+            }) {
+                Ok(legacy) if legacy.exists => {
+                    if verbose {
+                        eprintln!(
+                            "{}: the {} record sits under the stem's key; syncing against it",
+                            save_path.display(),
+                            system_slug
+                        );
+                    }
+                    active_rom_sha1 = legacy_sha1;
+                    latest = legacy;
+                }
+                // The server answers a request naming this system with this
+                // system's record only (RSM#68), so a record of another system
+                // under the stem's key comes back absent. Its system isn't in
+                // the answer, so the line names the stem's key instead.
+                Ok(_) => eprintln!(
+                    "{}: no {} record under the scoped key or the stem's key ({}); a record of another system under the stem's key is not taken",
+                    save_path.display(),
+                    system_slug,
+                    stem
+                ),
+                Err(err) => {
+                    if verbose {
+                        eprintln!(
+                            "{}: the stem's key could not be checked ({err:#}); keeping the {} key",
+                            save_path.display(),
+                            system_slug
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // The server holding these bytes means the save is in sync only if this
+    // device last synced it under the card it is offered under now. A save
+    // that moved cards (a per-game card newly holding it) is a different offer
+    // of the same bytes: the server moves the save onto the line the new card
+    // names, so it is uploaded rather than treated as in sync or restored.
+    let moved_to_another_card = prior_entry
+        .and_then(|entry| entry.slot_name.as_deref())
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+        .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+        .unwrap_or(false)
+        // The device's own state is not the only witness to a move: the server
+        // can re-home a save (another device, a manual repair) while this device
+        // still records the card it last synced. The card the server reports is
+        // compared as well, so an unchanged-bytes offer still uploads and the
+        // save lands on the card this device names.
+        || latest
+            .card_slot
+            .as_deref()
+            .map(str::trim)
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+            .unwrap_or(false);
+    if !latest.exists || moved_to_another_card {
         if options.dry_run {
             report.uploaded += 1;
             return Ok(Some(processed_entry(
@@ -1414,7 +1990,38 @@ fn process_single_save(
         )));
     }
 
-    if options.force_upload {
+    // What did both sides last agree on?  Comparing local against remote alone
+    // cannot tell "the user just saved" from "the server has something new", so a
+    // divergence was resolved by asking the server, which can only see its own side.
+    let (local_moved, remote_moved) = match prior_entry {
+        Some(prior) => {
+            let last = prior.sha256.as_str();
+            let remote = latest.sha256.as_deref().unwrap_or("");
+            (last != local_sha.as_str(), last != remote)
+        }
+        // Nothing agreed yet (first sync): not a conflict, fall through.
+        None => (false, false),
+    };
+
+    if local_moved && remote_moved {
+        // Both sides moved, and neither is more real.  Touch neither.
+        let remote_sha = latest.sha256.as_deref().unwrap_or("");
+        report.conflicts += 1;
+        eprintln!(
+            "Sync conflict for {}: local {} and server {} both changed since the last sync; leaving both untouched",
+            save_path.display(),
+            &local_sha[..local_sha.len().min(8)],
+            &remote_sha[..remote_sha.len().min(8)]
+        );
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            prior_entry
+                .expect("conflict requires a prior entry")
+                .clone(),
+        )));
+    }
+
+    if options.force_upload || local_moved {
         if options.dry_run {
             report.uploaded += 1;
             return Ok(Some(processed_entry(
@@ -1482,6 +2089,26 @@ fn process_single_save(
                 Some(&effective_slot_name),
             ),
         )));
+    }
+
+    // Three-way: what did we last agree with the server on?  Comparing local
+    // against remote alone cannot tell "the user just saved" from "the server has
+    // something new", so a divergence was resolved by asking the server, which can
+    // only see its own side.
+    if let Some(prior) = prior_entry {
+        let last = prior.sha256.as_str();
+        let remote = latest.sha256.as_deref().unwrap_or("");
+        if last != local_sha.as_str() && last != remote {
+            // Both sides moved, and neither is more real.  Touch neither.
+            report.conflicts += 1;
+            eprintln!(
+                "Sync conflict for {}: local {} and server {} both changed since the last sync; leaving both untouched",
+                save_path.display(),
+                &local_sha[..local_sha.len().min(8)],
+                &remote[..remote.len().min(8)]
+            );
+            return Ok(Some(processed_entry(state_key.clone(), prior.clone())));
+        }
     }
 
     if latest.sha256.as_deref() == Some(local_sha.as_str()) {
@@ -1863,6 +2490,7 @@ fn process_missing_save(
             sha256: None,
             version: None,
             id: None,
+            card_slot: None,
         },
         Err(err) => return Err(err),
     };
@@ -1977,6 +2605,24 @@ fn latest_save_context(save_path: &Path, system_slug: &str) -> LatestSaveContext
 
 fn is_playstation_system(system_slug: &str) -> bool {
     matches!(system_slug, "psx" | "ps2")
+}
+
+/// ROM files whose own bytes are a container, not the ROM a record is keyed on:
+/// archives, and disc images in any of the forms the scanner indexes. Hashing
+/// one gives the container's sha1, so these ask `/rom/lookup` instead.
+const CONTAINER_ROM_EXTENSIONS: &[&str] = &[
+    "zip", "7z", "chd", "iso", "cue", "bin", "gdi", "cdi", "rvz", "wbfs", "pbp", "cso",
+];
+
+fn rom_is_container(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            CONTAINER_ROM_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+        .unwrap_or(false)
 }
 
 fn is_dreamcast_system(system_slug: &str) -> bool {
@@ -2329,9 +2975,52 @@ fn parse_playstation_slot(value: &str) -> Option<String> {
     None
 }
 
+/// A PS1 card the emulator keeps per game (RetroArch's Beetle PSX without
+/// shared cards, the MiSTer) is named after that game and holds only its saves.
+/// The server keeps one line per card slot, so such a card gets its own slot,
+/// "Game: <name>"; sharing "Memory Card 1" made each game's card read as a
+/// deletion of every other game's save. A numbered card (memory_card_1, mcd001)
+/// is a shared card and keeps its number, and so does a PS2 card.
+const PS1_PER_GAME_SLOT_PREFIX: &str = "Game: ";
+
 fn infer_playstation_slot_from_path(path: &Path) -> String {
     let text = path.to_string_lossy().to_ascii_lowercase();
-    parse_playstation_slot(&text).unwrap_or_else(|| "Memory Card 1".to_string())
+    if let Some(slot) = parse_playstation_slot(&text) {
+        return slot;
+    }
+    let is_ps1_card = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("ps2"))
+        .unwrap_or(false);
+    match path.file_stem().and_then(|value| value.to_str()) {
+        Some(stem) if is_ps1_card && !stem.trim().is_empty() => {
+            format!("{PS1_PER_GAME_SLOT_PREFIX}{}", stem.trim())
+        }
+        _ => "Memory Card 1".to_string(),
+    }
+}
+
+/// The extension a per-game PS1 card has on this device: the server names the
+/// card after its game but knows only the `.mcr` container, while RetroArch
+/// reads `<game>.srm` and the MiSTer `<game>.sav`.
+fn ps1_per_game_card_extension(
+    cloud_save: &CloudSaveSummary,
+    source_profile: &EmulatorProfile,
+) -> Option<String> {
+    let slot = cloud_save.card_slot.as_deref()?.trim();
+    if !slot.starts_with(PS1_PER_GAME_SLOT_PREFIX)
+        || !cloud_save.system_slug.eq_ignore_ascii_case("psx")
+    {
+        return None;
+    }
+    Some(
+        match source_profile {
+            EmulatorProfile::Mister => "sav",
+            _ => "srm",
+        }
+        .to_string(),
+    )
 }
 
 fn parse_dreamcast_slot(value: &str) -> Option<String> {
@@ -2412,7 +3101,76 @@ fn save_selection_key(save_path: &Path) -> String {
     {
         return format!("wii:{}", title_code.to_ascii_lowercase());
     }
-    filename_stem(save_path).to_ascii_lowercase()
+    let stem = filename_stem(save_path).to_ascii_lowercase();
+    // Additive save extensions are NOT alternative formats of the main save —
+    // they carry independent state that must NOT be deduplicated against the
+    // primary battery save. Examples:
+    //   .rtc — GBC real-time clock state (Pokemon Crystal/Gold/Silver,
+    //          Harvest Moon GBC, etc). The .srm is the SRAM; the .rtc is
+    //          the day/night clock. Dropping .rtc loses time-based events
+    //          like Pokemon Crystal evolutions and the in-game day cycle.
+    //   .mpk / .cpk — N64 controller pak / memory pak. Independent of the
+    //          main .eep / .fla / .sra battery save.
+    // Give these their own selection key so select_preferred_save_per_stem
+    // doesn't pick one variant and silently drop the others.
+    if let Some(ext) = save_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        && matches!(ext.as_str(), "rtc" | "mpk" | "cpk")
+    {
+        return format!("{}:{}", stem, ext);
+    }
+    stem
+}
+
+/// Whether this copy may upload, and the reason when it may not.
+///
+/// The restore rule and this one are the same rule: the directory the emulator
+/// actually writes is the one that syncs. Declared wins; two copies with
+/// nothing declared is a conflict the helper refuses to resolve, because a
+/// wrong upload replaces a good record rather than merely landing in a place
+/// the game cannot see.
+fn live_upload_blocked(
+    source: &ResolvedSource,
+    save_path: &Path,
+    selection_key: &str,
+) -> Option<String> {
+    let root = source.save_roots.first()?;
+    let classification = classify_supported_save(save_path, None)?;
+    let system_slug = classification.system_slug;
+    let declared = source
+        .save_subdirs
+        .get(&system_slug)
+        .map(|path| path.as_path());
+    match live_target_for(root, &system_slug, selection_key, declared) {
+        LiveTarget::FallThrough => None,
+        LiveTarget::Path { live, .. } => {
+            if save_path.parent() == Some(live.as_path()) {
+                return None;
+            }
+            Some(format!(
+                "Not uploading {}: it is a stray copy, and {} is the live directory for {} in source '{}'",
+                save_path.display(),
+                live.display(),
+                system_slug,
+                source.name
+            ))
+        }
+        LiveTarget::Ambiguous(directories) => {
+            let named: Vec<String> = directories
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect();
+            Some(format!(
+                "Not uploading {}: it exists in {}, and no live directory is declared; set SAVE_SUBDIR_{} on source '{}'",
+                save_path.display(),
+                named.join(", "),
+                system_slug.to_ascii_uppercase(),
+                source.name
+            ))
+        }
+    }
 }
 
 fn select_preferred_save_per_stem(
@@ -2485,6 +3243,11 @@ fn preferred_save_path(
     };
     let current_extension = save_extension(save_path);
     if system_slug == "n64" && is_native_n64_extension(current_extension.as_deref()) {
+        return save_path.to_path_buf();
+    }
+    // A Sega CD backup RAM is read by its own name (scd_U.brm, cart.brm); the
+    // cartridge .srm rule would write a file Genesis Plus GX never opens.
+    if system_slug == "sega-cd" && current_extension.as_deref() == Some("brm") {
         return save_path.to_path_buf();
     }
     let Some(preferred_extension) =
@@ -2842,6 +3605,40 @@ mod tests {
             std::slice::from_ref(&root),
             true
         ));
+    }
+
+    // GBC-RTC clobber: a profile that targets the primary extension must not
+    // pull a sidecar onto it. An 8-byte clock state written over a 32 KiB
+    // cartridge save destroys the save.
+    #[test]
+    fn a_sidecar_restores_to_its_own_extension() {
+        let save = cloud_save(
+            "Pokemon - Crystal Version (USA, Europe) (Rev 1).rtc",
+            "Pokemon - Crystal Version",
+            "gameboy",
+            "gameboy/retroarch-gambatte",
+            ".srm",
+        );
+        assert_eq!(
+            cloud_target_extension(&save, Some("gameboy/retroarch-gambatte")).as_deref(),
+            Some("rtc"),
+            "the sidecar was mapped onto the profile's primary extension"
+        );
+    }
+
+    #[test]
+    fn a_primary_still_takes_the_profiles_extension() {
+        let save = cloud_save(
+            "Pokemon - Crystal Version (USA, Europe) (Rev 1).srm",
+            "Pokemon - Crystal Version",
+            "gameboy",
+            "gameboy/retroarch-gambatte",
+            ".srm",
+        );
+        assert_eq!(
+            cloud_target_extension(&save, Some("gameboy/retroarch-gambatte")).as_deref(),
+            Some("srm")
+        );
     }
 
     fn cloud_save(
@@ -3524,6 +4321,23 @@ mod tests {
     }
 
     #[test]
+    fn a_ps1_card_named_after_its_game_is_its_own_slot() {
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/Tekken 3 (USA).srm")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/PSX/Tekken 3 (USA).sav")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        // Numbered cards are shared and keep their number.
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/memory_card_1.mcr")),
+            "Memory Card 1".to_string()
+        );
+    }
+
+    #[test]
     fn resolves_dreamcast_slot_from_path() {
         assert_eq!(
             resolve_slot_name_for_sync(
@@ -3548,6 +4362,118 @@ mod tests {
         assert_eq!(
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
+        );
+    }
+
+    #[test]
+    fn mister_never_restores_a_psp_save() {
+        // MiSTer has no PSP core: a PSP record, loose or a PPSSPP SAVEDATA
+        // bundle, has nowhere on this device a game reads it from.
+        assert!(!supports_cloud_restore_system("psp"));
+        assert!(supports_cloud_restore_system("psx"));
+    }
+
+    #[test]
+    fn save_selection_key_separates_additive_extensions() {
+        // Pokemon Crystal saves both .srm (battery SRAM) and .rtc (real-time
+        // clock state). They are NOT alternative formats of each other —
+        // dropping .rtc loses time-based events (Pokemon evolutions, day/night
+        // cycle). They must get DIFFERENT selection keys so they don't dedup
+        // against each other in select_preferred_save_per_stem.
+        let srm = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).srm",
+        );
+        let rtc = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).rtc",
+        );
+        let srm_key = save_selection_key(&srm);
+        let rtc_key = save_selection_key(&rtc);
+        assert_ne!(
+            srm_key, rtc_key,
+            ".srm and .rtc must have distinct selection keys (issue: Pokemon Crystal clock state was being dropped)"
+        );
+        // Sanity: same stem still produces deterministic per-extension keys.
+        assert_eq!(
+            rtc_key,
+            "pokemon - crystal version (usa, europe) (rev 1):rtc"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_separates_n64_controller_pak_from_battery_save() {
+        // N64 .mpk / .cpk = controller pak (separate save device, used for
+        // games like Mario Kart 64 ghost data, F-Zero X custom courses).
+        // .eep / .fla / .sra = main battery save. Must not dedup.
+        let eep = PathBuf::from("/saves/n64/Mario Kart 64 (USA).eep");
+        let mpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).mpk");
+        let cpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).cpk");
+        let eep_key = save_selection_key(&eep);
+        let mpk_key = save_selection_key(&mpk);
+        let cpk_key = save_selection_key(&cpk);
+        assert_ne!(eep_key, mpk_key, ".eep and .mpk must have distinct keys");
+        assert_ne!(eep_key, cpk_key, ".eep and .cpk must have distinct keys");
+        assert_ne!(
+            mpk_key, cpk_key,
+            ".mpk and .cpk must have distinct keys (different controller-pak slots)"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_dedups_real_alternative_formats() {
+        // Regression guard: ALTERNATIVE formats of the same save (e.g. a
+        // user with both .sav and .srm versions of the same game) MUST
+        // still collide so dedup picks the preferred one.
+        let sav = PathBuf::from("/saves/snes/Super Mario World.sav");
+        let srm = PathBuf::from("/saves/snes/Super Mario World.srm");
+        assert_eq!(
+            save_selection_key(&sav),
+            save_selection_key(&srm),
+            "true alternative formats (.sav vs .srm of same game) must still dedup"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    #[test]
+    fn a_lock_names_its_owner() {
+        assert_eq!(super::lock_owner("pid=1234\nstarted_at=x\n"), Some(1234));
+        assert_eq!(super::lock_owner("started_at=x\n"), None);
+        assert_eq!(super::lock_owner("pid=abc\n"), None);
+    }
+
+    #[test]
+    fn of_two_takeovers_of_one_dead_lock_exactly_one_succeeds() {
+        let dir = std::env::temp_dir().join(format!("sgm-lock-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sync.lock");
+        std::fs::write(&path, "pid=4194303\nstarted_at=x\n").unwrap();
+        let first = super::SyncLock::take_over(&path, 4_194_303, "pid=1\n");
+        let second = super::SyncLock::take_over(&path, 4_194_303, "pid=2\n");
+        assert!(first.is_ok(), "the first takeover of a dead lock failed");
+        assert!(
+            second.is_err(),
+            "a second takeover deleted the first one's live lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "pid=1\n",
+            "the first sync's lock was replaced"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_alive_tells_a_running_process_from_a_missing_one() {
+        assert!(
+            super::pid_alive(std::process::id()),
+            "this test's own process reads as dead"
+        );
+        assert!(
+            !super::pid_alive(4_194_303),
+            "a pid naming no process reads as alive"
         );
     }
 }

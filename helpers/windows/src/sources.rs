@@ -46,6 +46,7 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "ps3",
     "ps4",
     "ps5",
+    "3ds",
 ];
 
 const MISTER_SYNC_SYSTEMS: &[&str] = &[
@@ -246,6 +247,13 @@ pub struct Source {
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
     pub systems: Vec<String>,
+    /// Per-system live-save subdirectory, relative to the source's save root.
+    /// A device that sorts saves by core writes them somewhere other than the
+    /// system directory, and only the operator knows which directory that is.
+    /// The helper reads this key and never writes it: a suggestion in a log is
+    /// evidence, a value the client writes for itself is a guess that outlives
+    /// the evidence.
+    pub save_subdirs: BTreeMap<String, PathBuf>,
     pub create_missing_system_dirs: bool,
     pub managed: bool,
     pub origin: String,
@@ -262,6 +270,7 @@ pub struct ResolvedSource {
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
     pub systems: Vec<String>,
+    pub save_subdirs: BTreeMap<String, PathBuf>,
     pub create_missing_system_dirs: bool,
     pub managed: bool,
     pub origin: String,
@@ -359,6 +368,7 @@ impl Source {
             rom_roots,
             recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: false,
             origin: "manual".to_string(),
@@ -386,6 +396,7 @@ impl Source {
             rom_roots: vec![rom_path],
             recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: true,
             origin,
@@ -416,6 +427,7 @@ impl Source {
                 .collect(),
             recursive: self.recursive,
             systems: self.systems.clone(),
+            save_subdirs: self.save_subdirs.clone(),
             create_missing_system_dirs: self.create_missing_system_dirs,
             managed: self.managed,
             origin: self.origin.clone(),
@@ -535,6 +547,7 @@ pub fn migrate_legacy_sources_if_needed(config: &AppConfig, verbose: bool) -> Re
             rom_roots: vec![rom_path],
             recursive: item.recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: false,
             origin: "legacy-migrated".to_string(),
@@ -1240,6 +1253,21 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         }
     });
 
+    // An operator declares where a device actually writes each system's saves;
+    // the helper only ever reads it. Keys are matched by prefix so a system the
+    // client does not know yet can still be declared.
+    let mut save_subdirs = BTreeMap::new();
+    for (key, value) in &section.values {
+        let Some(system) = key.strip_prefix("SAVE_SUBDIR_") else {
+            continue;
+        };
+        let system = system.trim().to_ascii_lowercase();
+        let directory = value.trim();
+        if !system.is_empty() && !directory.is_empty() {
+            save_subdirs.insert(system, PathBuf::from(directory));
+        }
+    }
+
     Some(Source {
         id: section.id.clone(),
         name: label,
@@ -1249,6 +1277,7 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         rom_roots: vec![rom_path],
         recursive,
         systems,
+        save_subdirs,
         create_missing_system_dirs,
         managed,
         origin,
@@ -1369,6 +1398,16 @@ fn render_config_with_sources(base: &str, sources: &[Source]) -> String {
             source.systems.join(",")
         };
         lines.push(format!("SYSTEMS=\"{}\"", escape_ini(&rendered_systems)));
+        // Re-emitted verbatim: save_source_store strips and re-renders every
+        // [source.*] section, so a key the struct does not carry is destroyed
+        // on the next config write.
+        for (system, directory) in &source.save_subdirs {
+            lines.push(format!(
+                "SAVE_SUBDIR_{}=\"{}\"",
+                system.to_ascii_uppercase(),
+                escape_ini(&directory.to_string_lossy())
+            ));
+        }
         lines.push(format!(
             "CREATE_MISSING_SYSTEM_DIRS=\"{}\"",
             source.create_missing_system_dirs
@@ -1471,6 +1510,39 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_live_directory_survives_a_config_rewrite() {
+        // save_source_store strips and re-renders every [source.*] section, so
+        // an operator's SAVE_SUBDIR_<system> is destroyed unless Source models
+        // it. This is the difference between "the value did not stick" and a
+        // key that is simply not the helper's to keep.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            "[source.retroarch]\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"/tmp/saves\"\nSAVE_SUBDIR_n64=\"Mupen64Plus-Next OpenGL\"\nSAVE_SUBDIR_GENESIS=\"Genesis Plus GX\\Sonic\"\n",
+        )
+        .unwrap();
+
+        let store = load_source_store(&config_path).unwrap();
+        assert_eq!(
+            store.sources[0].save_subdirs.get("n64"),
+            Some(&PathBuf::from("Mupen64Plus-Next OpenGL"))
+        );
+        assert_eq!(
+            store.sources[0].save_subdirs.get("genesis"),
+            Some(&PathBuf::from("Genesis Plus GX\\Sonic")),
+            "a multi-part value has to survive as written"
+        );
+
+        save_source_store(&config_path, &store).unwrap();
+        let reloaded = load_source_store(&config_path).unwrap();
+        assert_eq!(
+            reloaded.sources[0].save_subdirs, store.sources[0].save_subdirs,
+            "the declared live directory was lost in the rewrite"
+        );
+    }
+
+    #[test]
     fn default_windows_source_uses_save_layout() {
         let cfg = AppConfig {
             url: "127.0.0.1".to_string(),
@@ -1486,6 +1558,7 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: PathBuf::from("/tmp"),
             config_path: PathBuf::from("/tmp/config.ini"),
+            psp_savedata_bundles: false,
         };
 
         let source = default_source(&cfg, SourceKind::Windows).unwrap();

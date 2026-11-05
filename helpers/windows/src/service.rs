@@ -1111,6 +1111,7 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: tmp.path().to_path_buf(),
             config_path,
+            psp_savedata_bundles: false,
         };
         fs::create_dir_all(config.resolved_state_dir().unwrap()).unwrap();
 
