@@ -14,7 +14,13 @@ use walkdir::WalkDir;
 const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "cpk", "dsv", "gme", "mcr",
     "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr", "brm",
+    // Mednafen's Neo Geo Pocket flash save.
+    "flash",
 ];
+
+#[cfg(test)]
+#[path = "scanner_new_systems_tests.rs"]
+mod new_systems_tests;
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -842,6 +848,62 @@ pub fn classify_supported_save(
         return None;
     }
 
+    // Ahead of the Neo Geo arm: "neogeocd" and "neo geo pocket" both contain
+    // its "neogeo"/"neo geo", and would be filed as MVS/AES saves.
+    for (slug, needles) in [
+        (
+            "neogeo-cd",
+            &[
+                "neogeocd",
+                "neogeo cd",
+                "neo geo cd",
+                "neo-geo cd",
+                "neo-geo-cd",
+                "/ngcd/",
+                "\\ngcd\\",
+            ][..],
+        ),
+        (
+            "ngp",
+            &[
+                "neo geo pocket",
+                "neogeo pocket",
+                "neo-geo pocket",
+                "/ngp/",
+                "\\ngp\\",
+                "/ngpc/",
+                "\\ngpc\\",
+                "mednafen ngp",
+                "beetle ngp",
+            ][..],
+        ),
+        (
+            "virtualboy",
+            &[
+                "virtualboy",
+                "virtual boy",
+                "virtual-boy",
+                "/vb/",
+                "\\vb\\",
+                "mednafen vb",
+                "beetle vb",
+            ][..],
+        ),
+    ] {
+        if contains_any(&save_lower, needles) {
+            if is_plausible_save_for_system(&save_ext, save_size, slug) {
+                return classify_if_valid(
+                    save_path,
+                    &save_ext,
+                    save_size,
+                    slug,
+                    format!("path hint {} + .{} ({} bytes)", slug, save_ext, save_size),
+                );
+            }
+            return None;
+        }
+    }
+
     if contains_any(
         &save_lower,
         &[
@@ -1362,6 +1424,8 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "saturn" => matches!(ext, "sav" | "srm" | "ram" | "bkr"),
         "dreamcast" => matches!(ext, "bin" | "vms" | "dci"),
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
+        "neogeo-cd" | "virtualboy" => matches!(ext, "sav" | "srm"),
+        "ngp" => ext == "flash",
         "tgfx16" => matches!(ext, "sav" | "srm" | "ram" | "bkr" | "brm"),
         "wii" => ext == "bin",
         "psx" => matches!(
@@ -1436,6 +1500,14 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
                     && size.is_multiple_of(DC_BLOCK_SIZE as u64)
             }
         }
+        // Mednafen writes the Neo Geo Pocket flash as the blocks the game
+        // changed, so its size follows the save, not the cartridge.
+        "ngp" => (1..=65_536).contains(&size),
+        // Virtual Boy cartridge SRAM: 8 KiB, 32 KiB, or 64 KiB as Mednafen
+        // stores it.
+        "virtualboy" => matches!(size, 8192 | 32_768 | 65_536),
+        // Neo Geo CD backup RAM is 8 KiB.
+        "neogeo-cd" => size == 8192,
         "neogeo" => {
             // MiSTer NeoGeo backup RAM commonly includes a 0x2000 metadata/padding area
             // around the 64 KiB payload, so 0x12000 is valid even though it is not
