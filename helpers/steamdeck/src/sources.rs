@@ -47,6 +47,7 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "ps3",
     "ps4",
     "ps5",
+    "3ds",
 ];
 
 const MISTER_SYNC_SYSTEMS: &[&str] = &[

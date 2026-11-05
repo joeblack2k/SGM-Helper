@@ -582,7 +582,10 @@ pub fn classify_supported_save(
     }
 
     let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
-    if contains_any(&save_lower, &["gameboy advance", "/gba/", "\\gba\\"]) {
+    if contains_any(
+        &save_lower,
+        &["gameboy advance", "game boy advance", "/gba/", "\\gba\\"],
+    ) {
         if is_plausible_save_for_system(&save_ext, save_size, "gba") {
             return classify_if_valid(
                 save_path,
@@ -593,6 +596,55 @@ pub fn classify_supported_save(
             );
         }
         return None;
+    }
+    // mGBA and VisualBoyAdvance run Game Boy and Game Boy Advance games alike,
+    // and Genesis Plus GX, PicoDrive and SMS Plus GX run Mega Drive, Master
+    // System and Game Gear, so their directory names none of those systems.
+    // The size decides when only one system has a cartridge that size;
+    // otherwise the path alone leaves the save unclassified, and only the ROM
+    // can say. This runs before the Sega folder names below because a Genesis
+    // Plus GX save also sits under RetroArch's `genesis` folder.
+    if let Some(slugs) = shared_core_systems(&save_lower) {
+        let mut fits = slugs
+            .iter()
+            .copied()
+            .filter(|slug| is_plausible_save_for_system(&save_ext, save_size, slug));
+        if let (Some(slug), None) = (fits.next(), fits.next()) {
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                slug,
+                format!(
+                    "core directory shared by {} + .{} ({} bytes)",
+                    slugs.join(" and "),
+                    save_ext,
+                    save_size
+                ),
+            );
+        }
+        // The ROM can say when the size cannot. A zipped ROM has no system in its
+        // extension, but the folder it was found in names one (`Sega Genesis`,
+        // `Sega - Master System - Mark III`, `Sega Game Gear`), and that folder is
+        // evidence the core directory is not.
+        return rom_path
+            .and_then(|rom| rom_folder_system(rom, slugs))
+            .filter(|slug| is_plausible_save_for_system(&save_ext, save_size, slug))
+            .and_then(|slug| {
+                classify_if_valid(
+                    save_path,
+                    &save_ext,
+                    save_size,
+                    slug,
+                    format!(
+                        "core directory shared by {}, ROM folder names {} + .{} ({} bytes)",
+                        slugs.join(" and "),
+                        slug,
+                        save_ext,
+                        save_size
+                    ),
+                )
+            });
     }
     if contains_any(
         &save_lower,
@@ -627,6 +679,10 @@ pub fn classify_supported_save(
             "desmume",
             "ryujinx",
             "citra",
+            "n3ds",
+            "/3ds/",
+            "\\3ds\\",
+            "azahar",
             "yuzu",
             "suyu",
             "dolphin",
@@ -640,7 +696,11 @@ pub fn classify_supported_save(
             "nintendo",
         ],
     ) {
-        let slug = infer_nintendo_slug(&save_lower);
+        let Some(slug) = infer_nintendo_slug(&save_lower) else {
+            // No core name matched: leave the save unclassified rather than
+            // labelling it Game Boy, which is a wrong answer rather than a missing one.
+            return None;
+        };
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
             return classify_if_valid(
                 save_path,
@@ -868,36 +928,161 @@ fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
     }
 }
 
+/// `save_path` as a save of `system_slug`, when its path names a core directory
+/// that serves that system among others and the file fits that system.
+///
+/// The path cannot choose between the systems such a core runs, but a caller
+/// that already knows which one the save belongs to (the record it restored,
+/// the system it synced the file as) can ask whether the file is that save.
+pub fn classify_save_in_shared_core_as(
+    save_path: &Path,
+    system_slug: &str,
+) -> Option<SaveClassification> {
+    let save_ext = path_extension(save_path)?;
+    let save_size = save_path.metadata().ok()?.len();
+    if !is_plausible_save_size(save_size) || looks_plain_text(save_path) {
+        return None;
+    }
+    let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
+    let slugs = shared_core_systems(&save_lower)?;
+    let slug = slugs.iter().copied().find(|slug| *slug == system_slug)?;
+    if !is_plausible_save_for_system(&save_ext, save_size, slug) {
+        return None;
+    }
+    classify_if_valid(
+        save_path,
+        &save_ext,
+        save_size,
+        slug,
+        format!(
+            "core directory shared by {}, known as {} + .{} ({} bytes)",
+            slugs.join(" and "),
+            slug,
+            save_ext,
+            save_size
+        ),
+    )
+}
+
+/// The one system among `candidates` that the ROM's own folder names, if any.
+///
+/// Only the folder directly holding the ROM is read, so a collection root like
+/// `Views/LaunchBox` cannot vote; a folder naming two candidates names none.
+fn rom_folder_system(rom_path: &Path, candidates: &[&'static str]) -> Option<&'static str> {
+    let folder = rom_path
+        .parent()?
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let any = |names: &[&str]| names.iter().any(|name| folder.contains(name));
+    let names_system = |slug: &str| -> bool {
+        match slug {
+            "genesis" => any(&["genesis", "mega drive", "megadrive"]),
+            "master-system" => any(&["master system", "mark iii", "mastersystem"]),
+            "game-gear" => any(&["game gear", "gamegear"]),
+            "sega-cd" => any(&["sega cd", "mega cd", "mega-cd", "segacd"]),
+            "sega-32x" => any(&["32x"]),
+            "gba" => any(&["game boy advance", "gameboy advance", "gba"]),
+            "gameboy" => any(&["game boy", "gameboy"]) && !any(&["advance"]),
+            _ => false,
+        }
+    };
+    let mut hits = candidates.iter().copied().filter(|slug| names_system(slug));
+    match (hits.next(), hits.next()) {
+        (Some(slug), None) => Some(slug),
+        _ => None,
+    }
+}
+
+/// The systems a core directory in `haystack` serves, when it serves more than
+/// one. Such a name is evidence for none of them by itself.
+pub fn shared_core_systems(haystack: &str) -> Option<&'static [&'static str]> {
+    let haystack = haystack.to_ascii_lowercase();
+    if contains_any(&haystack, &["mgba", "visualboyadvance", "vba"]) {
+        return Some(&["gameboy", "gba"]);
+    }
+    // Sega cores, by the systems each runs. Their saves share one size table,
+    // so only the ROM or an already-known system can name one of them.
+    if haystack.contains("picodrive") {
+        return Some(&[
+            "genesis",
+            "master-system",
+            "game-gear",
+            "sega-cd",
+            "sega-32x",
+        ]);
+    }
+    if contains_any(
+        &haystack,
+        &["genesis plus gx", "genesis_plus_gx", "genesisplusgx"],
+    ) {
+        return Some(&["genesis", "master-system", "game-gear", "sega-cd"]);
+    }
+    if contains_any(&haystack, &["sms plus gx", "smsplus"]) {
+        return Some(&["master-system", "game-gear"]);
+    }
+    None
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-fn infer_nintendo_slug(haystack: &str) -> &'static str {
+fn infer_nintendo_slug(haystack: &str) -> Option<&'static str> {
     if contains_any(
         haystack,
         &["nintendo wii", "/wii/", "\\wii\\", "dolphin", "rvl"],
     ) {
-        return "wii";
-    }
-    if contains_any(haystack, &["gameboy advance", "/gba/", "\\gba\\"]) {
-        return "gba";
-    }
-    if contains_any(haystack, &["nintendo ds", "/nds/", "\\nds\\"]) {
-        return "nds";
-    }
-    if contains_any(haystack, &["nintendo 64", "/n64/", "\\n64\\"]) {
-        return "n64";
+        return Some("wii");
     }
     if contains_any(
         haystack,
-        &["super nintendo", "/snes/", "\\snes\\", "/sfc/", "\\sfc\\"],
+        &["gameboy advance", "game boy advance", "/gba/", "\\gba\\"],
     ) {
-        return "snes";
+        return Some("gba");
     }
-    if contains_any(haystack, &["famicom", "/nes/", "\\nes\\"]) {
-        return "nes";
+    if contains_any(
+        haystack,
+        &["game boy", "gameboy", "/gb/", "\\gb\\", "/gbc/", "\\gbc\\"],
+    ) {
+        return Some("gameboy");
     }
-    "gameboy"
+    if contains_any(
+        haystack,
+        &["nintendo ds", "/nds/", "\\nds\\", "melonds", "desmume"],
+    ) {
+        return Some("nds");
+    }
+    if contains_any(
+        haystack,
+        &["nintendo 64", "/n64/", "\\n64\\", "mupen", "project64"],
+    ) {
+        return Some("n64");
+    }
+    if contains_any(
+        haystack,
+        &[
+            "super nintendo",
+            "/snes/",
+            "\\snes\\",
+            "/sfc/",
+            "\\sfc\\",
+            "snes9x",
+            "bsnes",
+        ],
+    ) {
+        return Some("snes");
+    }
+    if contains_any(
+        haystack,
+        &["famicom", "/nes/", "\\nes\\", "fceux", "fceumm", "nestopia"],
+    ) {
+        return Some("nes");
+    }
+    if contains_any(haystack, &["n3ds", "/3ds/", "\\3ds\\", "azahar", "citra"]) {
+        return Some("3ds");
+    }
+    None
 }
 
 fn infer_sega_slug(haystack: &str) -> &'static str {
@@ -1067,6 +1252,9 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "gba" => matches!(ext, "sav" | "srm" | "sa1"),
         "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk" | "cpk" | "srm"),
         "nds" => matches!(ext, "sav" | "dsv"),
+        // Azahar/Citra store per-title save data under nand/ and sdmc/; the
+        // extension set is unverified against a device listing.
+        "3ds" => matches!(ext, "sav" | "dsv" | "dat" | "bin"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
             matches!(ext, "sav" | "srm" | "ram")
@@ -1688,7 +1876,7 @@ fn inspect_dreamcast_vmu_image(bytes: &[u8]) -> Option<DreamcastMetadata> {
         if end > bytes.len() {
             return None;
         }
-        for chunk in bytes[start..end].chunks_exact(DC_DIR_ENTRY_SIZE) {
+        for chunk in bytes[start..end].as_chunks::<DC_DIR_ENTRY_SIZE>().0 {
             let entry = parse_dreamcast_dir_entry(chunk)?;
             if entry.file_type != DC_FILETYPE_DATA && entry.file_type != DC_FILETYPE_GAME {
                 continue;
@@ -1748,7 +1936,10 @@ fn inspect_dreamcast_dci_payload(bytes: &[u8]) -> Option<DreamcastMetadata> {
         return None;
     }
     let mut file_bytes = Vec::with_capacity(file_blocks * DC_BLOCK_SIZE);
-    for block in bytes[DC_DCI_HEADER_SIZE..expected_len].chunks_exact(DC_BLOCK_SIZE) {
+    for block in bytes[DC_DCI_HEADER_SIZE..expected_len]
+        .as_chunks::<DC_BLOCK_SIZE>()
+        .0
+    {
         file_bytes.extend_from_slice(&dreamcast_unswap_32bit_chunks(block));
     }
 
@@ -1931,7 +2122,7 @@ fn parse_dreamcast_pkg_header(bytes: &[u8]) -> Option<DreamcastPkgHeader> {
 
 fn dreamcast_unswap_32bit_chunks(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    for chunk in out.chunks_exact_mut(4) {
+    for chunk in out.as_chunks_mut::<4>().0 {
         chunk.reverse();
     }
     out
@@ -2182,6 +2373,96 @@ fn looks_plain_text(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::infer_nintendo_slug;
+
+    fn save_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i.wrapping_mul(31) as u8) ^ 0xA5)
+            .collect()
+    }
+
+    fn write_save(dir: &std::path::Path, name: &str, len: usize) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, save_bytes(len)).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_mgba_directory_names_neither_game_boy_system() {
+        // A Game Boy save in RetroArch's mGBA folder is not a GBA save: mGBA
+        // runs both, and 8 KiB is a cartridge size for both.
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(
+            &tmp.path().join("saves/mGBA"),
+            "Kirby's Dream Land 2.srm",
+            8192,
+        );
+        assert_eq!(super::classify_supported_save(&save, None), None);
+        assert_eq!(
+            super::classify_save_in_shared_core_as(&save, "gameboy").map(|c| c.system_slug),
+            Some("gameboy".to_string())
+        );
+        assert_eq!(
+            super::classify_save_in_shared_core_as(&save, "gba").map(|c| c.system_slug),
+            Some("gba".to_string())
+        );
+        assert_eq!(super::classify_save_in_shared_core_as(&save, "snes"), None);
+        let vba = write_save(
+            &tmp.path().join("saves/VisualBoyAdvance"),
+            "Crystal.sav",
+            32768,
+        );
+        assert_eq!(super::classify_supported_save(&vba, None), None);
+    }
+
+    #[test]
+    fn an_mgba_save_only_one_system_can_hold_is_that_system() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/mGBA");
+        let gba = write_save(&dir, "Minish Cap.srm", 131072);
+        assert_eq!(
+            super::classify_supported_save(&gba, None).map(|c| c.system_slug),
+            Some("gba".to_string())
+        );
+        let gb = write_save(&dir, "Link's Awakening.srm", 2048);
+        assert_eq!(
+            super::classify_supported_save(&gb, None).map(|c| c.system_slug),
+            Some("gameboy".to_string())
+        );
+    }
+
+    #[test]
+    fn a_rom_still_names_the_system_of_an_mgba_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(&tmp.path().join("saves/mGBA"), "Crystal.srm", 32768);
+        let rom = tmp.path().join("roms/gbc/Crystal.gbc");
+        assert_eq!(
+            super::classify_supported_save(&save, Some(&rom)).map(|c| c.system_slug),
+            Some("gameboy".to_string())
+        );
+    }
+
+    #[test]
+    fn core_directory_names_resolve_to_their_system() {
+        // The directory list admits core names, so the classifier has to know them
+        // too, or a path the vocabulary misses is left unclassified.
+        // The caller lowercases the path before classifying.
+        assert_eq!(infer_nintendo_slug("/saves/snes9x"), Some("snes"));
+        assert_eq!(infer_nintendo_slug("/saves/bsnes"), Some("snes"));
+        assert_eq!(infer_nintendo_slug("/saves/fceumm"), Some("nes"));
+        // mGBA runs Game Boy and Game Boy Advance games: its name is neither.
+        assert_eq!(infer_nintendo_slug("/saves/mgba"), None);
+        assert_eq!(infer_nintendo_slug("/saves/desmume"), Some("nds"));
+        assert_eq!(
+            infer_nintendo_slug("/saves/mupen64plus-next opengl"),
+            Some("n64")
+        );
+        assert_eq!(
+            infer_nintendo_slug("/saves/gb/pokemon.sav"),
+            Some("gameboy")
+        );
+    }
     use super::*;
     use std::fs;
     use std::io::Write;
@@ -2438,6 +2719,187 @@ mod tests {
         fs::write(&save, [0x00u8; 1024]).unwrap();
 
         assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn game_boy_path_hints_classify_as_gameboy() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in ["saves/Game Boy", "saves/gb", "saves/Game Boy Color"] {
+            let save = tmp.path().join(hint).join("Pokemon Red.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert_eq!(
+                infer_supported_console_slug(&save, None).as_deref(),
+                Some("gameboy"),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn game_boy_advance_path_hints_classify_as_gba() {
+        let tmp = tempfile::tempdir().unwrap();
+        // VisualBoyAdvance runs Game Boy games too, and 32 KiB is a Game Boy
+        // cartridge size: its folder names neither system.
+        for hint in ["saves/Game Boy Advance", "saves/gba"] {
+            let save = tmp.path().join(hint).join("Metroid Fusion.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert_eq!(
+                infer_supported_console_slug(&save, None).as_deref(),
+                Some("gba"),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn nintendo_hint_without_a_known_system_is_unclassified() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in ["saves/Nintendo", "saves/ryujinx"] {
+            let save = tmp.path().join(hint).join("Pokemon.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert!(
+                infer_supported_console_slug(&save, None).is_none(),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genesis_plus_gx_directory_names_no_sega_system() {
+        // Genesis Plus GX runs Game Gear as well as Mega Drive, so a Game Gear
+        // save in its folder (or under RetroArch's genesis folder beside it)
+        // is not a Mega Drive save. The arcade filed Defenders of Oasis that way.
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["saves/Genesis Plus GX", "saves/genesis/Genesis Plus GX"] {
+            let save = write_save(
+                &tmp.path().join(dir),
+                "Defenders of Oasis (USA, Europe).srm",
+                65536,
+            );
+            assert_eq!(super::classify_supported_save(&save, None), None, "{dir}");
+            assert_eq!(
+                super::classify_save_in_shared_core_as(&save, "game-gear").map(|c| c.system_slug),
+                Some("game-gear".to_string())
+            );
+            assert_eq!(
+                super::classify_save_in_shared_core_as(&save, "genesis").map(|c| c.system_slug),
+                Some("genesis".to_string())
+            );
+            assert_eq!(super::classify_save_in_shared_core_as(&save, "snes"), None);
+        }
+        let pico = write_save(&tmp.path().join("saves/PicoDrive"), "Doom.srm", 8192);
+        assert_eq!(super::classify_supported_save(&pico, None), None);
+    }
+
+    #[test]
+    fn a_zipped_rom_names_a_genesis_plus_gx_save_by_its_folder() {
+        // The arcade's LaunchBox view holds zipped ROMs, whose extension names no
+        // system; the folder holding each ROM does.  Seven saves sat skipped until
+        // the folder was read.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/Genesis Plus GX");
+        let view = tmp.path().join("Views/LaunchBox");
+        for (save, size, folder, want) in [
+            (
+                "3 Ninjas Kick Back (USA).srm",
+                8192,
+                "Sega Genesis",
+                "genesis",
+            ),
+            ("Grind Stormer (USA).srm", 8192, "Sega Genesis", "genesis"),
+            ("Tempo Jr. (World).srm", 8192, "Sega Game Gear", "game-gear"),
+            (
+                "Global Defense (USA, Europe, Brazil) (En).srm",
+                8192,
+                "Sega Master System",
+                "master-system",
+            ),
+            (
+                "Phantasy Star (USA).srm",
+                8192,
+                "Sega - Master System - Mark III",
+                "master-system",
+            ),
+        ] {
+            let save_path = write_save(&dir, save, size);
+            let rom = view.join(folder).join(save.replace(".srm", ".zip"));
+            assert_eq!(
+                super::classify_supported_save(&save_path, Some(&rom)).map(|c| c.system_slug),
+                Some(want.to_string()),
+                "{save} with ROM in {folder}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rom_folder_that_names_no_single_system_still_decides_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(&tmp.path().join("saves/Genesis Plus GX"), "Thing.srm", 8192);
+        for folder in [
+            "Views/LaunchBox",
+            "Sega Genesis and Game Gear",
+            "Sega Saturn",
+        ] {
+            let rom = tmp.path().join(folder).join("Thing.zip");
+            assert_eq!(
+                super::classify_supported_save(&save, Some(&rom)),
+                None,
+                "{folder}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rom_still_names_the_system_of_a_genesis_plus_gx_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/Genesis Plus GX");
+        let gg = write_save(&dir, "Defenders of Oasis (USA, Europe).srm", 65536);
+        let gg_rom = tmp
+            .path()
+            .join("roms/gamegear/Defenders of Oasis (USA, Europe).gg");
+        assert_eq!(
+            super::classify_supported_save(&gg, Some(&gg_rom)).map(|c| c.system_slug),
+            Some("game-gear".to_string())
+        );
+        let md = write_save(&dir, "Phantasy Star IV (USA).srm", 8192);
+        let md_rom = tmp.path().join("roms/genesis/Phantasy Star IV (USA).md");
+        assert_eq!(
+            super::classify_supported_save(&md, Some(&md_rom)).map(|c| c.system_slug),
+            Some("genesis".to_string())
+        );
+    }
+
+    #[test]
+    fn a_plain_genesis_folder_still_names_genesis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(&tmp.path().join("saves/genesis"), "Sonic 3.srm", 8192);
+        assert_eq!(
+            super::classify_supported_save(&save, None).map(|c| c.system_slug),
+            Some("genesis".to_string())
+        );
+    }
+
+    #[test]
+    fn azahar_and_n3ds_paths_resolve_to_the_3ds_slug() {
+        assert_eq!(
+            infer_nintendo_slug("/saves/n3ds/azahar/nand/title/00040000"),
+            Some("3ds")
+        );
+        assert_eq!(
+            infer_nintendo_slug("/saves/n3ds/azahar/sdmc/Nintendo 3DS"),
+            Some("3ds")
+        );
+        assert_eq!(infer_nintendo_slug("/saves/3ds/citra"), Some("3ds"));
+        assert_eq!(
+            infer_nintendo_slug("/saves/gb/pokemon.sav"),
+            Some("gameboy")
+        );
     }
 
     #[test]
