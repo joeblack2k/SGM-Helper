@@ -1641,6 +1641,13 @@ fn heal_gameboy_rtc_srm_swap(target: &Path) {
             srm.display(),
             rtc.display()
         );
+    } else {
+        eprintln!(
+            "Could not move {} and {} to the extensions their content belongs to; check {} for the SRAM if .srm is missing",
+            srm.display(),
+            rtc.display(),
+            srm.with_extension("srm-rtc-swap").display()
+        );
     }
 }
 
