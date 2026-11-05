@@ -598,9 +598,12 @@ pub fn classify_supported_save(
         return None;
     }
     // mGBA and VisualBoyAdvance run Game Boy and Game Boy Advance games alike,
-    // so their directory names neither system. The size decides when only one
-    // system has a cartridge that size; otherwise the path alone leaves the
-    // save unclassified, and only the ROM can say.
+    // and Genesis Plus GX, PicoDrive and SMS Plus GX run Mega Drive, Master
+    // System and Game Gear, so their directory names none of those systems.
+    // The size decides when only one system has a cartridge that size;
+    // otherwise the path alone leaves the save unclassified, and only the ROM
+    // can say. This runs before the Sega folder names below because a Genesis
+    // Plus GX save also sits under RetroArch's `genesis` folder.
     if let Some(slugs) = shared_core_systems(&save_lower) {
         let mut fits = slugs
             .iter()
@@ -946,6 +949,26 @@ pub fn shared_core_systems(haystack: &str) -> Option<&'static [&'static str]> {
     let haystack = haystack.to_ascii_lowercase();
     if contains_any(&haystack, &["mgba", "visualboyadvance", "vba"]) {
         return Some(&["gameboy", "gba"]);
+    }
+    // Sega cores, by the systems each runs. Their saves share one size table,
+    // so only the ROM or an already-known system can name one of them.
+    if haystack.contains("picodrive") {
+        return Some(&[
+            "genesis",
+            "master-system",
+            "game-gear",
+            "sega-cd",
+            "sega-32x",
+        ]);
+    }
+    if contains_any(
+        &haystack,
+        &["genesis plus gx", "genesis_plus_gx", "genesisplusgx"],
+    ) {
+        return Some(&["genesis", "master-system", "game-gear", "sega-cd"]);
+    }
+    if contains_any(&haystack, &["sms plus gx", "smsplus"]) {
+        return Some(&["master-system", "game-gear"]);
     }
     None
 }
@@ -2387,6 +2410,63 @@ mod tests {
         assert_eq!(
             infer_nintendo_slug("/saves/gb/pokemon.sav"),
             Some("gameboy")
+        );
+    }
+
+    #[test]
+    fn a_genesis_plus_gx_directory_names_no_sega_system() {
+        // Genesis Plus GX runs Game Gear as well as Mega Drive, so a Game Gear
+        // save in its folder (or under RetroArch's genesis folder beside it)
+        // is not a Mega Drive save. The arcade filed Defenders of Oasis that way.
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["saves/Genesis Plus GX", "saves/genesis/Genesis Plus GX"] {
+            let save = write_save(
+                &tmp.path().join(dir),
+                "Defenders of Oasis (USA, Europe).srm",
+                65536,
+            );
+            assert_eq!(super::classify_supported_save(&save, None), None, "{dir}");
+            assert_eq!(
+                super::classify_save_in_shared_core_as(&save, "game-gear").map(|c| c.system_slug),
+                Some("game-gear".to_string())
+            );
+            assert_eq!(
+                super::classify_save_in_shared_core_as(&save, "genesis").map(|c| c.system_slug),
+                Some("genesis".to_string())
+            );
+            assert_eq!(super::classify_save_in_shared_core_as(&save, "snes"), None);
+        }
+        let pico = write_save(&tmp.path().join("saves/PicoDrive"), "Doom.srm", 8192);
+        assert_eq!(super::classify_supported_save(&pico, None), None);
+    }
+
+    #[test]
+    fn a_rom_still_names_the_system_of_a_genesis_plus_gx_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/Genesis Plus GX");
+        let gg = write_save(&dir, "Defenders of Oasis (USA, Europe).srm", 65536);
+        let gg_rom = tmp
+            .path()
+            .join("roms/gamegear/Defenders of Oasis (USA, Europe).gg");
+        assert_eq!(
+            super::classify_supported_save(&gg, Some(&gg_rom)).map(|c| c.system_slug),
+            Some("game-gear".to_string())
+        );
+        let md = write_save(&dir, "Phantasy Star IV (USA).srm", 8192);
+        let md_rom = tmp.path().join("roms/genesis/Phantasy Star IV (USA).md");
+        assert_eq!(
+            super::classify_supported_save(&md, Some(&md_rom)).map(|c| c.system_slug),
+            Some("genesis".to_string())
+        );
+    }
+
+    #[test]
+    fn a_plain_genesis_folder_still_names_genesis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(&tmp.path().join("saves/genesis"), "Sonic 3.srm", 8192);
+        assert_eq!(
+            super::classify_supported_save(&save, None).map(|c| c.system_slug),
+            Some("genesis".to_string())
         );
     }
 
