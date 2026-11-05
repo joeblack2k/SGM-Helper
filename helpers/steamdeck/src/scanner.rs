@@ -85,6 +85,7 @@ pub const SCANNER_SYSTEM_SLUGS: &[&str] = &[
     "gba",
     "n64",
     "nds",
+    "3ds",
     "genesis",
     "master-system",
     "game-gear",
@@ -101,8 +102,6 @@ pub const SCANNER_SYSTEM_SLUGS: &[&str] = &[
     "ps3",
     "ps4",
     "ps5",
-    // Not "3ds": it has an extension arm but no size arm in
-    // is_plausible_save_for_system, so no 3DS save is ever accepted.
 ];
 
 const ROM_EXTENSIONS: &[&str] = &[
@@ -1723,6 +1722,9 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "ps2" => (8 * 1024 * 1024..=128 * 1024 * 1024).contains(&size) && size.is_multiple_of(512),
         "psp" | "psvita" | "ps3" => (1024..=67_108_864).contains(&size),
         "ps4" | "ps5" => (1024..=268_435_456).contains(&size),
+        // Azahar/Citra keep per-title save data in power-of-two images, as
+        // DS cartridges do; without a size arm no 3DS save is accepted.
+        "3ds" => size.is_power_of_two() && (512..=16_777_216).contains(&size),
         _ => false,
     }
 }
@@ -2915,22 +2917,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_3ds_save_of_a_power_of_two_size_is_accepted() {
+        assert!(is_plausible_save_for_system("bin", 524_288, "3ds"));
+        assert!(is_plausible_save_for_system("sav", 131_072, "3ds"));
+        assert!(!is_plausible_save_for_system("bin", 100_000, "3ds"));
+        assert!(!is_plausible_save_for_system("srm", 524_288, "3ds"));
+    }
+
+    #[test]
     fn every_scanner_slug_is_a_known_system() {
-        // Each listed slug has an arm in is_plausible_save_for_system, so a
-        // slug listed without an arm fails here.
+        // Each listed slug must accept one realistic save: an extension its own
+        // arm names, at a size real saves of that system have. A slug with an
+        // extension arm and no size arm (as 3ds had) fails here, which a check
+        // over any extension and any size let through.
+        let sample = |slug: &str| -> (&'static str, u64) {
+            match slug {
+                "nes" | "snes" | "gameboy" | "gba" => ("srm", 8192),
+                "n64" => ("eep", 512),
+                "nds" => ("sav", 524_288),
+                "3ds" => ("bin", 524_288),
+                "genesis" | "master-system" | "game-gear" | "sega-cd" | "sega-32x" => ("srm", 8192),
+                "saturn" => ("bkr", SATURN_INTERNAL_RAW_SIZE as u64),
+                "dreamcast" => ("bin", DC_VMU_SIZE as u64),
+                "neogeo" => ("srm", 65536),
+                "wii" => ("bin", (WII_DATA_BIN_FILE_HEADER_OFFSET + 0x1000) as u64),
+                "psx" => ("mcr", PS1_MEMCARD_SIZE as u64),
+                "ps2" => ("ps2", 8 * 1024 * 1024),
+                "psp" | "psvita" | "ps3" | "ps4" | "ps5" => ("sav", 65536),
+                other => panic!("{other} has no sample save; add one"),
+            }
+        };
         for slug in SCANNER_SYSTEM_SLUGS {
-            let any_ext = [
-                "sav", "srm", "eep", "bin", "dsv", "mcr", "ps2", "vms", "dat",
-            ];
-            let any_size = [512u64, 2048, 8192, 32768, 131072, 8 * 1024 * 1024];
-            let accepted = any_ext.iter().any(|ext| {
-                any_size
-                    .iter()
-                    .any(|size| is_plausible_save_for_system(ext, *size, slug))
-            });
+            let (ext, size) = sample(slug);
             assert!(
-                accepted,
-                "{slug} is listed but the scanner never accepts a save for it"
+                is_plausible_save_for_system(ext, size, slug),
+                "{slug} rejects a {size}-byte .{ext} save"
             );
         }
     }
