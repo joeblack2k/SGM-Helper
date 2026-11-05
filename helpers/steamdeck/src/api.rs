@@ -73,6 +73,11 @@ pub struct LatestSaveResponse {
     pub sha256: Option<String>,
     pub version: Option<i64>,
     pub id: Option<String>,
+    /// The card the server holds the logical save on, when it reports one.
+    /// A server re-home leaves this different from the card being offered
+    /// while the bytes are unchanged, which local state cannot show.
+    #[serde(default, rename = "cardSlot")]
+    pub card_slot: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +114,9 @@ pub struct RomRecord {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadSaveResponse {
     pub save: Option<UploadedSave>,
+    /// The server already held these bytes and stored nothing new.
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,6 +238,9 @@ pub struct UploadedSave {
     pub id: Option<String>,
     pub sha256: Option<String>,
     pub version: Option<i64>,
+    /// Set from the response's top-level `duplicate`, not from the save body.
+    #[serde(skip)]
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -604,6 +615,7 @@ impl ApiClient {
         wii_title_id: Option<&str>,
         runtime_target: Option<&RuntimeTarget>,
         port_metadata: Option<&PortUploadMetadata>,
+        psp_save_dir: Option<&str>,
     ) -> Result<UploadSaveResponse> {
         let url = self.url("/saves");
         let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(filename.to_string());
@@ -637,6 +649,13 @@ impl ApiClient {
         }
         if let Some(runtime_target) = runtime_target {
             form = runtime_target.apply_multipart_form(form);
+        }
+        // A PPSSPP SAVEDATA bundle names the folder it restores into; the
+        // server keeps it with the record so any device can put it back.
+        if let Some(psp_save_dir) = psp_save_dir
+            && !psp_save_dir.trim().is_empty()
+        {
+            form = form.text("pspSaveDir", psp_save_dir.trim().to_string());
         }
         if let Some(port) = port_metadata {
             form = form

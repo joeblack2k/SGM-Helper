@@ -17,7 +17,7 @@ use crate::api::ApiClient;
 use crate::config::AppConfig;
 use crate::sources::{SourceKind, load_source_store, resolved_sources_or_default};
 use crate::state::{AuthState, now_rfc3339};
-use crate::syncer::{SyncOptions, SyncReport, run_sync};
+use crate::syncer::{SyncOptions, SyncReport, dry_run_marker, run_sync};
 
 #[derive(Debug, Clone)]
 pub struct ServiceRunOptions {
@@ -159,9 +159,10 @@ pub fn run_service(
 
     while !stop_flag.load(Ordering::SeqCst) {
         if let Some(action) = pending_action.take() {
-            if !quiet {
-                println!("Service sync triggered: {}", action.reason);
-            }
+            // Always named: a pass every few seconds has to be traceable to
+            // the thing that asked for it, and --quiet is the normal service
+            // mode.
+            eprintln!("Service sync triggered: {}", action.reason);
 
             runtime.last_event = Some(action.reason.clone());
             runtime.last_sync_started_at = Some(now_rfc3339());
@@ -199,14 +200,22 @@ pub fn run_service(
                 Ok(report) => {
                     if !quiet {
                         println!(
-                            "Service sync complete: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} errors={}",
+                            "Service sync complete{}: scanned={} uploaded={} deduplicated={} accepted_not_stored={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} rejected_permanent={} refused_size_mismatch={} errors={} would_upload={} would_download={}",
+                            dry_run_marker(&report),
                             report.scanned,
                             report.uploaded,
+                            report.deduplicated,
+                            report.accepted_not_stored,
                             report.downloaded,
                             report.in_sync,
                             report.conflicts,
                             report.skipped,
-                            report.errors
+                            report.rejected_n64_controller_pak,
+                            report.rejected_permanent,
+                            report.refused_size_mismatch,
+                            report.errors,
+                            report.would_upload,
+                            report.would_download
                         );
                     }
                     if report.errors == 0 {
@@ -1111,6 +1120,7 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: tmp.path().to_path_buf(),
             config_path,
+            psp_savedata_bundles: false,
         };
         fs::create_dir_all(config.resolved_state_dir().unwrap()).unwrap();
 

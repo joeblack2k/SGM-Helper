@@ -73,6 +73,11 @@ pub struct LatestSaveResponse {
     pub sha256: Option<String>,
     pub version: Option<i64>,
     pub id: Option<String>,
+    /// The card the server holds the logical save on, when it reports one.
+    /// A server re-home leaves this different from the card being offered
+    /// while the bytes are unchanged, which local state cannot show.
+    #[serde(default, rename = "cardSlot")]
+    pub card_slot: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +114,9 @@ pub struct RomRecord {
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadSaveResponse {
     pub save: Option<UploadedSave>,
+    /// The server already held these bytes and stored nothing new.
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,6 +238,9 @@ pub struct UploadedSave {
     pub id: Option<String>,
     pub sha256: Option<String>,
     pub version: Option<i64>,
+    /// Set from the response's top-level `duplicate`, not from the save body.
+    #[serde(skip)]
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
