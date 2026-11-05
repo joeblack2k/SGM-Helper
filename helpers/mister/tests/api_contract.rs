@@ -1281,6 +1281,21 @@ fn gb_rtc_harness(
     std::path::PathBuf,
     std::path::PathBuf,
 ) {
+    gb_rtc_harness_listing(local, "srm,rtc")
+}
+
+// `listing` names the tracks /saves returns, in order: "srm,rtc", "rtc,srm",
+// or "rtc" alone, which is how a server that groups both files under one
+// title lists them, its latest version being the clock.
+fn gb_rtc_harness_listing(
+    local: &[(&str, Vec<u8>)],
+    listing: &str,
+) -> (
+    MockServer,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let server = MockServer::start();
     server.mock(|when, then| {
         when.method(POST).path("/auth/token/app-password");
@@ -1310,7 +1325,20 @@ fn gb_rtc_harness(
         when.method(GET).path("/saves");
         then.status(200)
             .header("content-type", "application/json")
-            .body(r#"{"success":true,"total":2,"limit":100,"offset":0,"saves":[{"id":"save-srm","filename":"GOLD.srm","displayTitle":"Gold","systemSlug":"gameboy","sha256":"aaaa","version":1,"latestSizeBytes":32768},{"id":"save-rtc","filename":"GOLD.rtc","displayTitle":"Gold","systemSlug":"gameboy","sha256":"bbbb","version":1,"latestSizeBytes":8}]}"#);
+            .body({
+                let tracks: Vec<&str> = listing
+                    .split(',')
+                    .map(|track| match track {
+                        "srm" => r#"{"id":"save-srm","filename":"GOLD.srm","displayTitle":"Gold","systemSlug":"gameboy","sha256":"aaaa","version":1,"latestSizeBytes":32768}"#,
+                        _ => r#"{"id":"save-rtc","filename":"GOLD.rtc","displayTitle":"Gold","systemSlug":"gameboy","sha256":"bbbb","version":1,"latestSizeBytes":8}"#,
+                    })
+                    .collect();
+                format!(
+                    r#"{{"success":true,"total":{},"limit":100,"offset":0,"saves":[{}]}}"#,
+                    tracks.len(),
+                    tracks.join(",")
+                )
+            });
     });
     server.mock(|when, then| {
         when.method(GET)
@@ -1407,7 +1435,7 @@ fn a_device_with_neither_file_gets_the_sram_in_srm_and_the_clock_in_rtc() {
 }
 
 #[test]
-fn a_lone_srm_holding_the_clock_moves_to_rtc_and_the_sram_is_restored() {
+fn a_lone_srm_holding_the_clock_is_copied_to_rtc_and_the_sram_is_restored() {
     let clock = gb_clock();
     let (_server, _tmp, dir, config) = gb_rtc_harness(&[("GOLD.srm", clock.clone())]);
     let out = gb_rtc_sync(&config);
@@ -1420,6 +1448,48 @@ fn a_lone_srm_holding_the_clock_moves_to_rtc_and_the_sram_is_restored() {
         fs::read(dir.join("GOLD.srm")).unwrap().len(),
         32768,
         "the SRAM was not restored: {out}"
+    );
+}
+
+#[test]
+fn a_lone_srm_holding_the_clock_ends_with_the_sram_in_srm_whichever_record_comes_first() {
+    for listing in ["srm,rtc", "rtc,srm"] {
+        let clock = gb_clock();
+        let (_server, _tmp, dir, config) =
+            gb_rtc_harness_listing(&[("GOLD.srm", clock.clone())], listing);
+        let out = gb_rtc_sync(&config);
+        assert_eq!(
+            fs::read(dir.join("GOLD.srm")).ok(),
+            Some(gb_sram(0x5A)),
+            "{listing}: .srm does not hold the server's SRAM: {out}"
+        );
+        assert_eq!(
+            fs::read(dir.join("GOLD.rtc")).ok(),
+            Some(clock),
+            "{listing}: .rtc does not hold the device's clock: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_lone_srm_holding_the_clock_is_never_emptied_when_only_the_clock_is_listed() {
+    // The arcade: the only local file is an 8-byte `.srm`, and the server
+    // lists Gold as one track whose latest version is the clock, so no SRAM
+    // restore follows the heal. Moving the `.srm` to `.rtc` left the device
+    // with no `.srm` at all.
+    let clock = gb_clock();
+    let (_server, _tmp, dir, config) =
+        gb_rtc_harness_listing(&[("GOLD.srm", clock.clone())], "rtc");
+    let out = gb_rtc_sync(&config);
+    assert_eq!(
+        fs::read(dir.join("GOLD.srm")).ok(),
+        Some(clock.clone()),
+        ".srm was moved away with nothing restored in its place: {out}"
+    );
+    assert_eq!(
+        fs::read(dir.join("GOLD.rtc")).ok(),
+        Some(clock),
+        ".rtc does not hold the device's clock: {out}"
     );
 }
 
@@ -1454,7 +1524,7 @@ fn a_correct_srm_and_rtc_pair_is_left_alone() {
 }
 
 #[test]
-fn a_lone_rtc_holding_the_sram_moves_to_srm_and_the_clock_is_restored() {
+fn a_lone_rtc_holding_the_sram_is_copied_to_srm_and_the_clock_is_restored() {
     let sram = gb_sram(0x77);
     let (_server, _tmp, dir, config) = gb_rtc_harness(&[("GOLD.rtc", sram.clone())]);
     let out = gb_rtc_sync(&config);

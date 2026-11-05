@@ -1153,19 +1153,22 @@ fn heal_gameboy_rtc_srm_swap(target: &Path) {
                 .and_then(|_| fs::rename(&swap, &rtc))
                 .is_ok()
         }
-        (true, false) if rtc_len.is_none() => fs::rename(&srm, &rtc).is_ok(),
-        (false, true) if srm_len.is_none() => fs::rename(&rtc, &srm).is_ok(),
+        // One file, in the wrong slot: copy it into the empty one and leave
+        // the original where it is. The other record's restore overwrites it;
+        // if that restore never runs, the device still has its only copy.
+        (true, false) if rtc_len.is_none() => fs::copy(&srm, &rtc).is_ok(),
+        (false, true) if srm_len.is_none() => fs::copy(&rtc, &srm).is_ok(),
         _ => return,
     };
     if moved {
         eprintln!(
-            "Moved {} and {} to the extensions their content belongs to: SRAM in .srm, the clock in .rtc",
+            "Healed {} and {}: SRAM belongs in .srm, the clock in .rtc",
             srm.display(),
             rtc.display()
         );
     } else {
         eprintln!(
-            "Could not move {} and {} to the extensions their content belongs to; check {} for the SRAM if .srm is missing",
+            "Could not heal {} and {} (SRAM belongs in .srm, the clock in .rtc); check {} for the SRAM if .srm is missing",
             srm.display(),
             rtc.display(),
             srm.with_extension("srm-rtc-swap").display()
