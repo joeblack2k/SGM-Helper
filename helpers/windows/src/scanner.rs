@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "cpk", "dsv", "gme", "mcr",
-    "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr",
+    "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr", "brm",
 ];
 
 const MAX_SAVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -234,6 +234,379 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+/// The directory names PPSSPP keeps game saves under: its own `SAVEDATA`, and
+/// `PPSSPP-SA`, the folder RetroDECK links `SAVEDATA` to.
+const PSP_SAVEDATA_PARENTS: &[&str] = &["SAVEDATA", "PPSSPP-SA"];
+
+/// Where PPSSPP's SAVEDATA sits below a directory a source names: RetroDECK's
+/// saves root, PPSSPP's own memory stick, and a memory stick root.
+pub const PSP_SAVEDATA_SUBPATHS: &[&str] =
+    &["PSP/PPSSPP-SA", "PSP/SAVEDATA", "memstick/PSP/SAVEDATA"];
+
+/// The largest PARAM.SFO the helper reads. PPSSPP writes about 5 KB; anything
+/// far larger is not a PARAM.SFO.
+const PSP_PARAM_SFO_MAX_BYTES: u64 = 1024 * 1024;
+
+/// DOS date for 1980-01-01, the earliest a zip can name: day 1, month 1, year 0.
+const ZIP_FIXED_DOS_DATE: u16 = 0x0021;
+
+/// Pack a PPSSPP `SAVEDATA/<dir>/` folder into one payload, and its sha256.
+///
+/// The helper decides "in sync" by comparing this sha256 with the server's, so
+/// the bytes depend only on the files' names and contents: every regular file
+/// directly in the folder, sorted by name, stored without compression, under a
+/// fixed timestamp, with no extra fields and no comments. A subdirectory is not
+/// part of the save PPSSPP reads and is left out.
+pub fn pack_psp_savedata(dir: &Path) -> Result<(Vec<u8>, String)> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("kan PSP SAVEDATA map niet lezen: {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("kan PSP SAVEDATA map niet lezen: {}", dir.display()))?;
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = entry.file_name().into_string().map_err(|name| {
+            anyhow::anyhow!(
+                "PSP SAVEDATA bestand heeft geen UTF-8 naam: {:?} in {}",
+                name,
+                dir.display()
+            )
+        })?;
+        let bytes = fs::read(entry.path())
+            .with_context(|| format!("kan bestand niet lezen: {}", entry.path().display()))?;
+        entries.push((name, bytes));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let bytes = build_stored_zip(&entries)?;
+    let sha = sha256_bytes(&bytes);
+    Ok((bytes, sha))
+}
+
+/// A zip archive of `entries` in the order given: Stored, DOS time
+/// 1980-01-01 00:00, no extra fields, no comments, no zip64.
+pub fn build_stored_zip(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, bytes) in entries {
+        let name_len = u16::try_from(name.len())
+            .ok()
+            .context("zip entry naam is te lang")?;
+        let size = u32::try_from(bytes.len())
+            .ok()
+            .filter(|size| *size != u32::MAX)
+            .context("zip entry is te groot")?;
+        let offset = u32::try_from(out.len())
+            .ok()
+            .context("zip archief is te groot")?;
+        let crc = crc32(bytes);
+
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: Stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // time 00:00:00
+        out.extend_from_slice(&ZIP_FIXED_DOS_DATE.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&name_len.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(bytes);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&ZIP_FIXED_DOS_DATE.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&name_len.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
+        central.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let count = u16::try_from(entries.len())
+        .ok()
+        .context("te veel zip entries")?;
+    let central_offset = u32::try_from(out.len())
+        .ok()
+        .context("zip archief is te groot")?;
+    let central_len = u32::try_from(central.len())
+        .ok()
+        .context("zip archief is te groot")?;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&central_len.to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    Ok(out)
+}
+
+/// The entries of a SAVEDATA bundle, names exactly as stored. Only Stored
+/// entries are accepted, every offset is bounds-checked, and every entry's
+/// CRC must match: a payload that is not the bundle the helpers write is an
+/// error, never a partial restore.
+pub fn unpack_psp_savedata(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+        let end = at.checked_add(2)?;
+        bytes
+            .get(at..end)
+            .map(|raw| u16::from_le_bytes([raw[0], raw[1]]))
+    }
+    fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+        let end = at.checked_add(4)?;
+        bytes
+            .get(at..end)
+            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    const EOCD_LEN: usize = 22;
+    let earliest = bytes.len().saturating_sub(EOCD_LEN + u16::MAX as usize);
+    let eocd = (earliest..=bytes.len().saturating_sub(EOCD_LEN))
+        .rev()
+        .find(|at| u32_at(bytes, *at) == Some(0x0605_4b50))
+        .filter(|_| bytes.len() >= EOCD_LEN)
+        .context("PSP bundle is geen zip archief")?;
+    let count = u16_at(bytes, eocd + 10).context("PSP bundle zip is afgekapt")? as usize;
+    let mut cursor = u32_at(bytes, eocd + 16).context("PSP bundle zip is afgekapt")? as usize;
+
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if u32_at(bytes, cursor) != Some(0x0201_4b50) {
+            anyhow::bail!("PSP bundle zip heeft een ongeldige centrale directory");
+        }
+        let method = u16_at(bytes, cursor + 10).context("PSP bundle zip is afgekapt")?;
+        let crc = u32_at(bytes, cursor + 16).context("PSP bundle zip is afgekapt")?;
+        let size = u32_at(bytes, cursor + 20).context("PSP bundle zip is afgekapt")? as usize;
+        let name_len = u16_at(bytes, cursor + 28).context("PSP bundle zip is afgekapt")? as usize;
+        let extra_len = u16_at(bytes, cursor + 30).context("PSP bundle zip is afgekapt")? as usize;
+        let comment_len =
+            u16_at(bytes, cursor + 32).context("PSP bundle zip is afgekapt")? as usize;
+        let local = u32_at(bytes, cursor + 42).context("PSP bundle zip is afgekapt")? as usize;
+        let name_start = cursor + 46;
+        let name = bytes
+            .get(name_start..name_start + name_len)
+            .context("PSP bundle zip is afgekapt")?;
+        let name = String::from_utf8(name.to_vec())
+            .ok()
+            .context("PSP bundle zip entry heeft geen UTF-8 naam")?;
+        if method != 0 {
+            anyhow::bail!(
+                "PSP bundle entry {:?} is gecomprimeerd (methode {}); alleen Stored wordt gelezen",
+                name,
+                method
+            );
+        }
+        if u32_at(bytes, local) != Some(0x0403_4b50) {
+            anyhow::bail!("PSP bundle entry {:?} wijst naar geen lokale header", name);
+        }
+        let local_name_len =
+            u16_at(bytes, local + 26).context("PSP bundle zip is afgekapt")? as usize;
+        let local_extra_len =
+            u16_at(bytes, local + 28).context("PSP bundle zip is afgekapt")? as usize;
+        let data_start = local + 30 + local_name_len + local_extra_len;
+        let data = bytes
+            .get(
+                data_start
+                    ..data_start
+                        .checked_add(size)
+                        .context("PSP bundle zip is afgekapt")?,
+            )
+            .context("PSP bundle zip is afgekapt")?;
+        if crc32(data) != crc {
+            anyhow::bail!("PSP bundle entry {:?} heeft een ongeldige CRC", name);
+        }
+        entries.push((name, data.to_vec()));
+        cursor = name_start + name_len + extra_len + comment_len;
+    }
+    Ok(entries)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// The SAVEDATA_DIRECTORY a PARAM.SFO names: the folder PPSSPP reads the save from.
+pub fn read_param_sfo_savedir(path: &Path) -> Option<String> {
+    let len = fs::metadata(path).ok()?.len();
+    if len > PSP_PARAM_SFO_MAX_BYTES {
+        return None;
+    }
+    parse_param_sfo_savedir(&fs::read(path).ok()?)
+}
+
+/// Parse a PSF (`\0PSF`) table and return its SAVEDATA_DIRECTORY. Every offset
+/// comes from the file, so every one is checked before it is used.
+pub fn parse_param_sfo_savedir(bytes: &[u8]) -> Option<String> {
+    let u16_at = |at: usize| -> Option<u16> {
+        bytes
+            .get(at..at.checked_add(2)?)
+            .map(|raw| u16::from_le_bytes([raw[0], raw[1]]))
+    };
+    let u32_at = |at: usize| -> Option<usize> {
+        bytes
+            .get(at..at.checked_add(4)?)
+            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize)
+    };
+    if bytes.get(0..4)? != b"\0PSF" {
+        return None;
+    }
+    let key_table = u32_at(8)?;
+    let data_table = u32_at(12)?;
+    let count = u32_at(16)?;
+    for index in 0..count {
+        let entry = index.checked_mul(16)?.checked_add(20)?;
+        let key_offset = usize::from(u16_at(entry)?);
+        let format = u16_at(entry + 2)?;
+        let value_len = u32_at(entry + 4)?;
+        let data_offset = u32_at(entry + 12)?;
+
+        let key_start = key_table.checked_add(key_offset)?;
+        let key_bytes = bytes.get(key_start..)?;
+        let key_end = key_bytes.iter().position(|byte| *byte == 0)?;
+        if &key_bytes[..key_end] != b"SAVEDATA_DIRECTORY" {
+            continue;
+        }
+        // utf8 (NUL-terminated) or utf8-s; an integer is not a directory name.
+        if format != 0x0204 && format != 0x0004 {
+            return None;
+        }
+        let value_start = data_table.checked_add(data_offset)?;
+        let value = bytes.get(value_start..value_start.checked_add(value_len)?)?;
+        let value = value.split(|byte| *byte == 0).next().unwrap_or_default();
+        let value = std::str::from_utf8(value).ok()?.trim();
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    None
+}
+
+pub fn is_psp_savedata_parent(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            PSP_SAVEDATA_PARENTS
+                .iter()
+                .any(|parent| parent.eq_ignore_ascii_case(name))
+        })
+        .unwrap_or(false)
+}
+
+/// A folder is a PPSSPP save when it sits in SAVEDATA (or RetroDECK's
+/// PPSSPP-SA) and its PARAM.SFO names the folder itself.
+pub fn is_psp_savedata_dir(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !dir.parent().map(is_psp_savedata_parent).unwrap_or(false) {
+        return false;
+    }
+    let Ok(listing) = fs::read_dir(dir) else {
+        return false;
+    };
+    listing
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        })
+        .find(|entry| entry.file_name().eq_ignore_ascii_case("PARAM.SFO"))
+        .and_then(|entry| read_param_sfo_savedir(&entry.path()))
+        .map(|savedir| savedir == name)
+        .unwrap_or(false)
+}
+
+/// Every PPSSPP save folder under `roots`, once each. A root may be the
+/// SAVEDATA folder itself.
+pub fn discover_psp_savedata_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    discover_psp_savedata_dirs_in(roots, true)
+}
+
+fn discover_psp_savedata_dirs_in(roots: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        // A non-recursive source still sees the folders of a SAVEDATA root,
+        // and of the places PPSSPP keeps one under its own directory.
+        let mut starts = vec![root.clone()];
+        if !recursive {
+            starts.extend(
+                PSP_SAVEDATA_SUBPATHS
+                    .iter()
+                    .map(|subpath| root.join(subpath))
+                    .filter(|path| path.is_dir()),
+            );
+        }
+        for start in starts {
+            let walker = if recursive {
+                WalkDir::new(&start)
+            } else {
+                WalkDir::new(&start).max_depth(1)
+            };
+            let mut walk = walker.follow_links(false).into_iter();
+            while let Some(entry) = walk.next() {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                if !entry.file_type().is_dir() {
+                    continue;
+                }
+                if is_psp_savedata_dir(entry.path()) {
+                    dirs.push(entry.path().to_path_buf());
+                    walk.skip_current_dir();
+                }
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Single-file saves and PPSSPP save folders under `roots`. A file inside a
+/// save folder belongs to the folder and is not returned on its own: its data
+/// file alone names no folder, and a record of it restores nowhere.
+pub fn discover_save_files_and_psp_bundles(
+    roots: &[PathBuf],
+    recursive: bool,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let bundles = discover_psp_savedata_dirs_in(roots, recursive);
+    let files = discover_save_files(roots, recursive)?
+        .into_iter()
+        .filter(|path| !bundles.iter().any(|bundle| path.starts_with(bundle)))
+        .collect();
+    Ok((files, bundles))
 }
 
 pub fn filename_stem(path: &Path) -> String {
@@ -586,6 +959,18 @@ pub fn classify_supported_save(
         return None;
     }
 
+    // Decided by the format's own trailer, before any path rule: the file is
+    // every Sega CD game's save at once, so no ROM names it.
+    if save_ext == "brm" {
+        if is_sega_cd_shared_bram(save_path) {
+            return Some(SaveClassification {
+                system_slug: "sega-cd".to_string(),
+                evidence: format!("sega cd backup ram trailer + .brm ({} bytes)", save_size),
+            });
+        }
+        return None;
+    }
+
     if save_ext == "bin"
         && is_plausible_save_for_system(&save_ext, save_size, "wii")
         && inspect_wii_metadata(save_path).is_some()
@@ -617,7 +1002,18 @@ pub fn classify_supported_save(
     }
 
     let save_lower = save_path.to_string_lossy().to_ascii_lowercase();
-    if contains_any(&save_lower, &["gameboy advance", "/gba/", "\\gba\\"]) {
+    if contains_any(
+        &save_lower,
+        &[
+            "gameboy advance",
+            "game boy advance",
+            "mgba",
+            "visualboyadvance",
+            "vba",
+            "/gba/",
+            "\\gba\\",
+        ],
+    ) {
         if is_plausible_save_for_system(&save_ext, save_size, "gba") {
             return classify_if_valid(
                 save_path,
@@ -662,6 +1058,10 @@ pub fn classify_supported_save(
             "desmume",
             "ryujinx",
             "citra",
+            "n3ds",
+            "/3ds/",
+            "\\3ds\\",
+            "azahar",
             "yuzu",
             "suyu",
             "dolphin",
@@ -675,7 +1075,11 @@ pub fn classify_supported_save(
             "nintendo",
         ],
     ) {
-        let slug = infer_nintendo_slug(&save_lower);
+        let Some(slug) = infer_nintendo_slug(&save_lower) else {
+            // No core name matched: leave the save unclassified rather than
+            // labelling it Game Boy, which is a wrong answer rather than a missing one.
+            return None;
+        };
         if is_plausible_save_for_system(&save_ext, save_size, slug) {
             return classify_if_valid(
                 save_path,
@@ -692,19 +1096,24 @@ pub fn classify_supported_save(
         &save_lower,
         &[
             "master system",
+            "mastersystem",
             "/sms/",
             "\\sms\\",
             "game gear",
+            "gamegear",
             "/gg/",
             "\\gg\\",
             "sega 32x",
             "sega-32x",
             "sega32x",
+            "sega32xjp",
+            "sega32xna",
             "/32x/",
             "\\32x\\",
             "mega cd",
             "mega-cd",
             "megacd",
+            "megacdjp",
             "sega cd",
             "sega-cd",
             "segacd",
@@ -719,11 +1128,13 @@ pub fn classify_supported_save(
             "genesis",
             "mega drive",
             "megadrive",
+            "megadrivejp",
             "/md/",
             "\\md\\",
             "/gen/",
             "\\gen\\",
             "saturn",
+            "saturnjp",
             "dreamcast",
             "sega",
         ],
@@ -754,6 +1165,54 @@ pub fn classify_supported_save(
                 save_size,
                 "neogeo",
                 format!("path hint neogeo + .{} ({} bytes)", save_ext, save_size),
+            );
+        }
+        return None;
+    }
+
+    if contains_any(
+        &save_lower,
+        &[
+            "pc engine",
+            "pcengine",
+            "pc-engine",
+            "pcenginecd",
+            "pc-engine-cd",
+            "turbografx",
+            "turbo grafx",
+            "turbo-grafx",
+            "tgfx16",
+            "/tg16/",
+            "\\tg16\\",
+            "/tg-cd/",
+            "\\tg-cd\\",
+            "/tg_cd/",
+            "\\tg_cd\\",
+            "supergrafx",
+            "super grafx",
+            "/sgx/",
+            "\\sgx\\",
+            "/pce/",
+            "\\pce\\",
+            "/pce-cd/",
+            "\\pce-cd\\",
+            "/pcecd/",
+            "\\pcecd\\",
+            "nec - pc engine",
+            "nec - turbografx",
+            "mednafen-pce",
+            "beetle pce",
+            "beetle-pce",
+        ],
+    ) {
+        let slug = infer_nec_slug(&save_lower);
+        if is_plausible_save_for_system(&save_ext, save_size, slug) {
+            return classify_if_valid(
+                save_path,
+                &save_ext,
+                save_size,
+                slug,
+                format!("path hint nec + .{} ({} bytes)", save_ext, save_size),
             );
         }
         return None;
@@ -907,32 +1366,69 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-fn infer_nintendo_slug(haystack: &str) -> &'static str {
+fn infer_nintendo_slug(haystack: &str) -> Option<&'static str> {
     if contains_any(
         haystack,
         &["nintendo wii", "/wii/", "\\wii\\", "dolphin", "rvl"],
     ) {
-        return "wii";
-    }
-    if contains_any(haystack, &["gameboy advance", "/gba/", "\\gba\\"]) {
-        return "gba";
-    }
-    if contains_any(haystack, &["nintendo ds", "/nds/", "\\nds\\"]) {
-        return "nds";
-    }
-    if contains_any(haystack, &["nintendo 64", "/n64/", "\\n64\\"]) {
-        return "n64";
+        return Some("wii");
     }
     if contains_any(
         haystack,
-        &["super nintendo", "/snes/", "\\snes\\", "/sfc/", "\\sfc\\"],
+        &[
+            "gameboy advance",
+            "game boy advance",
+            "mgba",
+            "visualboyadvance",
+            "vba",
+            "/gba/",
+            "\\gba\\",
+        ],
     ) {
-        return "snes";
+        return Some("gba");
     }
-    if contains_any(haystack, &["famicom", "/nes/", "\\nes\\"]) {
-        return "nes";
+    if contains_any(
+        haystack,
+        &["game boy", "gameboy", "/gb/", "\\gb\\", "/gbc/", "\\gbc\\"],
+    ) {
+        return Some("gameboy");
     }
-    "gameboy"
+    if contains_any(
+        haystack,
+        &["nintendo ds", "/nds/", "\\nds\\", "melonds", "desmume"],
+    ) {
+        return Some("nds");
+    }
+    if contains_any(
+        haystack,
+        &["nintendo 64", "/n64/", "\\n64\\", "mupen", "project64"],
+    ) {
+        return Some("n64");
+    }
+    if contains_any(
+        haystack,
+        &[
+            "super nintendo",
+            "/snes/",
+            "\\snes\\",
+            "/sfc/",
+            "\\sfc\\",
+            "snes9x",
+            "bsnes",
+        ],
+    ) {
+        return Some("snes");
+    }
+    if contains_any(
+        haystack,
+        &["famicom", "/nes/", "\\nes\\", "fceux", "fceumm", "nestopia"],
+    ) {
+        return Some("nes");
+    }
+    if contains_any(haystack, &["n3ds", "/3ds/", "\\3ds\\", "azahar", "citra"]) {
+        return Some("3ds");
+    }
+    None
 }
 
 fn infer_sega_slug(haystack: &str) -> &'static str {
@@ -953,10 +1449,13 @@ fn infer_sega_slug(haystack: &str) -> &'static str {
     ) {
         return "dreamcast";
     }
-    if contains_any(haystack, &["master system", "/sms/", "\\sms\\"]) {
+    if contains_any(
+        haystack,
+        &["master system", "mastersystem", "/sms/", "\\sms\\"],
+    ) {
         return "master-system";
     }
-    if contains_any(haystack, &["game gear", "/gg/", "\\gg\\"]) {
+    if contains_any(haystack, &["game gear", "gamegear", "/gg/", "\\gg\\"]) {
         return "game-gear";
     }
     if contains_any(
@@ -1003,6 +1502,14 @@ fn infer_sega_slug(haystack: &str) -> &'static str {
         return "sega-32x";
     }
     "genesis"
+}
+
+fn infer_nec_slug(_haystack: &str) -> &'static str {
+    // MiSTer's TurboGrafx-16 core handles both HuCard ROMs and CD-ROM games
+    // under one core (TGFX16). Saves land in /media/fat/saves/TGFX16/ for
+    // both. Future work could split tgfx16-cd if MiSTer's core ever
+    // splits, or if a downstream consumer wants the distinction.
+    "tgfx16"
 }
 
 fn infer_sony_slug(haystack: &str) -> &'static str {
@@ -1086,6 +1593,21 @@ fn system_slug_from_save_extension(ext: &str) -> Option<&'static str> {
     }
 }
 
+/// Save formats that travel with a primary save rather than standing alone.
+///
+/// An RTC clock, a controller pak and a controller pak's copy are three
+/// different things, and none of them is the cartridge's save: an `.rtc` is
+/// seconds of wall-clock state (Pokemon Crystal/Gold/Silver), an `.mpk`/`.cpk`
+/// is a controller pak (N64). Restoring one onto a primary target overwrites a
+/// real save with a few bytes of something else.
+/// Extensible later (e.g. Dreamcast VMU); these three are the in-scope set.
+pub const SIDECAR_FORMATS: [&str; 3] = ["rtc", "mpk", "cpk"];
+
+/// Whether a bare lowercased extension is a sidecar format.
+pub fn is_sidecar(ext: &str) -> bool {
+    SIDECAR_FORMATS.contains(&ext)
+}
+
 fn is_plausible_save_size(size: u64) -> bool {
     size > 0 && size <= MAX_SAVE_BYTES
 }
@@ -1102,6 +1624,9 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "gba" => matches!(ext, "sav" | "srm" | "sa1"),
         "n64" => matches!(ext, "eep" | "fla" | "sra" | "mpk" | "cpk" | "srm"),
         "nds" => matches!(ext, "sav" | "dsv"),
+        // Azahar/Citra store per-title save data under nand/ and sdmc/; the
+        // extension set is unverified against a device listing.
+        "3ds" => matches!(ext, "sav" | "dsv" | "dat" | "bin"),
         "genesis" => matches!(ext, "sav" | "srm" | "ram"),
         "master-system" | "game-gear" | "sega-cd" | "sega-32x" => {
             matches!(ext, "sav" | "srm" | "ram")
@@ -1109,6 +1634,7 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "saturn" => matches!(ext, "sav" | "srm" | "ram" | "bkr"),
         "dreamcast" => matches!(ext, "bin" | "vms" | "dci"),
         "neogeo" => matches!(ext, "sav" | "srm" | "ram"),
+        "tgfx16" => matches!(ext, "sav" | "srm" | "ram" | "bkr" | "brm"),
         "wii" => ext == "bin",
         "psx" => matches!(
             ext,
@@ -1131,10 +1657,18 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             size,
             512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072
         ),
-        "gameboy" => matches!(
-            size,
-            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536
-        ),
+        "gameboy" => match ext {
+            // .rtc carries the GBC real-time clock state (Pokemon
+            // Crystal/Gold/Silver, Harvest Moon GBC). It's structurally
+            // different from SRAM — typically 8 bytes (MiSTer Gameboy_MiSTer
+            // canonical layout) up to ~64 bytes for variants with extra
+            // metadata. Don't apply the SRAM size profile to it.
+            "rtc" => (1..=64).contains(&size),
+            _ => matches!(
+                size,
+                512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 | 65536
+            ),
+        },
         "gba" => matches!(size, 512 | 8192 | 32768 | 65536 | 131072),
         "n64" => match ext {
             "eep" => size == 512 || size == 2048,
@@ -1178,6 +1712,13 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             // around the 64 KiB payload, so 0x12000 is valid even though it is not
             // a power-of-two size.
             size == 0x12000 || (size.is_power_of_two() && (512..=2_097_152).contains(&size))
+        }
+        "tgfx16" => {
+            // TurboGrafx-16 / PC Engine HuCard battery saves are typically 2KB SRAM.
+            // PCE CD / TGFX-CD adds backup RAM (BRAM) — 2KB stock, 8KB extended,
+            // or up to 32KB on some accessories. Accept the common power-of-two
+            // sizes in that range.
+            matches!(size, 2048 | 4096 | 8192 | 16384 | 32768)
         }
         "wii" => (WII_DATA_BIN_FILE_HEADER_OFFSET + 0x80..=MAX_SAVE_BYTES as usize)
             .contains(&(size as usize)),
@@ -1328,6 +1869,37 @@ fn looks_like_wii_data_bin_path(path: &Path) -> bool {
         .map(|value| value.eq_ignore_ascii_case("data.bin"))
         .unwrap_or(false)
         && wii_title_code_from_path(path).is_some()
+}
+
+/// Genesis Plus GX's Sega CD backup RAM, internal (`scd_U.brm`, 8 KiB) or RAM
+/// cart (`cart.brm`, 512 KiB): it ends with the format's trailer, and a blank,
+/// freshly formatted one is all zero before its last 64 bytes.
+pub fn is_sega_cd_shared_bram(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    sega_cd_bram_has_saves(&bytes)
+}
+
+fn sega_cd_bram_has_saves(bytes: &[u8]) -> bool {
+    const TRAILER: usize = 0x40;
+    if !matches!(bytes.len(), 8192 | 524_288) {
+        return false;
+    }
+    let trailer = &bytes[bytes.len() - TRAILER..];
+    if &trailer[0x20..0x2B] != b"SEGA_CD_ROM" || &trailer[0x30..0x3D] != b"RAM_CARTRIDGE" {
+        return false;
+    }
+    bytes[..bytes.len() - TRAILER]
+        .iter()
+        .any(|value| *value != 0)
+}
+
+/// The line key a shared Sega CD backup RAM syncs under: one per device kind and
+/// file, since the file is the device's whole Sega CD save store.
+pub fn sega_cd_bram_line_key(device_type: &str, save_path: &Path) -> Option<String> {
+    let stem = save_path.file_stem()?.to_str()?.to_ascii_lowercase();
+    Some(format!("segacd-bram:{}:{}", device_type, stem))
 }
 
 fn validate_non_blank_payload(path: &Path) -> bool {
@@ -1723,7 +2295,7 @@ fn inspect_dreamcast_vmu_image(bytes: &[u8]) -> Option<DreamcastMetadata> {
         if end > bytes.len() {
             return None;
         }
-        for chunk in bytes[start..end].chunks_exact(DC_DIR_ENTRY_SIZE) {
+        for chunk in bytes[start..end].as_chunks::<DC_DIR_ENTRY_SIZE>().0 {
             let entry = parse_dreamcast_dir_entry(chunk)?;
             if entry.file_type != DC_FILETYPE_DATA && entry.file_type != DC_FILETYPE_GAME {
                 continue;
@@ -1783,7 +2355,10 @@ fn inspect_dreamcast_dci_payload(bytes: &[u8]) -> Option<DreamcastMetadata> {
         return None;
     }
     let mut file_bytes = Vec::with_capacity(file_blocks * DC_BLOCK_SIZE);
-    for block in bytes[DC_DCI_HEADER_SIZE..expected_len].chunks_exact(DC_BLOCK_SIZE) {
+    for block in bytes[DC_DCI_HEADER_SIZE..expected_len]
+        .as_chunks::<DC_BLOCK_SIZE>()
+        .0
+    {
         file_bytes.extend_from_slice(&dreamcast_unswap_32bit_chunks(block));
     }
 
@@ -1966,7 +2541,7 @@ fn parse_dreamcast_pkg_header(bytes: &[u8]) -> Option<DreamcastPkgHeader> {
 
 fn dreamcast_unswap_32bit_chunks(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    for chunk in out.chunks_exact_mut(4) {
+    for chunk in out.as_chunks_mut::<4>().0 {
         chunk.reverse();
     }
     out
@@ -2026,10 +2601,14 @@ fn validate_ps1_raw_memcard(bytes: &[u8]) -> bool {
         }
     }
 
-    let trailing_start = 63 * PS1_FRAME_SIZE;
-    let trailing_end = trailing_start + PS1_FRAME_SIZE;
-    let trailing = &header[trailing_start..trailing_end];
-    trailing.starts_with(b"MC") && frame_checksum_ok(trailing)
+    // Frame 63 ("write test sector") historically duplicates frame 0's MC magic
+    // on real-hardware-formatted cards. Many emulators (SwanStation / Beetle
+    // PSX / Duckstation libretro) do NOT populate it that way — they leave it
+    // zero-filled or write game data through it. Requiring "MC" here was
+    // rejecting every RetroArch/SwanStation memcard as if it were noise.
+    // Frame 0 magic + frames 1-15 checksums are sufficient evidence this is
+    // a real PS1 memcard.
+    true
 }
 
 fn frame_checksum_ok(frame: &[u8]) -> bool {
@@ -2215,8 +2794,72 @@ fn looks_plain_text(path: &Path) -> bool {
     printable.saturating_mul(100) >= bytes.len().saturating_mul(95)
 }
 
+/// A PARAM.SFO the way PPSSPP writes one: the PSF header, an index entry
+/// per key, a key table and a data table. Only the two keys the helper
+/// reads; the real file also carries the title, detail and file list.
+#[cfg(test)]
+pub(crate) fn param_sfo_fixture(save_dir: &str) -> Vec<u8> {
+    let keys: &[(&str, &[u8], u32)] = &[
+        ("CATEGORY", b"MS\0", 4),
+        ("SAVEDATA_DIRECTORY", save_dir.as_bytes(), 64),
+    ];
+    let mut key_table = Vec::new();
+    let mut data_table = Vec::new();
+    let mut index = Vec::new();
+    for (key, value, max_len) in keys {
+        let mut value = value.to_vec();
+        if !value.ends_with(&[0]) {
+            value.push(0);
+        }
+        index.extend_from_slice(&(key_table.len() as u16).to_le_bytes());
+        index.extend_from_slice(&0x0204u16.to_le_bytes());
+        index.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        index.extend_from_slice(&max_len.to_le_bytes());
+        index.extend_from_slice(&(data_table.len() as u32).to_le_bytes());
+        key_table.extend_from_slice(key.as_bytes());
+        key_table.push(0);
+        value.resize(*max_len as usize, 0);
+        data_table.extend_from_slice(&value);
+    }
+    while key_table.len() % 4 != 0 {
+        key_table.push(0);
+    }
+    let key_offset = 20 + index.len();
+    let data_offset = key_offset + key_table.len();
+    let mut out = b"\0PSF".to_vec();
+    out.extend_from_slice(&0x0101u32.to_le_bytes());
+    out.extend_from_slice(&(key_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(data_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    out.extend_from_slice(&index);
+    out.extend_from_slice(&key_table);
+    out.extend_from_slice(&data_table);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::infer_nintendo_slug;
+
+    #[test]
+    fn core_directory_names_resolve_to_their_system() {
+        // The directory list admits core names, so the classifier has to know them
+        // too, or a path the vocabulary misses is left unclassified.
+        // The caller lowercases the path before classifying.
+        assert_eq!(infer_nintendo_slug("/saves/snes9x"), Some("snes"));
+        assert_eq!(infer_nintendo_slug("/saves/bsnes"), Some("snes"));
+        assert_eq!(infer_nintendo_slug("/saves/fceumm"), Some("nes"));
+        assert_eq!(infer_nintendo_slug("/saves/mgba"), Some("gba"));
+        assert_eq!(infer_nintendo_slug("/saves/desmume"), Some("nds"));
+        assert_eq!(
+            infer_nintendo_slug("/saves/mupen64plus-next opengl"),
+            Some("n64")
+        );
+        assert_eq!(
+            infer_nintendo_slug("/saves/gb/pokemon.sav"),
+            Some("gameboy")
+        );
+    }
     use super::*;
     use std::fs;
     use std::io::Write;
@@ -2473,6 +3116,74 @@ mod tests {
         fs::write(&save, [0x00u8; 1024]).unwrap();
 
         assert!(infer_supported_console_slug(&save, None).is_none());
+    }
+
+    #[test]
+    fn game_boy_path_hints_classify_as_gameboy() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in ["saves/Game Boy", "saves/gb", "saves/Game Boy Color"] {
+            let save = tmp.path().join(hint).join("Pokemon Red.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert_eq!(
+                infer_supported_console_slug(&save, None).as_deref(),
+                Some("gameboy"),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn game_boy_advance_path_hints_classify_as_gba() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in [
+            "saves/Game Boy Advance",
+            "saves/gba",
+            "saves/VisualBoyAdvance",
+        ] {
+            let save = tmp.path().join(hint).join("Metroid Fusion.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert_eq!(
+                infer_supported_console_slug(&save, None).as_deref(),
+                Some("gba"),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn nintendo_hint_without_a_known_system_is_unclassified() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hint in ["saves/Nintendo", "saves/ryujinx"] {
+            let save = tmp.path().join(hint).join("Pokemon.sav");
+            fs::create_dir_all(save.parent().unwrap()).unwrap();
+            fs::write(&save, [0x00u8; 32768]).unwrap();
+
+            assert!(
+                infer_supported_console_slug(&save, None).is_none(),
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn azahar_and_n3ds_paths_resolve_to_the_3ds_slug() {
+        assert_eq!(
+            infer_nintendo_slug("/saves/n3ds/azahar/nand/title/00040000"),
+            Some("3ds")
+        );
+        assert_eq!(
+            infer_nintendo_slug("/saves/n3ds/azahar/sdmc/Nintendo 3DS"),
+            Some("3ds")
+        );
+        assert_eq!(infer_nintendo_slug("/saves/3ds/citra"), Some("3ds"));
+        assert_eq!(
+            infer_nintendo_slug("/saves/gb/pokemon.sav"),
+            Some("gameboy")
+        );
     }
 
     #[test]
@@ -2800,5 +3511,326 @@ mod tests {
 
     fn write_be_u32(payload: &mut [u8], offset: usize, value: u32) {
         payload[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_psp_savedata(parent: &Path, save_dir: &str) -> PathBuf {
+        let dir = parent.join(save_dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut data = vec![0u8; 4096];
+        data[0] = 0xFF;
+        data[17] = 0x42;
+        fs::write(dir.join("DISSIDIA.BIN"), &data).unwrap();
+        fs::write(dir.join("ICON0.PNG"), b"\x89PNG\r\n\x1a\nicon").unwrap();
+        fs::write(dir.join("PARAM.SFO"), param_sfo_fixture(save_dir)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn param_sfo_names_its_savedata_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("PARAM.SFO");
+        fs::write(&path, param_sfo_fixture("ULUS10437GameData00")).unwrap();
+        assert_eq!(
+            read_param_sfo_savedir(&path).as_deref(),
+            Some("ULUS10437GameData00")
+        );
+
+        // Every offset is read from the file, so every one is checked: a
+        // truncated or foreign file answers None rather than panicking.
+        let whole = param_sfo_fixture("ULUS10437GameData00");
+        for cut in 0..whole.len() {
+            let _ = parse_param_sfo_savedir(&whole[..cut]);
+        }
+        assert_eq!(parse_param_sfo_savedir(&whole[..whole.len() - 70]), None);
+        assert_eq!(parse_param_sfo_savedir(b"not a psf at all"), None);
+        let mut bad_offset = whole.clone();
+        bad_offset[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_param_sfo_savedir(&bad_offset), None);
+    }
+
+    #[test]
+    fn a_psp_savedata_bundle_is_byte_identical_across_runs_and_mtimes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = write_psp_savedata(&tmp.path().join("PSP/SAVEDATA"), "ULUS10437GameData00");
+        // A subdirectory is not part of the save PPSSPP reads.
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("nested/stray.bin"), b"stray").unwrap();
+
+        let (first, first_sha) = pack_psp_savedata(&dir).unwrap();
+        let (second, second_sha) = pack_psp_savedata(&dir).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first_sha, second_sha);
+        assert_eq!(first_sha, sha256_bytes(&first));
+
+        // "In sync" is a sha comparison with the server, so touching a file
+        // must not change the bundle.
+        for name in ["DISSIDIA.BIN", "ICON0.PNG", "PARAM.SFO"] {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap();
+            file.set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            )
+            .unwrap();
+        }
+        let (third, third_sha) = pack_psp_savedata(&dir).unwrap();
+        assert_eq!(first, third);
+        assert_eq!(first_sha, third_sha);
+
+        let entries = unpack_psp_savedata(&first).unwrap();
+        let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["DISSIDIA.BIN", "ICON0.PNG", "PARAM.SFO"]);
+        assert_eq!(entries[0].1, fs::read(dir.join("DISSIDIA.BIN")).unwrap());
+        // Stored, DOS time 1980-01-01 00:00 (date 0x0021, time 0).
+        assert_eq!(&first[0..4], b"PK\x03\x04");
+        assert_eq!(
+            u16::from_le_bytes([first[8], first[9]]),
+            0,
+            "method must be Stored"
+        );
+        assert_eq!(u16::from_le_bytes([first[10], first[11]]), 0);
+        assert_eq!(u16::from_le_bytes([first[12], first[13]]), 0x0021);
+    }
+
+    #[test]
+    fn a_psp_savedata_folder_is_one_bundle_and_its_bin_is_not_a_loose_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saves = tmp.path().join("saves");
+        let bundle = write_psp_savedata(&saves.join("PSP/PPSSPP-SA"), "ULUS10437GameData00");
+        // A folder whose PARAM.SFO names another directory is not PPSSPP's save.
+        let renamed = write_psp_savedata(&saves.join("PSP/SAVEDATA"), "ULUS10437GameData01");
+        fs::write(
+            renamed.join("PARAM.SFO"),
+            param_sfo_fixture("SOMETHINGELSE"),
+        )
+        .unwrap();
+        // Not under SAVEDATA / PPSSPP-SA: an ordinary directory.
+        write_psp_savedata(&saves.join("psp"), "ULUS10437GameData02");
+        fs::create_dir_all(saves.join("snes")).unwrap();
+        fs::write(saves.join("snes/mario.srm"), vec![0x11u8; 8192]).unwrap();
+
+        let roots = vec![saves.clone()];
+        assert_eq!(discover_psp_savedata_dirs(&roots), vec![bundle.clone()]);
+
+        // A source whose root is the SAVEDATA folder itself (the cabinet's
+        // PPSSPP source) still finds the folder.
+        assert_eq!(
+            discover_psp_savedata_dirs(&[saves.join("PSP/PPSSPP-SA")]),
+            vec![bundle.clone()]
+        );
+
+        let (files, bundles) = discover_save_files_and_psp_bundles(&roots, true).unwrap();
+        assert_eq!(bundles, vec![bundle.clone()]);
+        assert!(
+            !files.iter().any(|path| path.starts_with(&bundle)),
+            "the bundle's own files were discovered as loose saves: {files:?}"
+        );
+        assert!(files.contains(&saves.join("snes/mario.srm")));
+        assert!(files.contains(&renamed.join("DISSIDIA.BIN")));
+    }
+
+    #[test]
+    fn a_ppsspp_root_finds_its_memstick_savedata_even_without_recursion() {
+        // A portable PPSSPP keeps saves at memstick/PSP/SAVEDATA under its own
+        // directory; a source naming that directory finds them either way.
+        let tmp = tempfile::tempdir().unwrap();
+        let ppsspp = tmp.path().join("ppsspp_win");
+        let bundle =
+            write_psp_savedata(&ppsspp.join("memstick/PSP/SAVEDATA"), "ULUS10437GameData00");
+        for recursive in [true, false] {
+            let (files, bundles) =
+                discover_save_files_and_psp_bundles(std::slice::from_ref(&ppsspp), recursive)
+                    .unwrap();
+            assert_eq!(bundles, vec![bundle.clone()], "recursive={recursive}");
+            assert!(!files.iter().any(|path| path.starts_with(&bundle)));
+        }
+    }
+
+    #[test]
+    fn ps1_memcard_accepted_when_trailing_frame_lacks_mc_magic() {
+        // Build a valid memcard, then overwrite frame 63 with the "looks like
+        // game data continuation" bytes seen in real SwanStation/RetroArch
+        // memcards (e.g. Tom Clancy's Rainbow Six - Lone Wolf saved on Steam
+        // Deck). Frame 63 historically held the "write test sector" with MC
+        // magic; emulators don't always honor that — they leave it zeroed
+        // OR write actual game state through it. The validator must accept
+        // these. Issue #N (filed alongside this commit).
+        let mut bytes = build_valid_ps1_memcard();
+        let trailing_start = 63 * PS1_FRAME_SIZE;
+        // Wipe to zero, then write the observed bytes from the real-world
+        // SwanStation Rainbow Six memcard at this offset.
+        for b in bytes[trailing_start..trailing_start + PS1_FRAME_SIZE].iter_mut() {
+            *b = 0;
+        }
+        bytes[trailing_start..trailing_start + 8]
+            .copy_from_slice(&[0x03, 0x00, 0x00, 0x00, 0x80, 0x0C, 0x5A, 0x27]);
+        assert!(
+            validate_ps1_raw_memcard(&bytes),
+            "memcard with non-MC trailing frame should be accepted"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_accepted_when_trailing_frame_is_zero_filled() {
+        // Another common emulator pattern: leave frame 63 entirely zeroed.
+        let mut bytes = build_valid_ps1_memcard();
+        let trailing_start = 63 * PS1_FRAME_SIZE;
+        for b in bytes[trailing_start..trailing_start + PS1_FRAME_SIZE].iter_mut() {
+            *b = 0;
+        }
+        assert!(
+            validate_ps1_raw_memcard(&bytes),
+            "memcard with zero-filled trailing frame should be accepted"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_still_rejected_when_size_wrong() {
+        let bytes = vec![0u8; PS1_MEMCARD_SIZE - 1];
+        assert!(
+            !validate_ps1_raw_memcard(&bytes),
+            "memcard with wrong size must still be rejected"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_still_rejected_when_frame0_magic_absent() {
+        let mut bytes = build_valid_ps1_memcard();
+        bytes[0] = b'X';
+        bytes[1] = b'Y';
+        assert!(
+            !validate_ps1_raw_memcard(&bytes),
+            "memcard without MC magic at frame 0 must still be rejected"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_still_rejected_when_directory_frame_checksum_broken() {
+        let mut bytes = build_valid_ps1_memcard();
+        // Corrupt directory frame 3 (intentionally NOT touching frame 0 or
+        // the trailing frame — proves we still require directory frames to
+        // be well-formed even though we relaxed the trailing check).
+        let frame3_start = 3 * PS1_FRAME_SIZE;
+        let checksum_byte_index = frame3_start + PS1_FRAME_SIZE - 1;
+        bytes[checksum_byte_index] = bytes[checksum_byte_index].wrapping_add(1);
+        assert!(
+            !validate_ps1_raw_memcard(&bytes),
+            "memcard with broken directory frame checksum must still be rejected"
+        );
+    }
+
+    #[test]
+    fn ps1_memcard_regression_strict_format_still_accepted() {
+        // Regression guard: the original strict-format memcard (with MC at
+        // frame 63) must continue to pass — we only RELAXED the trailing
+        // check, not removed support for it.
+        let bytes = build_valid_ps1_memcard();
+        assert!(
+            validate_ps1_raw_memcard(&bytes),
+            "strict-format memcard with MC at trailing frame should still be accepted"
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_retrodeck_sega_single_word_dirs() {
+        // RetroDECK uses single-word lowercase directory names (gamegear,
+        // mastersystem, megadrive). The Sega classifier historically had
+        // some of these (megadrive, megacd, sega32x) but was missing
+        // gamegear and mastersystem. Issue #5 (filed alongside this commit).
+        // Tests cover both the fix and the previously-broken paths.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Build a 64K non-printable SRAM payload (battery save shape). 0xA5
+        // is binary-looking — using a printable byte like 0x42 ('B') would
+        // trip looks_plain_text() and bail at the early-return guard in
+        // classify_supported_save before any path-hint dispatch runs.
+        let payload = vec![0xA5u8; 65536];
+
+        for (subdir, expected_slug) in &[
+            ("gamegear", "game-gear"),         // FIX — was broken
+            ("mastersystem", "master-system"), // FIX — was broken
+            ("megadrive", "genesis"),          // regression guard
+            ("megacd", "sega-cd"),             // regression guard
+            ("sega32x", "sega-32x"),           // regression guard
+            ("genesis", "genesis"),            // regression guard (English name)
+            ("megacdjp", "sega-cd"),           // FIX — JP variant
+            // saturnjp omitted: Saturn classifier requires a valid backup-RAM
+            // header signature in passes_binary_validation, so a flat 0xA5
+            // payload is rejected before slug assignment. Worth its own test
+            // with a synthesized Saturn Bk-header fixture.
+            ("sega32xjp", "sega-32x"),  // FIX — JP variant
+            ("sega32xna", "sega-32x"),  // FIX — NA variant
+            ("megadrivejp", "genesis"), // FIX — JP variant
+        ] {
+            let dir = tmp.path().join("retrodeck/saves").join(subdir);
+            fs::create_dir_all(&dir).unwrap();
+            let save = dir.join("Test Game.srm");
+            fs::write(&save, &payload).unwrap();
+
+            let classification = classify_supported_save(&save, None);
+            assert!(
+                classification.is_some(),
+                "expected /{subdir}/ to classify (would skip in production with 'outside allowed console families' if None)",
+            );
+            let got = classification.unwrap().system_slug;
+            assert_eq!(
+                got, *expected_slug,
+                "/{subdir}/ classified as {got}, expected {expected_slug}",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_recognizes_pcengine_tgfx16_paths() {
+        // The TurboGrafx-16 / PC Engine block was missing entirely from
+        // classify_supported_save before this PR. Saves under any of the
+        // common dir conventions (RetroDECK / standalone / libretro) were
+        // skipped at "outside allowed console families." Issue (filed
+        // alongside this commit).
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = vec![0xA5u8; 2048]; // 2KB — canonical HuCard SRAM size; 0xA5 avoids looks_plain_text
+
+        for subdir in &[
+            "pcengine",         // RetroDECK convention
+            "pcenginecd",       // RetroDECK CD variant
+            "pc-engine",        // hyphen variant
+            "pc-engine-cd",     // hyphen CD variant
+            "tg16",             // older convention
+            "tg-cd",            // older CD convention
+            "tg_cd",            // underscore CD variant
+            "supergrafx",       // SuperGrafx
+            "super grafx",      // SuperGrafx with space
+            "sgx",              // SuperGrafx slug
+            "pce",              // short PC Engine slug
+            "pce-cd",           // short PCE CD
+            "pcecd",            // short PCE CD packed
+            "PC Engine",        // standalone with space
+            "TurboGrafx",       // standalone English name
+            "turbo grafx",      // English name with space
+            "turbo-grafx",      // English name with hyphen
+            "tgfx16",           // MiSTer slug
+            "nec - pc engine",  // NoIntro DAT naming
+            "nec - turbografx", // NoIntro DAT naming variant
+            "mednafen-pce",     // libretro core name
+            "beetle pce",       // alternate libretro name
+            "beetle-pce",       // hyphen variant
+        ] {
+            let dir = tmp.path().join("retrodeck/saves").join(subdir);
+            fs::create_dir_all(&dir).unwrap();
+            let save = dir.join("Test Game.srm");
+            fs::write(&save, &payload).unwrap();
+
+            let classification = classify_supported_save(&save, None);
+            assert!(
+                classification.is_some(),
+                "expected /{subdir}/ to classify (would skip in production with 'outside allowed console families' if None)",
+            );
+            let got = classification.unwrap().system_slug;
+            assert_eq!(
+                got, "tgfx16",
+                "/{subdir}/ classified as {got}, expected tgfx16",
+            );
+        }
     }
 }
