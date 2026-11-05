@@ -3014,7 +3014,14 @@ fn process_single_save(
         Some(prior) => {
             let last = prior.sha256.as_str();
             let remote = latest.sha256.as_deref().unwrap_or("");
-            (last != local_sha.as_str(), last != remote)
+            // Local and server holding the same bytes is agreement, whatever
+            // was recorded last: it settles below and records these bytes.  Only
+            // a real difference between the two sides can be a conflict.
+            let agree = remote == local_sha.as_str();
+            (
+                last != local_sha.as_str() && !agree,
+                last != remote && !agree,
+            )
         }
         // Nothing agreed yet (first sync): not a conflict, fall through.
         None => (false, false),
@@ -3030,6 +3037,35 @@ fn process_single_save(
             &local_sha[..local_sha.len().min(8)],
             &remote_sha[..remote_sha.len().min(8)]
         );
+        let three_way = ConflictCheckResponse {
+            exists: true,
+            conflict_id: None,
+            cloud_sha256: latest.sha256.clone(),
+            cloud_version: latest.version,
+            cloud_save_id: latest.id.clone(),
+        };
+        if let Err(err) = handle_conflict(
+            api,
+            save_path,
+            &normalized_save.canonical_bytes,
+            &local_sha,
+            &active_rom_sha1,
+            &effective_slot_name,
+            options.dry_run,
+            device_type,
+            fingerprint,
+            &three_way,
+            source_name,
+            source_kind,
+            app_password,
+            &runtime_target,
+        ) {
+            eprintln!(
+                "Could not report the conflict for {}: {}",
+                save_path.display(),
+                err
+            );
+        }
         return Ok(Some(processed_entry(
             state_key.clone(),
             prior_entry
