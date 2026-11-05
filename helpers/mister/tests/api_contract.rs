@@ -1136,7 +1136,7 @@ fn a_file_this_helper_synced_as_another_system_is_not_overwritten() {
             .header("content-type", "application/json")
             .body(r#"{"success":true,"total":1,"limit":100,"offset":0,"saves":[{"id":"save-other","filename":"Other Quest (USA).srm","displayTitle":"Other Quest","systemSlug":"snes","sha256":"sha-other","version":2,"latestSizeBytes":8192}]}"#);
     });
-    let _download = server.mock(|when, then| {
+    let download = server.mock(|when, then| {
         when.method(GET).path("/saves/download");
         then.status(200).body(snes_save_bytes(7));
     });
@@ -1179,6 +1179,11 @@ fn a_file_this_helper_synced_as_another_system_is_not_overwritten() {
         fs::read(&path).unwrap(),
         other,
         "a file this helper synced as a genesis save was overwritten by a snes record:\n{stderr}"
+    );
+    assert_eq!(
+        download.calls(),
+        0,
+        "the server copy was downloaded only to be thrown away:\n{stderr}"
     );
 }
 

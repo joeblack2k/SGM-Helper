@@ -824,6 +824,25 @@ fn restore_single_cloud_save(
     {
         return Ok(());
     }
+    // Decided before the download, from the helper's state and the local file
+    // alone: a file this helper synced as another system's save is kept, so the
+    // server copy is not fetched each pass only to be thrown away.
+    if let Some(kept) = [&provisional_path, &native_target_path]
+        .into_iter()
+        .find(|path| {
+            local_file_is_some_save(path)
+                && recorded_as_other_system(path, &system_slug, sync_entries)
+        })
+    {
+        report.skipped += 1;
+        eprintln!(
+            "Not restoring {} save '{}' over {}: this helper synced that file as a save of another system; it is kept until the shared name resolves to one system",
+            system_slug,
+            cloud_save.display_name(),
+            kept.display()
+        );
+        return Ok(());
+    }
     if !target_parent_allowed(&provisional_path, save_roots, create_missing_system_dirs) {
         report.skipped += 1;
         if verbose {
@@ -901,7 +920,7 @@ fn restore_single_cloud_save(
     {
         report.skipped += 1;
         eprintln!(
-            "Not restoring {} save '{}' over {}: this helper synced that file as a save of another system",
+            "Not restoring {} save '{}' over {}: this helper synced that file as a save of another system; it is kept until the shared name resolves to one system",
             system_slug,
             cloud_save.display_name(),
             target_path.display()
