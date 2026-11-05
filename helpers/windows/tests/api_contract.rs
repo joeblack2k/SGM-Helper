@@ -1534,6 +1534,278 @@ fn writeback_state(state_dir: &std::path::Path, path: &std::path::Path, system_s
     fs::write(state_dir.join("sync_state.json"), state).unwrap();
 }
 
+// A Game Boy save with a real-time clock is two files on one stem: `.srm`
+// holds the SRAM and `.rtc` holds the clock. A pair written the wrong way
+// round (the 8-byte clock in `.srm`) is invisible to the scanner, since no
+// SRAM size is 8 bytes, so it was never repaired. A restore of either record
+// first moves each file to the extension its content belongs to.
+fn gb_rtc_harness(
+    local: &[(&str, Vec<u8>)],
+) -> (
+    MockServer,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    gb_rtc_harness_listing(local, "srm,rtc")
+}
+
+// `listing` names the tracks /saves returns, in order: "srm,rtc", "rtc,srm",
+// or "rtc" alone, which is how a server that groups both files under one
+// title lists them, its latest version being the clock.
+fn gb_rtc_harness_listing(
+    local: &[(&str, Vec<u8>)],
+    listing: &str,
+) -> (
+    MockServer,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_rtc","expiresInDays":7}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"rtc@example.com"}}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-up","sha256":"x","version":1}}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body({
+                let tracks: Vec<&str> = listing
+                    .split(',')
+                    .map(|track| match track {
+                        "srm" => r#"{"id":"save-srm","filename":"GOLD.srm","displayTitle":"Gold","systemSlug":"gameboy","sha256":"aaaa","version":1,"latestSizeBytes":32768}"#,
+                        _ => r#"{"id":"save-rtc","filename":"GOLD.rtc","displayTitle":"Gold","systemSlug":"gameboy","sha256":"bbbb","version":1,"latestSizeBytes":8}"#,
+                    })
+                    .collect();
+                format!(
+                    r#"{{"success":true,"total":{},"limit":100,"offset":0,"saves":[{}]}}"#,
+                    tracks.len(),
+                    tracks.join(",")
+                )
+            });
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/saves/download")
+            .query_param("id", "save-srm");
+        then.status(200).body(gb_sram(0x5A));
+    });
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/saves/download")
+            .query_param("id", "save-rtc");
+        then.status(200)
+            .body(vec![0x2C, 0x88, 0xD9, 0x6A, 0x01, 0x00, 0x00, 0x00]);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/gb")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    for (name, bytes) in local {
+        fs::write(root.join("saves/gb").join(name), bytes).unwrap();
+    }
+    let config = tmp.path().join("config-rtc.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\n\n[source.retroarch]\nLABEL=\"RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"gameboy\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.join("saves").display(),
+            root.join("roms").display()
+        ),
+    )
+    .unwrap();
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("rtc@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    (server, tmp, root.join("saves/gb"), config)
+}
+
+fn gb_rtc_sync(config: &std::path::Path) -> String {
+    let output = wb_helper()
+        .arg("--config")
+        .arg(config)
+        .arg("sync")
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+// A save's bytes, not a fill: a uniform file reads as text or as blank to the
+// scanner and is never classified as a save.
+fn gb_sram(seed: u8) -> Vec<u8> {
+    (0..32768u32)
+        .map(|i| (i.wrapping_mul(31) as u8) ^ seed ^ 0x80)
+        .collect()
+}
+
+// The 8-byte clock Gold's server record holds.
+fn gb_clock() -> Vec<u8> {
+    vec![0x2C, 0x88, 0xD9, 0x6A, 0x00, 0x00, 0x00, 0x00]
+}
+
+#[test]
+fn a_device_with_neither_file_gets_the_sram_in_srm_and_the_clock_in_rtc() {
+    // The origin of the swap: the clock record was restored, then renamed to
+    // the cartridge's `.srm`, over the SRAM.
+    let (_server, _tmp, dir, config) = gb_rtc_harness(&[]);
+    let out = gb_rtc_sync(&config);
+    assert_eq!(
+        fs::read(dir.join("GOLD.srm")).unwrap(),
+        gb_sram(0x5A),
+        "the SRAM is not in .srm: {out}"
+    );
+    assert_eq!(
+        fs::read(dir.join("GOLD.rtc")).unwrap().len(),
+        8,
+        "the clock is not in .rtc: {out}"
+    );
+}
+
+#[test]
+fn a_lone_srm_holding_the_clock_is_copied_to_rtc_and_the_sram_is_restored() {
+    let clock = gb_clock();
+    let (_server, _tmp, dir, config) = gb_rtc_harness(&[("GOLD.srm", clock.clone())]);
+    let out = gb_rtc_sync(&config);
+    assert_eq!(
+        fs::read(dir.join("GOLD.rtc")).unwrap(),
+        clock,
+        "the device's clock was lost: {out}"
+    );
+    assert_eq!(
+        fs::read(dir.join("GOLD.srm")).unwrap().len(),
+        32768,
+        "the SRAM was not restored: {out}"
+    );
+}
+
+#[test]
+fn a_lone_srm_holding_the_clock_ends_with_the_sram_in_srm_whichever_record_comes_first() {
+    for listing in ["srm,rtc", "rtc,srm"] {
+        let clock = gb_clock();
+        let (_server, _tmp, dir, config) =
+            gb_rtc_harness_listing(&[("GOLD.srm", clock.clone())], listing);
+        let out = gb_rtc_sync(&config);
+        assert_eq!(
+            fs::read(dir.join("GOLD.srm")).ok(),
+            Some(gb_sram(0x5A)),
+            "{listing}: .srm does not hold the server's SRAM: {out}"
+        );
+        assert_eq!(
+            fs::read(dir.join("GOLD.rtc")).ok(),
+            Some(clock),
+            "{listing}: .rtc does not hold the device's clock: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_lone_srm_holding_the_clock_is_never_emptied_when_only_the_clock_is_listed() {
+    // The arcade: the only local file is an 8-byte `.srm`, and the server
+    // lists Gold as one track whose latest version is the clock, so no SRAM
+    // restore follows the heal. Moving the `.srm` to `.rtc` left the device
+    // with no `.srm` at all.
+    let clock = gb_clock();
+    let (_server, _tmp, dir, config) =
+        gb_rtc_harness_listing(&[("GOLD.srm", clock.clone())], "rtc");
+    let out = gb_rtc_sync(&config);
+    assert_eq!(
+        fs::read(dir.join("GOLD.srm")).ok(),
+        Some(clock.clone()),
+        ".srm was moved away with nothing restored in its place: {out}"
+    );
+    assert_eq!(
+        fs::read(dir.join("GOLD.rtc")).ok(),
+        Some(clock),
+        ".rtc does not hold the device's clock: {out}"
+    );
+}
+
+#[test]
+fn a_swapped_srm_and_rtc_trade_places() {
+    let clock = gb_clock();
+    let sram = gb_sram(0x77);
+    let (_server, _tmp, dir, config) =
+        gb_rtc_harness(&[("GOLD.srm", clock.clone()), ("GOLD.rtc", sram.clone())]);
+    let out = gb_rtc_sync(&config);
+    assert_eq!(
+        fs::read(dir.join("GOLD.srm")).unwrap(),
+        sram,
+        "the device's SRAM is not in .srm: {out}"
+    );
+    assert_eq!(
+        fs::read(dir.join("GOLD.rtc")).unwrap(),
+        clock,
+        "the device's clock is not in .rtc: {out}"
+    );
+}
+
+#[test]
+fn a_correct_srm_and_rtc_pair_is_left_alone() {
+    let clock = gb_clock();
+    let sram = gb_sram(0x77);
+    let (_server, _tmp, dir, config) =
+        gb_rtc_harness(&[("GOLD.srm", sram.clone()), ("GOLD.rtc", clock.clone())]);
+    let out = gb_rtc_sync(&config);
+    assert_eq!(fs::read(dir.join("GOLD.srm")).unwrap(), sram, "{out}");
+    assert_eq!(fs::read(dir.join("GOLD.rtc")).unwrap(), clock, "{out}");
+}
+
+#[test]
+fn a_lone_rtc_holding_the_sram_is_copied_to_srm_and_the_clock_is_restored() {
+    let sram = gb_sram(0x77);
+    let (_server, _tmp, dir, config) = gb_rtc_harness(&[("GOLD.rtc", sram.clone())]);
+    let out = gb_rtc_sync(&config);
+    assert_eq!(
+        fs::read(dir.join("GOLD.srm")).unwrap(),
+        sram,
+        "the device's SRAM was lost: {out}"
+    );
+    assert_eq!(
+        fs::read(dir.join("GOLD.rtc")).unwrap().len(),
+        8,
+        "the clock was not restored: {out}"
+    );
+}
+
 fn slot_state_synced(
     state_dir: &std::path::Path,
     path: &std::path::Path,
