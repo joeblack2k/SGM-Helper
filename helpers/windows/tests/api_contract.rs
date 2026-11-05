@@ -310,6 +310,253 @@ fn sync_reports_conflict_when_backend_marks_conflict() {
     assert!(conflict_report.calls() >= 1);
 }
 
+// The arcade's shape: RetroArch writes N64 saves into its core folder
+// (SAVE_SUBDIR_N64), and an older helper left a copy in the system-named one.
+// The core folder's copy is the live save. It must be the one that syncs:
+// if the stray is chosen as the title's preferred variant, the live copy is
+// skipped as the lesser one, the stray is refused as a stray, and the
+// restore pass rewrites the live file on every run.
+#[test]
+fn the_live_copy_syncs_when_a_stray_shares_its_name() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_live64","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"live64@example.com"}}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+    // No ROM is local, so the ROM key comes from the server's lookup.
+    let _lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"sm64-sha1","md5":"sm64-md5"}}"#);
+    });
+    let latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-live64","sha256":"sha-live64"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    let core = root.join("saves/Mupen64Plus-Next OpenGL");
+    let stray_dir = root.join("saves/n64");
+    fs::create_dir_all(&core).unwrap();
+    fs::create_dir_all(&stray_dir).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    // A RetroArch N64 bundle: 296,960 bytes (EEPROM + SRAM + FlashRAM + paks).
+    let bundle = |seed: u8| -> Vec<u8> {
+        (0..296_960u32)
+            .map(|index| ((index as u8).wrapping_mul(31).wrapping_add(seed)) | 0x01)
+            .collect()
+    };
+    let live_copy = core.join("Super Mario 64 (USA).srm");
+    fs::write(&live_copy, bundle(7)).unwrap();
+    fs::write(stray_dir.join("Super Mario 64 (USA).srm"), bundle(19)).unwrap();
+    // No ROM in ROM_PATH, as on the arcade (its ROMs are LaunchBox views):
+    // only the system-named folder can say the file is an N64 save.
+    let config = live_directory_config(
+        &tmp,
+        &server,
+        &root,
+        &state_dir,
+        "SAVE_SUBDIR_N64=\"Mupen64Plus-Next OpenGL\"",
+    );
+    let ini = fs::read_to_string(&config)
+        .unwrap()
+        .replace("SYSTEMS=\"snes\"", "SYSTEMS=\"n64\"");
+    fs::write(&config, ini).unwrap();
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("live64@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sync failed:\n{stderr}");
+    assert!(
+        latest.calls() >= 1 && upload.calls() == 1,
+        "the live copy was never synced (latest={}, upload={}):\n{stderr}",
+        latest.calls(),
+        upload.calls()
+    );
+    let state = fs::read_to_string(state_dir.join("sync_state.json")).unwrap();
+    assert!(
+        state.contains("Mupen64Plus-Next OpenGL"),
+        "the live copy has no state entry, so the restore pass rewrites it:\n{state}"
+    );
+}
+
+// A Game Gear save the core keeps in the Genesis folder: the folder names
+// another system, so the path alone cannot say the file is this save. The
+// helper synced it as game-gear, and the restore pass resolved that very file
+// as the target ("it already holds this game-gear save"); it must then count
+// as present, not be downloaded and rewritten on every pass.
+#[test]
+fn a_save_synced_as_its_system_is_not_rewritten_by_the_restore_pass() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_gg","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"gg@example.com"}}"#);
+    });
+    let _lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"gg-sha1","md5":"gg-md5"}}"#);
+    });
+    let _latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-gg-up","sha256":"up"}}"#);
+    });
+    let bytes: Vec<u8> = (0..65_536u32)
+        .map(|index| ((index as u8).wrapping_mul(13).wrapping_add(3)) | 0x01)
+        .collect();
+    // The server's record holds exactly the bytes the device already has.
+    let held_sha = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&bytes))
+    };
+    let listing = format!(
+        r#"{{"success":true,"total":1,"limit":100,"offset":0,"saves":[{{"id":"save-gg","displayTitle":"Defenders of Oasis","systemSlug":"game-gear","filename":"Defenders of Oasis (USA, Europe).sav","fileSize":65536,"latestSizeBytes":65536,"version":1,"sha256":"{held_sha}"}}]}}"#
+    );
+    let _list = server.mock(move |when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(listing);
+    });
+    let download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(vec![0x5au8; 65536]);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    let genesis = root.join("saves/genesis");
+    fs::create_dir_all(&genesis).unwrap();
+    // As on the arcade, Genesis Plus GX is the declared live directory for
+    // genesis and holds that system's copy of the stem, so the genesis-folder
+    // file is not uploaded as genesis and keeps its game-gear state entry.
+    let live_genesis = root.join("saves/Genesis Plus GX");
+    fs::create_dir_all(&live_genesis).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let held = genesis.join("Defenders of Oasis (USA, Europe).srm");
+    fs::write(&held, &bytes).unwrap();
+    fs::write(
+        live_genesis.join("Defenders of Oasis (USA, Europe).srm"),
+        &bytes,
+    )
+    .unwrap();
+    let state = serde_json::json!({
+        "entries": {
+            held.to_string_lossy(): {
+                "sha256": "bb",
+                "rom_sha1": "gg-sha1",
+                "version": 1,
+                "system_slug": "game-gear",
+                "local_container": "native",
+                "adapter_profile": "identity",
+                "source_kind": "retroarch",
+                "source_name": "RetroArch",
+                "slot_name": "default",
+                "updated_at": "2026-11-05T00:00:00Z"
+            }
+        }
+    });
+    fs::write(state_dir.join("sync_state.json"), state.to_string()).unwrap();
+    let config = live_directory_config(
+        &tmp,
+        &server,
+        &root,
+        &state_dir,
+        "SAVE_SUBDIR_GENESIS=\"Genesis Plus GX\"",
+    );
+    let ini = fs::read_to_string(&config)
+        .unwrap()
+        .replace("SYSTEMS=\"snes\"", "SYSTEMS=\"game-gear,genesis\"");
+    fs::write(&config, ini).unwrap();
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("gg@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    let output = wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .arg("--verbose")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "sync failed:\n{stderr}");
+    assert_eq!(
+        download.calls(),
+        0,
+        "the file synced as game-gear was downloaded again:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read(&held).unwrap(),
+        bytes,
+        "the file synced as game-gear was rewritten:\n{stderr}"
+    );
+}
+
 #[test]
 fn sync_accepts_ps1_gme_and_uploads_normalized_payload() {
     let expected_line = "ps-line:psx:retroarch:memory-card-1";

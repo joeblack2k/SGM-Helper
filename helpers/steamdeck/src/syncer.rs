@@ -698,6 +698,22 @@ fn restore_single_cloud_save(
         report.skipped += 1;
         return Ok(());
     };
+    // Every "already present" check below goes through this. The path decides
+    // when it names the system; when it does not (a core folder such as
+    // "Mupen64Plus-Next OpenGL", or the Genesis folder a Game Gear core writes
+    // into), a file this helper synced as this system and that already holds
+    // the record's bytes is the save -- the target resolver chose it on the same
+    // state entry. Without this it reads as absent and is rewritten every pass.
+    let known_entries = &*sync_entries;
+    let existing_local_save_is_valid = |path: &Path, system_slug: &str, expect_sidecar: bool| {
+        existing_local_save_is_valid(path, system_slug, expect_sidecar)
+            || synced_here_with_these_bytes(
+                path,
+                system_slug,
+                cloud_save.sha256.as_deref(),
+                known_entries,
+            )
+    };
 
     if !supports_cloud_restore_system(&system_slug) {
         report.skipped += 1;
@@ -1898,6 +1914,34 @@ fn preferred_system_directory_for_root(
         }
     }
     default_dir.to_string()
+}
+
+/// A file this helper synced as `system_slug` whose bytes are the record's:
+/// the cloud save is already here, whatever the path says.
+fn synced_here_with_these_bytes(
+    path: &Path,
+    system_slug: &str,
+    cloud_sha256: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> bool {
+    let Some(cloud_sha256) = cloud_sha256.map(str::trim).filter(|sha| !sha.is_empty()) else {
+        return false;
+    };
+    known_save_for_system(path, system_slug, known_saves)
+        && crate::scanner::sha256_file(path)
+            .map(|local| same_sha256(&local, cloud_sha256))
+            .unwrap_or(false)
+}
+
+/// Two sha256 values agree when one is a prefix of the other: the server lists
+/// and some state entries carry a shortened digest.
+fn same_sha256(left: &str, right: &str) -> bool {
+    let (left, right) = (
+        left.trim().to_ascii_lowercase(),
+        right.trim().to_ascii_lowercase(),
+    );
+    let shorter = left.len().min(right.len());
+    shorter >= 16 && left[..shorter] == right[..shorter]
 }
 
 fn select_cloud_restore_root(save_roots: &[PathBuf]) -> &PathBuf {

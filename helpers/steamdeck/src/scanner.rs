@@ -1020,6 +1020,10 @@ pub fn classify_supported_save(
             "nintendo 64",
             "/n64/",
             "\\n64\\",
+            // N64 core folders (RetroArch's "Mupen64Plus-Next OpenGL"):
+            // infer_nintendo_slug names them, so they must reach it.
+            "mupen",
+            "project64",
             "super nintendo",
             "/snes/",
             "\\snes\\",
