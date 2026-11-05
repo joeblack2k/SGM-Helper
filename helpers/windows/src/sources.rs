@@ -46,6 +46,7 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "ps3",
     "ps4",
     "ps5",
+    "3ds",
 ];
 
 const MISTER_SYNC_SYSTEMS: &[&str] = &[
@@ -246,6 +247,13 @@ pub struct Source {
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
     pub systems: Vec<String>,
+    /// Per-system live-save subdirectory, relative to the source's save root.
+    /// A device that sorts saves by core writes them somewhere other than the
+    /// system directory, and only the operator knows which directory that is.
+    /// The helper reads this key and never writes it: a suggestion in a log is
+    /// evidence, a value the client writes for itself is a guess that outlives
+    /// the evidence.
+    pub save_subdirs: BTreeMap<String, PathBuf>,
     pub create_missing_system_dirs: bool,
     pub managed: bool,
     pub origin: String,
@@ -262,6 +270,7 @@ pub struct ResolvedSource {
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
     pub systems: Vec<String>,
+    pub save_subdirs: BTreeMap<String, PathBuf>,
     pub create_missing_system_dirs: bool,
     pub managed: bool,
     pub origin: String,
@@ -359,6 +368,7 @@ impl Source {
             rom_roots,
             recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: false,
             origin: "manual".to_string(),
@@ -386,6 +396,7 @@ impl Source {
             rom_roots: vec![rom_path],
             recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: true,
             origin,
@@ -399,23 +410,43 @@ impl Source {
     }
 
     pub fn resolve(&self, binary_dir: &Path) -> ResolvedSource {
+        let save_roots: Vec<PathBuf> = self
+            .save_roots
+            .iter()
+            .map(|path| resolve_path(binary_dir, path))
+            .collect();
+        // A stored config can carry a ROM path that is the source's own save
+        // root -- an auto-created default used to write one. Indexing saves as
+        // ROMs is never right, and the config is not the operator's to edit by
+        // hand, so the root is dropped with a line instead.
+        let rom_roots: Vec<PathBuf> = self
+            .rom_roots
+            .iter()
+            .map(|path| resolve_path(binary_dir, path))
+            .filter(|root| {
+                let key = directory_key(root);
+                if save_roots.iter().any(|save| directory_key(save) == key) {
+                    eprintln!(
+                        "Ignoring ROM root {} in source '{}': it is the source's own save root",
+                        root.display(),
+                        self.name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         ResolvedSource {
             id: self.id.clone(),
             name: self.name.clone(),
             kind: self.kind.clone(),
             profile: self.profile.clone(),
-            save_roots: self
-                .save_roots
-                .iter()
-                .map(|path| resolve_path(binary_dir, path))
-                .collect(),
-            rom_roots: self
-                .rom_roots
-                .iter()
-                .map(|path| resolve_path(binary_dir, path))
-                .collect(),
+            save_roots,
+            rom_roots,
             recursive: self.recursive,
             systems: self.systems.clone(),
+            save_subdirs: self.save_subdirs.clone(),
             create_missing_system_dirs: self.create_missing_system_dirs,
             managed: self.managed,
             origin: self.origin.clone(),
@@ -535,6 +566,7 @@ pub fn migrate_legacy_sources_if_needed(config: &AppConfig, verbose: bool) -> Re
             rom_roots: vec![rom_path],
             recursive: item.recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: false,
             origin: "legacy-migrated".to_string(),
@@ -645,6 +677,31 @@ pub fn prepare_sources_for_sync(
     resolved_sources_or_default(&store, config, default_kind)
 }
 
+/// A comparison key for a directory path.
+///
+/// A stored config can spell the same directory two ways -- `…\.\saves` and
+/// `…\saves` both came from this helper -- and `PathBuf` equality does not see
+/// through the difference. Curdir components are dropped, trailing separators
+/// with them, and case is folded on Windows, where the filesystem does.
+fn directory_key(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_string_lossy().to_string()),
+        }
+    }
+    let joined = parts.join("/");
+    if cfg!(windows) {
+        joined.to_ascii_lowercase()
+    } else {
+        joined
+    }
+}
+
 pub fn resolved_sources_or_default(
     store: &SourceStore,
     config: &AppConfig,
@@ -694,11 +751,15 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
             vec![root.clone()],
             true,
         ),
+        // No ROM root: the save root is the only directory a default knows
+        // about, and using it for both indexed save files as ROMs and logged a
+        // missing ROM root on every pass. A ROM lookup without an index falls
+        // back to the server, which is what it does for an unknown stem anyway.
         SourceKind::Windows => Source::new(
             "default-windows".to_string(),
             SourceKind::Windows,
             vec![root.clone()],
-            vec![root.clone()],
+            Vec::new(),
             true,
         ),
         SourceKind::SteamDeck => {
@@ -715,7 +776,7 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
                     "default-steamdeck".to_string(),
                     SourceKind::SteamDeck,
                     vec![root.clone()],
-                    vec![root],
+                    Vec::new(),
                     true,
                 )
             }
@@ -724,7 +785,7 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
             "default-custom".to_string(),
             SourceKind::Custom,
             vec![root.clone()],
-            vec![root],
+            Vec::new(),
             true,
         ),
     };
@@ -1104,9 +1165,33 @@ fn is_skipped_deep_scan_path(path: &Path) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+/// Whether `path` is `root` or sits inside it, compared by `directory_key`.
+fn directory_within(path: &Path, root: &Path) -> bool {
+    let path = directory_key(path);
+    let root = directory_key(root);
+    path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
+}
+
+/// A configured source wins over autoscan.  A managed candidate whose every save
+/// root is, or sits inside, a save root a configured (manual) source already
+/// covers would watch the same files a second time under rules the operator
+/// never set, and two sources disagreeing about one file refuse or misfile it.
+/// So autoscan does not add it; if the configured source goes, the next scan may.
+fn covered_by_configured(candidate: &Source, configured: &[Source]) -> bool {
+    !candidate.save_roots.is_empty()
+        && candidate.save_roots.iter().all(|root| {
+            configured
+                .iter()
+                .flat_map(|source| source.save_roots.iter())
+                .any(|covered| directory_within(root, covered))
+        })
+}
+
 fn replace_managed_sources(existing: &[Source], mut replacements: Vec<Source>) -> Vec<Source> {
     let mut out: Vec<Source> = existing.iter().filter(|v| !v.managed).cloned().collect();
     let existing_ids: BTreeSet<String> = out.iter().map(|value| value.id.clone()).collect();
+    let configured = out.clone();
+    replacements.retain(|candidate| !covered_by_configured(candidate, &configured));
 
     for mut replacement in replacements.drain(..) {
         replacement.id = dedupe_id(replacement.id, &existing_ids);
@@ -1240,6 +1325,21 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         }
     });
 
+    // An operator declares where a device actually writes each system's saves;
+    // the helper only ever reads it. Keys are matched by prefix so a system the
+    // client does not know yet can still be declared.
+    let mut save_subdirs = BTreeMap::new();
+    for (key, value) in &section.values {
+        let Some(system) = key.strip_prefix("SAVE_SUBDIR_") else {
+            continue;
+        };
+        let system = system.trim().to_ascii_lowercase();
+        let directory = value.trim();
+        if !system.is_empty() && !directory.is_empty() {
+            save_subdirs.insert(system, PathBuf::from(directory));
+        }
+    }
+
     Some(Source {
         id: section.id.clone(),
         name: label,
@@ -1249,6 +1349,7 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         rom_roots: vec![rom_path],
         recursive,
         systems,
+        save_subdirs,
         create_missing_system_dirs,
         managed,
         origin,
@@ -1369,6 +1470,16 @@ fn render_config_with_sources(base: &str, sources: &[Source]) -> String {
             source.systems.join(",")
         };
         lines.push(format!("SYSTEMS=\"{}\"", escape_ini(&rendered_systems)));
+        // Re-emitted verbatim: save_source_store strips and re-renders every
+        // [source.*] section, so a key the struct does not carry is destroyed
+        // on the next config write.
+        for (system, directory) in &source.save_subdirs {
+            lines.push(format!(
+                "SAVE_SUBDIR_{}=\"{}\"",
+                system.to_ascii_uppercase(),
+                escape_ini(&directory.to_string_lossy())
+            ));
+        }
         lines.push(format!(
             "CREATE_MISSING_SYSTEM_DIRS=\"{}\"",
             source.create_missing_system_dirs
@@ -1450,6 +1561,72 @@ fn backup_corrupt(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn autoscan_candidate(save: &str) -> Source {
+        Source::managed(
+            "windows_default".to_string(),
+            "autoscan".to_string(),
+            SourceKind::Windows,
+            EmulatorProfile::Generic,
+            PathBuf::from(save),
+            PathBuf::from(save),
+            true,
+            "autoscan-known".to_string(),
+        )
+    }
+
+    fn configured(save: &str) -> Source {
+        Source::new(
+            "RetroDeck".to_string(),
+            SourceKind::Windows,
+            vec![PathBuf::from(save)],
+            vec![PathBuf::from("/roms")],
+            true,
+        )
+    }
+
+    #[test]
+    fn autoscan_does_not_add_a_source_over_a_configured_save_root() {
+        let existing = vec![configured("/home/deck/retrodeck/saves")];
+        let out = replace_managed_sources(
+            &existing,
+            vec![
+                autoscan_candidate("/home/deck/retrodeck/saves"),
+                autoscan_candidate("/home/deck/retrodeck/saves/./gbc/"),
+            ],
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "autoscan duplicated a configured source: {out:?}"
+        );
+        assert!(!out[0].managed);
+    }
+
+    #[test]
+    fn autoscan_still_adds_a_source_outside_every_configured_root() {
+        let existing = vec![configured("/home/deck/retrodeck/saves")];
+        let out = replace_managed_sources(
+            &existing,
+            vec![
+                autoscan_candidate("/home/deck/retrodeck/saves-other"),
+                autoscan_candidate("/home/deck/.local/share/dolphin"),
+            ],
+        );
+        assert_eq!(
+            out.len(),
+            3,
+            "a source no configured root covers was dropped"
+        );
+    }
+
+    #[test]
+    fn autoscan_returns_once_the_configured_source_is_gone() {
+        let out =
+            replace_managed_sources(&[], vec![autoscan_candidate("/home/deck/retrodeck/saves")]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].managed);
+    }
+
     #[test]
     fn helper_device_type_matches_backend_identity_names() {
         assert_eq!(SourceKind::MisterFpga.helper_device_type(), "mister");
@@ -1470,9 +1647,84 @@ mod tests {
         assert!(deck_systems.contains(&"wii".to_string()));
     }
 
+    // An existing config can carry a ROM path that is the source's own save
+    // root; the derivation no longer writes one, and this is the half that
+    // heals the ones already on disk.
+    // The same directory spelled two ways -- `./saves` and `saves` -- is the
+    // shape the arcade's stored config carries, and PathBuf equality does not
+    // see through it.
+    #[test]
+    fn a_rom_root_spelled_differently_from_the_save_root_is_dropped() {
+        let source = Source::new(
+            "windows".to_string(),
+            SourceKind::Windows,
+            vec![PathBuf::from("./saves")],
+            vec![PathBuf::from("saves")],
+            true,
+        );
+        let resolved = source.resolve(Path::new("/tmp"));
+        assert!(
+            resolved.rom_roots.is_empty(),
+            "a differently spelled save root survived as a ROM root: {:?}",
+            resolved.rom_roots
+        );
+    }
+
+    #[test]
+    fn a_rom_root_that_is_the_save_root_is_dropped() {
+        let source = Source::new(
+            "windows".to_string(),
+            SourceKind::Windows,
+            vec![PathBuf::from("./saves")],
+            vec![PathBuf::from("./saves")],
+            true,
+        );
+        let resolved = source.resolve(Path::new("/tmp"));
+        assert_eq!(resolved.save_roots.len(), 1);
+        assert!(
+            resolved.rom_roots.is_empty(),
+            "the save root was kept as a ROM root: {:?}",
+            resolved.rom_roots
+        );
+    }
+
+    #[test]
+    fn a_declared_live_directory_survives_a_config_rewrite() {
+        // save_source_store strips and re-renders every [source.*] section, so
+        // an operator's SAVE_SUBDIR_<system> is destroyed unless Source models
+        // it. This is the difference between "the value did not stick" and a
+        // key that is simply not the helper's to keep.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            "[source.retroarch]\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"/tmp/saves\"\nSAVE_SUBDIR_n64=\"Mupen64Plus-Next OpenGL\"\nSAVE_SUBDIR_GENESIS=\"Genesis Plus GX\\Sonic\"\n",
+        )
+        .unwrap();
+
+        let store = load_source_store(&config_path).unwrap();
+        assert_eq!(
+            store.sources[0].save_subdirs.get("n64"),
+            Some(&PathBuf::from("Mupen64Plus-Next OpenGL"))
+        );
+        assert_eq!(
+            store.sources[0].save_subdirs.get("genesis"),
+            Some(&PathBuf::from("Genesis Plus GX\\Sonic")),
+            "a multi-part value has to survive as written"
+        );
+
+        save_source_store(&config_path, &store).unwrap();
+        let reloaded = load_source_store(&config_path).unwrap();
+        assert_eq!(
+            reloaded.sources[0].save_subdirs, store.sources[0].save_subdirs,
+            "the declared live directory was lost in the rewrite"
+        );
+    }
+
     #[test]
     fn default_windows_source_uses_save_layout() {
         let cfg = AppConfig {
+            secure: false,
             url: "127.0.0.1".to_string(),
             port: 3001,
             email: String::new(),
@@ -1486,10 +1738,19 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: PathBuf::from("/tmp"),
             config_path: PathBuf::from("/tmp/config.ini"),
+            psp_savedata_bundles: false,
         };
 
         let source = default_source(&cfg, SourceKind::Windows).unwrap();
         assert!(source.save_roots[0].to_string_lossy().ends_with("/saves"));
+        // The save root is the only directory a default knows about; using it as
+        // the ROM root indexed save files as ROMs and logged a missing ROM root
+        // on every pass.
+        assert!(
+            source.rom_roots.is_empty(),
+            "an auto default gave itself a ROM root: {:?}",
+            source.rom_roots
+        );
     }
 
     #[test]
