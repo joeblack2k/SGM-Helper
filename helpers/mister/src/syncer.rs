@@ -2438,6 +2438,57 @@ fn process_single_save(
             );
             return Ok(None);
         }
+        // Nothing agreed yet (the file was never synced: a first sync, or a file
+        // that was a stray until a path rule changed), and the server's bytes differ
+        // from it.  Both are real saves and nothing records which is newer, so this
+        // write would replace a classified local save with no trace of it.  Report
+        // a conflict and write neither side; it keeps reporting until the two agree
+        // (delete the local file to take the server's, or FORCE_UPLOAD to send the
+        // local one).  A blank file an emulator creates before the first save holds
+        // no progress, so it still takes the server's copy.
+        if prior_entry.is_none()
+            && canonical_bytes != normalized_save.canonical_bytes
+            && !is_blank_save(&normalized_save.canonical_bytes)
+        {
+            let remote_sha = latest.sha256.as_deref().unwrap_or("");
+            report.conflicts += 1;
+            eprintln!(
+                "Sync conflict for {}: local {} was never synced and differs from server {}; leaving both untouched",
+                save_path.display(),
+                &local_sha[..local_sha.len().min(8)],
+                &remote_sha[..remote_sha.len().min(8)]
+            );
+            let unrecorded = ConflictCheckResponse {
+                exists: true,
+                conflict_id: None,
+                cloud_sha256: latest.sha256.clone(),
+                cloud_version: latest.version,
+                cloud_save_id: Some(save_id.clone()),
+            };
+            if let Err(err) = handle_conflict(
+                api,
+                save_path,
+                &normalized_save.canonical_bytes,
+                &local_sha,
+                &active_rom_sha1,
+                &effective_slot_name,
+                options.dry_run,
+                device_type,
+                fingerprint,
+                &unrecorded,
+                source_name,
+                source_kind,
+                app_password,
+                &runtime_target,
+            ) {
+                eprintln!(
+                    "Could not report the conflict for {}: {}",
+                    save_path.display(),
+                    err
+                );
+            }
+            return Ok(None);
+        }
         if let Some(parent) = target_save_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("kan map niet maken: {}", parent.display()))?;
@@ -3629,6 +3680,11 @@ fn filename_with_extension(filename: &str, target_ext: &str) -> Option<String> {
     let path = Path::new(filename);
     let stem = path.file_stem()?.to_str()?;
     Some(format!("{}.{}", stem, trimmed_target))
+}
+/// An all-0x00 or all-0xFF save holds no progress: it is what an emulator writes
+/// before the game has saved anything.
+fn is_blank_save(bytes: &[u8]) -> bool {
+    bytes.iter().all(|value| *value == 0x00) || bytes.iter().all(|value| *value == 0xFF)
 }
 
 #[allow(clippy::too_many_arguments)]
