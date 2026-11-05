@@ -423,7 +423,8 @@ fn a_clock_sidecar_of_the_held_rom_restores_beside_its_save() {
     // A Game Boy cartridge's .rtc sits beside its .srm under the same ROM: the
     // shared ROM never makes the clock the save already held.
     let rig = rig();
-    held(&rig, "saves/gb/Pokemon - Gold Version (USA).srm", "gameboy", ROM, &save_bytes(0x21));
+    let sram = save_bytes(0x21);
+    held(&rig, "saves/gb/Pokemon - Gold Version (USA).srm", "gameboy", ROM, &sram);
     let clock: Vec<u8> = (0u8..48).collect();
     let download = record(&rig, "Pokemon - Gold Version (USA).rtc", "gameboy", ROM, None, &clock);
 
@@ -433,10 +434,15 @@ fn a_clock_sidecar_of_the_held_rom_restores_beside_its_save() {
         !stderr.contains("already held at"),
         "the clock sidecar was treated as the held save:\n{stderr}"
     );
-    // This helper's native target for a cartridge .rtc is the game's primary
-    // save, which is held, so its existing native-target check (which has no
-    // sidecar-class gate here, unlike the Steam Deck helper's) declines the
-    // download. That predates this guard; what this guard owes is not to claim
-    // the sidecar as the held save.
-    let _ = download;
+    assert_eq!(download.calls(), 1, "the clock sidecar was not restored:\n{stderr}");
+    assert_eq!(
+        fs::read(rig.root().join("saves/gb/Pokemon - Gold Version (USA).rtc")).ok(),
+        Some(clock),
+        "the clock did not land as .rtc beside its save:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read(rig.root().join("saves/gb/Pokemon - Gold Version (USA).srm")).unwrap(),
+        sram,
+        "the held save was changed:\n{stderr}"
+    );
 }
