@@ -1165,9 +1165,33 @@ fn is_skipped_deep_scan_path(path: &Path) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+/// Whether `path` is `root` or sits inside it, compared by `directory_key`.
+fn directory_within(path: &Path, root: &Path) -> bool {
+    let path = directory_key(path);
+    let root = directory_key(root);
+    path == root || path.starts_with(&format!("{}/", root.trim_end_matches('/')))
+}
+
+/// A configured source wins over autoscan.  A managed candidate whose every save
+/// root is, or sits inside, a save root a configured (manual) source already
+/// covers would watch the same files a second time under rules the operator
+/// never set, and two sources disagreeing about one file refuse or misfile it.
+/// So autoscan does not add it; if the configured source goes, the next scan may.
+fn covered_by_configured(candidate: &Source, configured: &[Source]) -> bool {
+    !candidate.save_roots.is_empty()
+        && candidate.save_roots.iter().all(|root| {
+            configured
+                .iter()
+                .flat_map(|source| source.save_roots.iter())
+                .any(|covered| directory_within(root, covered))
+        })
+}
+
 fn replace_managed_sources(existing: &[Source], mut replacements: Vec<Source>) -> Vec<Source> {
     let mut out: Vec<Source> = existing.iter().filter(|v| !v.managed).cloned().collect();
     let existing_ids: BTreeSet<String> = out.iter().map(|value| value.id.clone()).collect();
+    let configured = out.clone();
+    replacements.retain(|candidate| !covered_by_configured(candidate, &configured));
 
     for mut replacement in replacements.drain(..) {
         replacement.id = dedupe_id(replacement.id, &existing_ids);
@@ -1536,6 +1560,72 @@ fn backup_corrupt(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn autoscan_candidate(save: &str) -> Source {
+        Source::managed(
+            "windows_default".to_string(),
+            "autoscan".to_string(),
+            SourceKind::Windows,
+            EmulatorProfile::Generic,
+            PathBuf::from(save),
+            PathBuf::from(save),
+            true,
+            "autoscan-known".to_string(),
+        )
+    }
+
+    fn configured(save: &str) -> Source {
+        Source::new(
+            "RetroDeck".to_string(),
+            SourceKind::Windows,
+            vec![PathBuf::from(save)],
+            vec![PathBuf::from("/roms")],
+            true,
+        )
+    }
+
+    #[test]
+    fn autoscan_does_not_add_a_source_over_a_configured_save_root() {
+        let existing = vec![configured("/home/deck/retrodeck/saves")];
+        let out = replace_managed_sources(
+            &existing,
+            vec![
+                autoscan_candidate("/home/deck/retrodeck/saves"),
+                autoscan_candidate("/home/deck/retrodeck/saves/./gbc/"),
+            ],
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "autoscan duplicated a configured source: {out:?}"
+        );
+        assert!(!out[0].managed);
+    }
+
+    #[test]
+    fn autoscan_still_adds_a_source_outside_every_configured_root() {
+        let existing = vec![configured("/home/deck/retrodeck/saves")];
+        let out = replace_managed_sources(
+            &existing,
+            vec![
+                autoscan_candidate("/home/deck/retrodeck/saves-other"),
+                autoscan_candidate("/home/deck/.local/share/dolphin"),
+            ],
+        );
+        assert_eq!(
+            out.len(),
+            3,
+            "a source no configured root covers was dropped"
+        );
+    }
+
+    #[test]
+    fn autoscan_returns_once_the_configured_source_is_gone() {
+        let out =
+            replace_managed_sources(&[], vec![autoscan_candidate("/home/deck/retrodeck/saves")]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].managed);
+    }
 
     #[test]
     fn helper_device_type_matches_backend_identity_names() {
