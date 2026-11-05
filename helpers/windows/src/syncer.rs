@@ -3152,8 +3152,37 @@ fn latest_save_context(save_path: &Path, system_slug: &str) -> LatestSaveContext
             .unwrap_or_else(|| upload_filename_for_sync(save_path, system_slug)),
         system_slug: system_slug.to_string(),
         display_title: filename_stem(save_path),
-        region_code: None,
+        region_code: save_region_code(save_path),
     }
+}
+
+/// The release region a save's No-Intro name carries, the same way the server
+/// reads it (`detectRegionCode` in RetroSaveManager): the first of US, EU or JP
+/// whose hint appears in the name. The server's title fallback uses it to match
+/// only a save of the same release; without it a (Japan) save was served to a
+/// (USA) ROM.
+fn save_region_code(save_path: &Path) -> Option<String> {
+    let name = save_path.file_stem()?.to_str()?.to_ascii_lowercase();
+    const HINTS: [(&str, &[&str]); 3] = [
+        (
+            "US",
+            &[
+                "usa",
+                "u.s.a",
+                "north america",
+                "ntsc-u",
+                "ntsc u",
+                "(us)",
+                " us ",
+            ],
+        ),
+        ("EU", &["europe", "pal", "eur", "(eu)", " eu "]),
+        ("JP", &["japan", "ntsc-j", "ntsc j", "(jp)", " jp "]),
+    ];
+    HINTS
+        .iter()
+        .find(|(_, hints)| hints.iter().any(|hint| name.contains(hint)))
+        .map(|(code, _)| (*code).to_string())
 }
 
 fn is_playstation_system(system_slug: &str) -> bool {
@@ -4048,6 +4077,19 @@ fn synced_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_latest_check_names_the_region_the_save_name_carries() {
+        let region = |name: &str| latest_save_context(Path::new(name), "gameboy").region_code;
+        assert_eq!(
+            region("Super Mario Bros. Deluxe (USA, Europe) (Rev 1).sav").as_deref(),
+            Some("US")
+        );
+        assert_eq!(region("Some Game (Europe).srm").as_deref(), Some("EU"));
+        assert_eq!(region("Some Game (Japan).srm").as_deref(), Some("JP"));
+        assert_eq!(region("Super Mario Bros. Deluxe (J) (C).srm"), None);
+        assert_eq!(region("wario.sav"), None);
+    }
 
     #[test]
     fn source_system_policy_allows_only_configured_slugs() {
