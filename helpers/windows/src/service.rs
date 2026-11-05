@@ -199,16 +199,17 @@ pub fn run_service(
                 Ok(report) => {
                     if !quiet {
                         println!(
-                            "Service sync complete{}: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} accepted_not_stored={} rejected_permanent={} refused_size_mismatch={} errors={} would_upload={} would_download={}",
+                            "Service sync complete{}: scanned={} uploaded={} deduplicated={} accepted_not_stored={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} rejected_permanent={} refused_size_mismatch={} errors={} would_upload={} would_download={}",
                             dry_run_marker(&report),
                             report.scanned,
                             report.uploaded,
+                            report.deduplicated,
+                            report.accepted_not_stored,
                             report.downloaded,
                             report.in_sync,
                             report.conflicts,
                             report.skipped,
                             report.rejected_n64_controller_pak,
-                            report.accepted_not_stored,
                             report.rejected_permanent,
                             report.refused_size_mismatch,
                             report.errors,

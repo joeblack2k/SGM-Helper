@@ -50,6 +50,9 @@ pub struct SyncReport {
     /// `skipped`, which also holds saves with nothing to do, and apart from
     /// `errors`, which holds refusals and failures on every other system.
     pub rejected_n64_controller_pak: usize,
+    /// The server already held the uploaded bytes (`duplicate: true`) and
+    /// stored nothing new. Counted apart from `uploaded`.
+    pub deduplicated: usize,
     /// The server answered 2xx but returned no save, so nothing was stored.
     pub accepted_not_stored: usize,
     /// Saves the server refused permanently. Not re-attempted until the
@@ -2312,7 +2315,7 @@ fn process_port_save(
             report_accepted_not_stored(report, &port_save.path);
             return Ok(None);
         };
-        report.uploaded += 1;
+        count_stored_upload(report, &stored);
         Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
@@ -2570,7 +2573,7 @@ fn process_psp_savedata_dir(
             report_accepted_not_stored(report, dir);
             return Ok(None);
         };
-        report.uploaded += 1;
+        count_stored_upload(report, &stored);
         Ok(Some(entry_for(
             local_sha.clone(),
             stored.version.or(latest.version),
@@ -2963,8 +2966,8 @@ fn process_single_save(
             &runtime_target,
             verbose,
         );
-        let upload_version = match upload_result {
-            Ok(Some(save)) => save.version,
+        let uploaded_save = match upload_result {
+            Ok(Some(save)) => save,
             Ok(None) => {
                 // 2xx with no `save`: the server accepted the request but stored
                 // nothing.  Counting this as uploaded is how a client reports a
@@ -2990,7 +2993,9 @@ fn process_single_save(
             }
         };
 
-        report.uploaded += 1;
+        count_stored_upload(report, &uploaded_save);
+
+        let upload_version = uploaded_save.version;
         return Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
@@ -3075,8 +3080,8 @@ fn process_single_save(
             &runtime_target,
             verbose,
         );
-        let upload_version = match upload_result {
-            Ok(Some(save)) => save.version,
+        let uploaded_save = match upload_result {
+            Ok(Some(save)) => save,
             Ok(None) => {
                 // 2xx with no `save`: the server accepted the request but stored
                 // nothing.  Counting this as uploaded is how a client reports a
@@ -3101,7 +3106,9 @@ fn process_single_save(
                 return Err(err);
             }
         };
-        report.uploaded += 1;
+        count_stored_upload(report, &uploaded_save);
+
+        let upload_version = uploaded_save.version;
         return Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
@@ -3185,11 +3192,11 @@ fn process_single_save(
                 None,
                 None,
             )?;
-            if stored_save(response).is_none() {
+            let Some(stored) = stored_save(response) else {
                 report_accepted_not_stored(report, save_path);
                 return Ok(None);
-            }
-            report.uploaded += 1;
+            };
+            count_stored_upload(report, &stored);
             return Ok(Some(processed_entry(
                 state_key.clone(),
                 synced_entry(
@@ -3248,11 +3255,11 @@ fn process_single_save(
                     None,
                     None,
                 )?;
-                if stored_save(response).is_none() {
+                let Some(stored) = stored_save(response) else {
                     report_accepted_not_stored(report, save_path);
                     return Ok(None);
-                }
-                report.uploaded += 1;
+                };
+                count_stored_upload(report, &stored);
                 return Ok(Some(processed_entry(
                     state_key.clone(),
                     synced_entry(
@@ -3346,11 +3353,11 @@ fn process_single_save(
                     None,
                     None,
                 )?;
-                if stored_save(response).is_none() {
+                let Some(stored) = stored_save(response) else {
                     report_accepted_not_stored(report, save_path);
                     return Ok(None);
-                }
-                report.uploaded += 1;
+                };
+                count_stored_upload(report, &stored);
                 return Ok(Some(processed_entry(
                     state_key.clone(),
                     synced_entry(
@@ -4544,9 +4551,21 @@ fn upload_with_n64_mister_cpk_fallback(
 /// no `version`. A 2xx with no `save` object stored nothing, and every upload
 /// path has to say so rather than count the request.
 fn stored_save(response: UploadSaveResponse) -> Option<UploadedSave> {
+    let duplicate = response.duplicate;
     response
         .save
         .filter(|save| save.version.is_some() || save.id.is_some() || save.sha256.is_some())
+        .map(|save| UploadedSave { duplicate, ..save })
+}
+
+/// Counts a stored upload. The server answers bytes it already holds with
+/// `duplicate: true` and stores nothing new; that is not an upload.
+fn count_stored_upload(report: &mut SyncReport, save: &UploadedSave) {
+    if save.duplicate {
+        report.deduplicated += 1;
+    } else {
+        report.uploaded += 1;
+    }
 }
 
 /// A 2xx that stored nothing: counted and named, never counted as an upload.
