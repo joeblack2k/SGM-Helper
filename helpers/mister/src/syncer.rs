@@ -2515,7 +2515,8 @@ fn process_single_save(
             // Padding is not a difference: the same save written by a core that
             // pads and one that doesn't must not leave two devices disagreeing.
             // Read the file only on the mismatch, to compare the bytes that carry
-            // the save.
+            // the save. A whole read is fine here: it is bounded by a save's size
+            // (KiB), unlike hashing a ROM, which must stream.
             if let Ok(on_disk) = std::fs::read(&target_save_path) {
                 let padded = if on_disk.len() >= local_bytes.len() {
                     same_save_with_padding(&local_bytes, &on_disk)
