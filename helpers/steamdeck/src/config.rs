@@ -100,10 +100,20 @@ impl AppConfig {
             merged_overrides.url = Some(url);
             merged_overrides.port = Some(port);
             merged_overrides.api_url = None;
+            // Safe recursion: the URL is resolved here, once. The inner call must not find
+            // it again, so it gets the maps without the API-URL keys; with them it would
+            // re-read the same API_URL from the environment or config.ini and recurse
+            // forever. A new source for the API URL must be dropped here too.
+            let mut env_values = env_values.clone();
+            let mut ini_values = ini_values.clone();
+            for key in ["ONE_RETRO_API_URL", "API_URL"] {
+                env_values.remove(key);
+                ini_values.remove(key);
+            }
             return AppConfig::from_sources(
                 &merged_overrides,
-                env_values,
-                ini_values,
+                &env_values,
+                &ini_values,
                 binary_dir,
                 config_path,
             );
@@ -496,6 +506,28 @@ SAVE_PATH="/home/snes9x/save"
         )
         .unwrap();
         assert_eq!(cfg.base_url(), "http://192.168.1.9:9096");
+    }
+
+    /// An API_URL from the environment or config.ini, with none on the command line,
+    /// resolves once instead of recursing until the stack overflows.
+    #[test]
+    fn api_url_from_env_or_ini_resolves() {
+        for key in ["API_URL", "ONE_RETRO_API_URL"] {
+            let cfg = test_sources(
+                ConfigOverrides::default(),
+                &[(key, "http://10.0.0.7:9096")],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(cfg.base_url(), "http://10.0.0.7:9096");
+        }
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[],
+            &[("API_URL", "10.0.0.8:3001")],
+        )
+        .unwrap();
+        assert_eq!(cfg.base_url(), "http://10.0.0.8:3001");
     }
 
     #[test]
