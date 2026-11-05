@@ -609,8 +609,8 @@ pub fn classify_supported_save(
             .iter()
             .copied()
             .filter(|slug| is_plausible_save_for_system(&save_ext, save_size, slug));
-        return match (fits.next(), fits.next()) {
-            (Some(slug), None) => classify_if_valid(
+        if let (Some(slug), None) = (fits.next(), fits.next()) {
+            return classify_if_valid(
                 save_path,
                 &save_ext,
                 save_size,
@@ -621,9 +621,30 @@ pub fn classify_supported_save(
                     save_ext,
                     save_size
                 ),
-            ),
-            _ => None,
-        };
+            );
+        }
+        // The ROM can say when the size cannot. A zipped ROM has no system in its
+        // extension, but the folder it was found in names one (`Sega Genesis`,
+        // `Sega - Master System - Mark III`, `Sega Game Gear`), and that folder is
+        // evidence the core directory is not.
+        return rom_path
+            .and_then(|rom| rom_folder_system(rom, slugs))
+            .filter(|slug| is_plausible_save_for_system(&save_ext, save_size, slug))
+            .and_then(|slug| {
+                classify_if_valid(
+                    save_path,
+                    &save_ext,
+                    save_size,
+                    slug,
+                    format!(
+                        "core directory shared by {}, ROM folder names {} + .{} ({} bytes)",
+                        slugs.join(" and "),
+                        slug,
+                        save_ext,
+                        save_size
+                    ),
+                )
+            });
     }
     if contains_any(
         &save_lower,
@@ -941,6 +962,36 @@ pub fn classify_save_in_shared_core_as(
             save_size
         ),
     )
+}
+
+/// The one system among `candidates` that the ROM's own folder names, if any.
+///
+/// Only the folder directly holding the ROM is read, so a collection root like
+/// `Views/LaunchBox` cannot vote; a folder naming two candidates names none.
+fn rom_folder_system(rom_path: &Path, candidates: &[&'static str]) -> Option<&'static str> {
+    let folder = rom_path
+        .parent()?
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let any = |names: &[&str]| names.iter().any(|name| folder.contains(name));
+    let names_system = |slug: &str| -> bool {
+        match slug {
+            "genesis" => any(&["genesis", "mega drive", "megadrive"]),
+            "master-system" => any(&["master system", "mark iii", "mastersystem"]),
+            "game-gear" => any(&["game gear", "gamegear"]),
+            "sega-cd" => any(&["sega cd", "mega cd", "mega-cd", "segacd"]),
+            "sega-32x" => any(&["32x"]),
+            "gba" => any(&["game boy advance", "gameboy advance", "gba"]),
+            "gameboy" => any(&["game boy", "gameboy"]) && !any(&["advance"]),
+            _ => false,
+        }
+    };
+    let mut hits = candidates.iter().copied().filter(|slug| names_system(slug));
+    match (hits.next(), hits.next()) {
+        (Some(slug), None) => Some(slug),
+        _ => None,
+    }
 }
 
 /// The systems a core directory in `haystack` serves, when it serves more than
@@ -2744,6 +2795,64 @@ mod tests {
         }
         let pico = write_save(&tmp.path().join("saves/PicoDrive"), "Doom.srm", 8192);
         assert_eq!(super::classify_supported_save(&pico, None), None);
+    }
+
+    #[test]
+    fn a_zipped_rom_names_a_genesis_plus_gx_save_by_its_folder() {
+        // The arcade's LaunchBox view holds zipped ROMs, whose extension names no
+        // system; the folder holding each ROM does.  Seven saves sat skipped until
+        // the folder was read.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/Genesis Plus GX");
+        let view = tmp.path().join("Views/LaunchBox");
+        for (save, size, folder, want) in [
+            (
+                "3 Ninjas Kick Back (USA).srm",
+                8192,
+                "Sega Genesis",
+                "genesis",
+            ),
+            ("Grind Stormer (USA).srm", 8192, "Sega Genesis", "genesis"),
+            ("Tempo Jr. (World).srm", 8192, "Sega Game Gear", "game-gear"),
+            (
+                "Global Defense (USA, Europe, Brazil) (En).srm",
+                8192,
+                "Sega Master System",
+                "master-system",
+            ),
+            (
+                "Phantasy Star (USA).srm",
+                8192,
+                "Sega - Master System - Mark III",
+                "master-system",
+            ),
+        ] {
+            let save_path = write_save(&dir, save, size);
+            let rom = view.join(folder).join(save.replace(".srm", ".zip"));
+            assert_eq!(
+                super::classify_supported_save(&save_path, Some(&rom)).map(|c| c.system_slug),
+                Some(want.to_string()),
+                "{save} with ROM in {folder}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rom_folder_that_names_no_single_system_still_decides_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = write_save(&tmp.path().join("saves/Genesis Plus GX"), "Thing.srm", 8192);
+        for folder in [
+            "Views/LaunchBox",
+            "Sega Genesis and Game Gear",
+            "Sega Saturn",
+        ] {
+            let rom = tmp.path().join(folder).join("Thing.zip");
+            assert_eq!(
+                super::classify_supported_save(&save, Some(&rom)),
+                None,
+                "{folder}"
+            );
+        }
     }
 
     #[test]
