@@ -581,6 +581,9 @@ fn restore_single_cloud_save(
     // into), a file this helper synced as this system and that already holds
     // the record's bytes is the save -- the target resolver chose it on the same
     // state entry. Without this it reads as absent and is rewritten every pass.
+    // This closure shadows the free function for every call below it in this
+    // function and nowhere else: a call moved into a helper function, or added
+    // above this line, gets the unshadowed check and the rewrite loop returns.
     let known_entries = &*sync_entries;
     let existing_local_save_is_valid = |path: &Path, system_slug: &str| {
         existing_local_save_is_valid(path, system_slug)
