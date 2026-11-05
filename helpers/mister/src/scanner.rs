@@ -100,6 +100,9 @@ pub const SCANNER_SYSTEM_SLUGS: &[&str] = &[
     "saturn",
     "dreamcast",
     "neogeo",
+    "neogeo-cd",
+    "ngp",
+    "virtualboy",
     "wii",
     "psx",
     "ps2",
@@ -2734,6 +2737,10 @@ mod tests {
                 "saturn" => ("bkr", SATURN_INTERNAL_RAW_SIZE as u64),
                 "dreamcast" => ("bin", DC_VMU_SIZE as u64),
                 "neogeo" => ("srm", 65536),
+                // Neo Geo Pocket flash: 32 KiB, a .flash as the ngp arm names.
+                "ngp" => ("flash", 32_768),
+                // Virtual Boy and Neo Geo CD battery RAM: 8 KiB .srm.
+                "virtualboy" | "neogeo-cd" => ("srm", 8192),
                 "wii" => ("bin", (WII_DATA_BIN_FILE_HEADER_OFFSET + 0x1000) as u64),
                 "psx" => ("mcr", PS1_MEMCARD_SIZE as u64),
                 "ps2" => ("ps2", 8 * 1024 * 1024),
