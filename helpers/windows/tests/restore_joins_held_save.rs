@@ -219,3 +219,91 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// The device's own save recorded with a given sha256 string (it need not be the
+/// file's real digest: this pins what the comparison reads).
+fn own_save_recorded_as(rig: &Rig, bytes: &[u8], recorded_sha: &str) {
+    let path = rig.root().join(OWN);
+    fs::write(&path, bytes).unwrap();
+    let body = format!(
+        r#"{{"entries":{{"{}":{{"sha256":"{recorded_sha}","rom_sha1":"other-rom","version":1,"system_slug":"snes","local_container":"native","adapter_profile":"identity","source_kind":"retroarch","source_name":"retroarch","updated_at":"2026-01-01T00:00:00Z"}}}}}}"#,
+        path.display()
+    );
+    fs::write(rig.state().join("sync_state.json"), body).unwrap();
+    rig.server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"success":true,"exists":true,"sha256":"{recorded_sha}","version":1,"id":"save-own"}}"#
+            ));
+    });
+}
+
+#[test]
+fn a_short_digest_matching_a_held_save_s_prefix_is_not_the_same_save() {
+    let rig = rig();
+    let held = save_bytes(0x21);
+    own_save_recorded_as(&rig, &held, &sha256_hex(&held));
+    // The record names only the first 16 hex characters of the held save's
+    // digest: not proof of the same bytes, so the restore goes ahead.
+    let remote = save_bytes(0x44);
+    let short: String = sha256_hex(&held)[..16].to_string();
+    let body = format!(
+        r#"{{"success":true,"total":1,"limit":100,"offset":0,"saves":[{{"id":"save-short","filename":"{SHORT}","displayTitle":"x","systemSlug":"snes","romSha1":"bridge:snes:x","sha256":"{short}","version":1,"latestSizeBytes":8192}}]}}"#
+    );
+    rig.server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200).header("content-type", "application/json").body(body);
+    });
+    let download = rig.server.mock(move |when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(remote);
+    });
+
+    let stderr = sync(&rig);
+
+    assert!(
+        !stderr.contains("already held at"),
+        "an abbreviated digest was treated as the same save:\n{stderr}"
+    );
+    assert_eq!(download.calls(), 1, "the record was not restored:\n{stderr}");
+}
+
+#[test]
+fn two_full_digests_sharing_a_prefix_are_not_the_same_save() {
+    let rig = rig();
+    let remote = save_bytes(0x44);
+    let remote_sha = sha256_hex(&remote);
+    // Same first 16 hex characters, different after: a different save.
+    let mut recorded = remote_sha.clone();
+    let last = if recorded.ends_with('0') { "1" } else { "0" };
+    recorded.replace_range(63..64, last);
+    assert_eq!(recorded.len(), 64);
+    assert_ne!(recorded, remote_sha);
+    own_save_recorded_as(&rig, &save_bytes(0x21), &recorded);
+    let download = short_record(&rig, &remote, "bridge:snes:legend of zelda the - a link to the past");
+
+    let stderr = sync(&rig);
+
+    assert!(
+        !stderr.contains("already held at"),
+        "a different full digest was treated as the same save:\n{stderr}"
+    );
+    assert_eq!(download.calls(), 1, "the record was not restored:\n{stderr}");
+}
+
+#[test]
+fn the_skip_line_names_the_check_that_matched() {
+    let rig = rig();
+    let bytes = save_bytes(0x21);
+    own_save(&rig, &bytes);
+    let _download = short_record(&rig, &bytes, "bridge:snes:legend of zelda the - a link to the past");
+
+    let stderr = sync(&rig);
+
+    assert!(
+        stderr.contains("already held at") && stderr.contains("(matched by bytes)"),
+        "the skip line does not say which check matched:\n{stderr}"
+    );
+}

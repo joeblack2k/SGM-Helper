@@ -815,14 +815,17 @@ fn restore_single_cloud_save(
     // that file is the save. Writing the record under its own name would add a
     // second copy, which the next pass uploads as a new save once the record is
     // gone, and the pair loops.
-    if let Some(held) = held_elsewhere(&provisional_path, cloud_save, &system_slug, sync_entries) {
+    if let Some((held, arm)) =
+        held_elsewhere(&provisional_path, cloud_save, &system_slug, sync_entries)
+    {
         report.skipped += 1;
         eprintln!(
-            "Not restoring {} save '{}' as {}: {} already holds this game's save",
+            "Not restoring {} save '{}' as {}: this save is already held at {} (matched by {})",
             system_slug,
             cloud_save.display_name(),
             provisional_path.display(),
-            held
+            held,
+            arm
         );
         return Ok(());
     }
@@ -1820,16 +1823,17 @@ fn existing_cloud_target_for_alias(
 
 /// Whether the helper's own state records `path` as a save of `system_slug`.
 /// The path of a save this helper already synced for the record's game under
-/// another name: an entry of the same system recorded with the record's ROM
-/// sha1, or one whose recorded bytes are the record's. `target` itself never
-/// counts -- a file at the record's own path is the ordinary update. A
-/// synthetic ROM key (one with a ':') names no ROM, so only bytes decide then.
+/// another name, and which check found it: an entry of the same system recorded
+/// with the record's ROM sha1 ("rom_sha1"), or one whose recorded bytes are the
+/// record's ("bytes"). `target` itself never counts -- a file at the record's own
+/// path is the ordinary update. A synthetic ROM key (one with a ':') names no
+/// ROM, so only bytes decide then.
 fn held_elsewhere(
     target: &Path,
     cloud_save: &CloudSaveSummary,
     system_slug: &str,
     known_saves: &HashMap<String, SyncedEntry>,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     let target_key = target.to_string_lossy();
     let rom = cloud_save
         .rom_sha1
@@ -1841,26 +1845,35 @@ fn held_elsewhere(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let digests_match = |left: &str, right: &str| {
-        let (left, right) = (left.trim().to_ascii_lowercase(), right.to_ascii_lowercase());
-        let shorter = left.len().min(right.len());
-        shorter >= 16 && left[..shorter] == right[..shorter]
-    };
-    let mut held: Vec<&String> = known_saves
+    let mut held: Vec<(&String, &'static str)> = known_saves
         .iter()
         .filter(|(path, entry)| {
             path.as_str() != target_key.as_ref()
                 && entry.system_slug.as_deref() == Some(system_slug)
                 && Path::new(path.as_str()).exists()
-                && (rom
-                    .map(|rom| entry.rom_sha1.as_deref().map(str::trim) == Some(rom))
-                    .unwrap_or(false)
-                    || sha.map(|sha| digests_match(&entry.sha256, sha)).unwrap_or(false))
         })
-        .map(|(path, _)| path)
+        .filter_map(|(path, entry)| {
+            if rom.is_some_and(|rom| entry.rom_sha1.as_deref().map(str::trim) == Some(rom)) {
+                Some((path, "rom_sha1"))
+            } else if sha.is_some_and(|sha| same_save_digest(&entry.sha256, sha)) {
+                Some((path, "bytes"))
+            } else {
+                None
+            }
+        })
         .collect();
     held.sort();
-    held.first().map(|path| (*path).clone())
+    held.first().map(|(path, arm)| ((*path).clone(), *arm))
+}
+
+/// Two sha256 hex digests name the same bytes only when both are full and
+/// equal. Every device's sync_state and the server's listing carry full
+/// 64-character digests (measured on the Deck, arcade and MiSTer), so an
+/// abbreviated value is not evidence of the same save here and never matches --
+/// a short prefix shared by two different saves would skip a real restore.
+fn same_save_digest(left: &str, right: &str) -> bool {
+    let (left, right) = (left.trim().to_ascii_lowercase(), right.trim().to_ascii_lowercase());
+    left.len() == 64 && left == right
 }
 
 fn known_save_for_system(
