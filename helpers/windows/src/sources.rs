@@ -1486,6 +1486,7 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: PathBuf::from("/tmp"),
             config_path: PathBuf::from("/tmp/config.ini"),
+            psp_savedata_bundles: false,
         };
 
         let source = default_source(&cfg, SourceKind::Windows).unwrap();

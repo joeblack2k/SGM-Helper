@@ -54,11 +54,7 @@ struct SyncLock {
 impl SyncLock {
     fn acquire(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("sync.lock");
-        let lock_content = format!(
-            "pid={}\\nstarted_at={}\\n",
-            std::process::id(),
-            now_rfc3339()
-        );
+        let lock_content = format!("pid={}\nstarted_at={}\n", std::process::id(), now_rfc3339());
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -71,11 +67,103 @@ impl SyncLock {
                 Ok(Self { path })
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display());
+                // A sync that died leaves its lock behind, and every later sync would stop here for
+                // good. The lock names its owner; one whose process is gone is taken over, once.
+                let existing = fs::read_to_string(&path).unwrap_or_default();
+                match lock_owner(&existing) {
+                    Some(pid) if !pid_alive(pid) => Self::take_over(&path, pid, &lock_content),
+                    _ => anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display()),
+                }
             }
             Err(err) => Err(err)
                 .with_context(|| format!("kan sync lockfile niet maken: {}", path.display())),
         }
+    }
+}
+
+impl SyncLock {
+    /// Take over a lock whose owner `dead` is gone. Two syncs can find the same dead lock: a rename
+    /// to a name of this process's own moves the file once, so only one of them gets it, and a
+    /// remove by path could delete the lock the other has just created. The renamed file must still
+    /// name `dead`; one naming anyone else is a live lock, put back.
+    fn take_over(path: &Path, dead: u32, lock_content: &str) -> Result<Self> {
+        let busy = || anyhow::anyhow!("sync is al actief (lockfile bestaat): {}", path.display());
+        let stale = path.with_extension(format!("lock.stale.{}", std::process::id()));
+        if fs::rename(path, &stale).is_err() {
+            return Err(busy());
+        }
+        if lock_owner(&fs::read_to_string(&stale).unwrap_or_default()) != Some(dead) {
+            let _ = fs::rename(&stale, path);
+            return Err(busy());
+        }
+        let _ = fs::remove_file(&stale);
+        eprintln!(
+            "oude sync.lock van pid={} verwijderd (proces draait niet meer): {}",
+            dead,
+            path.display()
+        );
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| busy())?;
+        use std::io::Write;
+        file.write_all(lock_content.as_bytes())
+            .with_context(|| format!("kan lockfile niet schrijven: {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// The pid a `sync.lock` names on its `pid=` line. Locks written before the
+/// format was fixed hold a literal backslash-n instead of a newline, all on one
+/// line; the pid is the digits after `pid=` either way, so such a lock can
+/// still be taken over once its owner is gone.
+fn lock_owner(contents: &str) -> Option<u32> {
+    contents
+        .lines()
+        .flat_map(|line| line.split("\\n"))
+        .find_map(|field| field.trim().strip_prefix("pid="))
+        .and_then(|pid| pid.trim().parse().ok())
+}
+
+/// Whether a process with this pid is running. A process that exists but this user may not
+/// signal or open (another user's) counts as running, so its lock is never taken.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess only reads the pid; the handle is closed below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: reads this thread's last error, set by OpenProcess.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        // SAFETY: the handle is open and valid; code is a valid out pointer.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+        // SAFETY: closes the handle opened above, once.
+        unsafe { CloseHandle(handle) };
+        !ok || code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -645,6 +733,8 @@ fn restore_single_cloud_save(
     Ok(())
 }
 
+/// MiSTer has no PSP core, so PSP is not here: a PSP record, a loose file or a PPSSPP SAVEDATA
+/// bundle, has nowhere on this device a game reads it from.
 fn supports_cloud_restore_system(system_slug: &str) -> bool {
     matches!(
         system_slug,
@@ -665,7 +755,6 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "wii"
             | "psx"
             | "ps2"
-            | "psp"
             | "psvita"
             | "ps3"
             | "ps4"
@@ -1244,6 +1333,8 @@ fn process_single_save(
             wii_title_code_from_path(save_path).as_deref(),
             &effective_slot_name,
         ))
+    } else if system_slug == "sega-cd" && crate::scanner::is_sega_cd_shared_bram(save_path) {
+        crate::scanner::sega_cd_bram_line_key(device_type, save_path)
     } else {
         None
     };
@@ -2487,6 +2578,11 @@ fn preferred_save_path(
     if system_slug == "n64" && is_native_n64_extension(current_extension.as_deref()) {
         return save_path.to_path_buf();
     }
+    // A Sega CD backup RAM is read by its own name (scd_U.brm, cart.brm); the
+    // cartridge .srm rule would write a file Genesis Plus GX never opens.
+    if system_slug == "sega-cd" && current_extension.as_deref() == Some("brm") {
+        return save_path.to_path_buf();
+    }
     let Some(preferred_extension) =
         preferred_extension_for_system(source_kind, source_profile, system_slug, canonical_size)
     else {
@@ -3548,6 +3644,61 @@ mod tests {
         assert_eq!(
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
+        );
+    }
+
+    #[test]
+    fn mister_never_restores_a_psp_save() {
+        // MiSTer has no PSP core: a PSP record, loose or a PPSSPP SAVEDATA
+        // bundle, has nowhere on this device a game reads it from.
+        assert!(!supports_cloud_restore_system("psp"));
+        assert!(supports_cloud_restore_system("psx"));
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    #[test]
+    fn a_lock_names_its_owner() {
+        assert_eq!(super::lock_owner("pid=1234\nstarted_at=x\n"), Some(1234));
+        assert_eq!(super::lock_owner("started_at=x\n"), None);
+        assert_eq!(super::lock_owner("pid=abc\n"), None);
+        // The one-line form earlier releases wrote, with a literal backslash-n.
+        assert_eq!(super::lock_owner("pid=1234\\nstarted_at=x\\n"), Some(1234));
+    }
+
+    #[test]
+    fn of_two_takeovers_of_one_dead_lock_exactly_one_succeeds() {
+        let dir = std::env::temp_dir().join(format!("sgm-lock-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sync.lock");
+        std::fs::write(&path, "pid=4194303\nstarted_at=x\n").unwrap();
+        let first = super::SyncLock::take_over(&path, 4_194_303, "pid=1\n");
+        let second = super::SyncLock::take_over(&path, 4_194_303, "pid=2\n");
+        assert!(first.is_ok(), "the first takeover of a dead lock failed");
+        assert!(
+            second.is_err(),
+            "a second takeover deleted the first one's live lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "pid=1\n",
+            "the first sync's lock was replaced"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_alive_tells_a_running_process_from_a_missing_one() {
+        assert!(
+            super::pid_alive(std::process::id()),
+            "this test's own process reads as dead"
+        );
+        assert!(
+            !super::pid_alive(4_194_303),
+            "a pid naming no process reads as alive"
         );
     }
 }
