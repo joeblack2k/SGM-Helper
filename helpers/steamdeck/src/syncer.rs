@@ -1290,6 +1290,14 @@ fn extension_from_filename(filename: &str) -> Option<String> {
 /// The restore target without any record of what has been synced; used by the
 /// tests, which have no state to consult. A real restore goes through
 /// `cloud_target_path_with_known`.
+/// Whether `longer` is `shorter` followed only by 0xFF bytes: the same save from
+/// a core that pads its SRAM and one that doesn't.
+fn same_save_with_padding(shorter: &[u8], longer: &[u8]) -> bool {
+    longer.len() >= shorter.len()
+        && longer.starts_with(shorter)
+        && longer[shorter.len()..].iter().all(|byte| *byte == 0xFF)
+}
+
 #[cfg(test)]
 fn cloud_target_path(
     cloud_save: &CloudSaveSummary,
@@ -3463,6 +3471,41 @@ fn process_single_save(
             && existing.len() != local_bytes.len() as u64
             && local_file_is_some_save(&target_save_path)
         {
+            // Padding is not a difference: the same save written by a core that
+            // pads and one that doesn't must not leave two devices disagreeing.
+            // Read the file only on the mismatch, to compare the bytes that carry
+            // the save.
+            if let Ok(on_disk) = std::fs::read(&target_save_path) {
+                let padded = if on_disk.len() >= local_bytes.len() {
+                    same_save_with_padding(&local_bytes, &on_disk)
+                } else {
+                    same_save_with_padding(&on_disk, &local_bytes)
+                };
+                if padded {
+                    report.in_sync += 1;
+                    eprintln!(
+                        "Keeping {} ({} bytes): record {} is the same save at {} bytes, the difference is 0xFF padding",
+                        target_save_path.display(),
+                        on_disk.len(),
+                        save_id,
+                        local_bytes.len()
+                    );
+                    return Ok(Some(processed_entry(
+                        state_key.clone(),
+                        synced_entry(
+                            local_sha,
+                            Some(active_rom_sha1.clone()),
+                            latest.version,
+                            Some(&system_slug),
+                            Some(normalized_save.local_container),
+                            Some(normalized_save.adapter_profile),
+                            Some(source_kind),
+                            Some(source_name),
+                            Some(&effective_slot_name),
+                        ),
+                    )));
+                }
+            }
             report.refused_size_mismatch += 1;
             eprintln!(
                 "Refusing to write record {} ({} bytes) over {} ({} bytes): a save keeps its size, so this payload is a different save or a canonical form the game never wrote",

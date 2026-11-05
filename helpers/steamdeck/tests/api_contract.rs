@@ -3273,6 +3273,57 @@ fn a_download_that_would_change_a_master_system_saves_size_is_refused() {
     );
 }
 
+// Padding is not a size difference. The same GBA save written by a core that pads
+// its SRAM to 128 KiB with 0xFF and stored by the server at 32 KiB is one save:
+// refusing it as "a different save" leaves the two devices disagreeing forever.
+#[test]
+fn a_save_that_differs_only_by_ff_padding_is_in_sync_not_refused() {
+    let save: Vec<u8> = (0..32_768u32).map(|i| (i % 233) as u8 | 1).collect();
+    let mut padded = save.clone();
+    padded.resize(131_072, 0xFF);
+    let (after, log, _) = local_after_a_download_of(
+        "gba",
+        "gba",
+        "Kirby - Nightmare in Dream Land (USA).srm",
+        &padded,
+        &save,
+    );
+    assert_eq!(after, padded, "the padded local save was rewritten:\n{log}");
+    assert!(
+        log.contains("refused_size_mismatch=0"),
+        "padding was refused as a different save:\n{log}"
+    );
+    assert!(
+        log.contains("the difference is 0xFF padding"),
+        "the padding decision was not named:\n{log}"
+    );
+    assert!(
+        log.contains("in_sync=1"),
+        "the padded save was not counted in sync:\n{log}"
+    );
+}
+
+// Only 0xFF padding is forgiven: a longer local file whose tail holds data is a
+// different save and stays refused.
+#[test]
+fn a_longer_save_whose_tail_is_not_ff_padding_is_still_refused() {
+    let save: Vec<u8> = (0..32_768u32).map(|i| (i % 233) as u8 | 1).collect();
+    let mut longer = save.clone();
+    longer.resize(131_072, 0x5A);
+    let (after, log, _) = local_after_a_download_of(
+        "gba",
+        "gba",
+        "Kirby - Nightmare in Dream Land (USA).srm",
+        &longer,
+        &save,
+    );
+    assert_eq!(after, longer, "the local save was overwritten:\n{log}");
+    assert!(
+        log.contains("refused_size_mismatch=1"),
+        "a real size difference was not refused:\n{log}"
+    );
+}
+
 fn romroot_helper() -> Command {
     Command::cargo_bin("sgm-steamdeck-helper").unwrap()
 }
