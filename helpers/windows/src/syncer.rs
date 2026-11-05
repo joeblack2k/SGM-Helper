@@ -1824,8 +1824,8 @@ fn existing_cloud_target_for_alias(
 /// Whether the helper's own state records `path` as a save of `system_slug`.
 /// The path of a save this helper already synced for the record's game under
 /// another name, and which check found it: an entry of the same system recorded
-/// with the record's ROM sha1 ("rom_sha1"), or one whose recorded bytes are the
-/// record's ("bytes"). `target` itself never counts -- a file at the record's own
+/// with the record's ROM sha1 ("rom_sha1", cartridge systems and primary saves
+/// only), or one whose recorded bytes are the record's ("bytes"). `target` itself never counts -- a file at the record's own
 /// path is the ordinary update. A synthetic ROM key (one with a ':') names no
 /// ROM, so only bytes decide then.
 fn held_elsewhere(
@@ -1839,7 +1839,8 @@ fn held_elsewhere(
         .rom_sha1
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.contains(':'));
+        .filter(|value| !value.is_empty() && !value.contains(':'))
+        .filter(|_| one_save_per_rom(system_slug) && !is_sidecar_path(&cloud_save.filename));
     let sha = cloud_save
         .sha256
         .as_deref()
@@ -1853,7 +1854,9 @@ fn held_elsewhere(
                 && Path::new(path.as_str()).exists()
         })
         .filter_map(|(path, entry)| {
-            if rom.is_some_and(|rom| entry.rom_sha1.as_deref().map(str::trim) == Some(rom)) {
+            if rom.is_some_and(|rom| entry.rom_sha1.as_deref().map(str::trim) == Some(rom))
+                && !is_sidecar_path(path)
+            {
                 Some((path, "rom_sha1"))
             } else if sha.is_some_and(|sha| same_save_digest(&entry.sha256, sha)) {
                 Some((path, "bytes"))
@@ -1864,6 +1867,38 @@ fn held_elsewhere(
         .collect();
     held.sort();
     held.first().map(|(path, arm)| ((*path).clone(), *arm))
+}
+
+/// Systems where a ROM has exactly one save, the cartridge's. Elsewhere one ROM
+/// legitimately holds several saves at different paths -- a PS1 game's cards per
+/// slot ("Game: <name>"), shared PS2 cards, Dreamcast VMUs, Saturn internal and
+/// cartridge memory, Sega CD BRAM, PSP SAVEDATA folders, Wii title data -- and a
+/// restore names its file from the record alone, so the ROM says nothing about
+/// which of them a record is. There only identical bytes mean the same save.
+fn one_save_per_rom(system_slug: &str) -> bool {
+    matches!(
+        system_slug,
+        "nes"
+            | "snes"
+            | "gameboy"
+            | "gba"
+            | "n64"
+            | "nds"
+            | "genesis"
+            | "master-system"
+            | "game-gear"
+            | "sega-32x"
+            | "neogeo"
+    )
+}
+
+/// A clock (.rtc) or controller-pak (.mpk, .cpk) sidecar sits beside its game's
+/// primary save under the same ROM, so a shared ROM never makes it that save.
+fn is_sidecar_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| crate::scanner::is_sidecar(&value.to_ascii_lowercase()))
 }
 
 /// Two sha256 hex digests name the same bytes only when both are full and

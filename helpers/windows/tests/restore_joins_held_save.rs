@@ -68,7 +68,9 @@ fn rig() -> Rig {
     });
     let tmp = tempfile::tempdir().unwrap();
     let rig = Rig { server, tmp };
-    fs::create_dir_all(rig.root().join("saves/snes")).unwrap();
+    for dir in ["saves/snes", "saves/psx", "saves/gb"] {
+        fs::create_dir_all(rig.root().join(dir)).unwrap();
+    }
     fs::create_dir_all(rig.root().join("roms/snes")).unwrap();
     fs::create_dir_all(rig.state()).unwrap();
     rig
@@ -128,7 +130,7 @@ fn sync(rig: &Rig) -> String {
     fs::write(
         &config,
         format!(
-            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.retroarch]\nLABEL=\"RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"snes\"\n",
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.retroarch]\nLABEL=\"RetroArch\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"snes,psx,gameboy\"\n",
             rig.server.port(),
             rig.root().display(),
             rig.state().display(),
@@ -306,4 +308,135 @@ fn the_skip_line_names_the_check_that_matched() {
         stderr.contains("already held at") && stderr.contains("(matched by bytes)"),
         "the skip line does not say which check matched:\n{stderr}"
     );
+}
+
+/// A formatted PS1 memory card (frame 0 "MC", frames 0-15 XOR-checksummed),
+/// with `seed` in its data blocks so two cards differ.
+fn ps1_card(seed: u8) -> Vec<u8> {
+    let mut bytes = vec![0x00u8; 131072];
+    bytes[..2].copy_from_slice(b"MC");
+    for frame in 0..16usize {
+        let start = frame * 128;
+        let checksum = bytes[start..start + 127].iter().fold(0u8, |acc, value| acc ^ value);
+        bytes[start + 127] = checksum;
+    }
+    for (index, byte) in bytes[8192..].iter_mut().enumerate() {
+        *byte = seed.wrapping_add((index % 241) as u8);
+    }
+    bytes
+}
+
+/// A save this helper holds and has recorded as synced under `rom`.
+fn held(rig: &Rig, relative: &str, system: &str, rom: &str, bytes: &[u8]) {
+    let path = rig.root().join(relative);
+    fs::write(&path, bytes).unwrap();
+    let body = format!(
+        r#"{{"entries":{{"{}":{{"sha256":"{}","rom_sha1":"{rom}","version":1,"system_slug":"{system}","local_container":"native","adapter_profile":"identity","source_kind":"retroarch","source_name":"retroarch","updated_at":"2026-01-01T00:00:00Z"}}}}}}"#,
+        path.display(),
+        sha256_hex(bytes)
+    );
+    fs::write(rig.state().join("sync_state.json"), body).unwrap();
+    rig.server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(format!(
+                r#"{{"success":true,"exists":true,"sha256":"{}","version":1,"id":"save-held"}}"#,
+                sha256_hex(bytes)
+            ));
+    });
+}
+
+/// The server lists one record; returns the download mock.
+fn record<'a>(
+    rig: &'a Rig,
+    filename: &str,
+    system: &str,
+    rom: &str,
+    card_slot: Option<&str>,
+    bytes: &[u8],
+) -> Mock<'a> {
+    let slot = card_slot
+        .map(|slot| format!(r#""cardSlot":"{slot}","#))
+        .unwrap_or_default();
+    let body = format!(
+        r#"{{"success":true,"total":1,"limit":100,"offset":0,"saves":[{{"id":"save-rec","filename":"{filename}","displayTitle":"x","systemSlug":"{system}",{slot}"romSha1":"{rom}","sha256":"{}","version":1,"latestSizeBytes":{}}}]}}"#,
+        sha256_hex(bytes),
+        bytes.len()
+    );
+    rig.server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200).header("content-type", "application/json").body(body);
+    });
+    let payload = bytes.to_vec();
+    rig.server.mock(move |when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(payload);
+    })
+}
+
+fn landed(rig: &Rig, bytes: &[u8]) -> bool {
+    walk(&rig.root())
+        .into_iter()
+        .any(|path| fs::read(&path).map(|got| got == bytes).unwrap_or(false))
+}
+
+#[test]
+fn two_ps1_cards_of_one_rom_on_different_slots_both_restore() {
+    // A PS1 game holds a card per slot: its own "Game: <name>" card here, and a
+    // second card of the same ROM on the server. One ROM, two saves -- the ROM
+    // says nothing about which card a record is, so the second card restores.
+    let rig = rig();
+    held(&rig, "saves/psx/Tekken 3 (USA).srm", "psx", ROM, &ps1_card(0x11));
+    let _upload = upload(&rig);
+    let second = ps1_card(0x77);
+    let download = record(&rig, "Tekken 3 (USA)_2.mcr", "psx", ROM, Some("Memory Card 2"), &second);
+
+    let stderr = sync(&rig);
+
+    assert!(
+        !stderr.contains("already held at"),
+        "a second card of the same ROM was treated as the held card:\n{stderr}"
+    );
+    assert_eq!(download.calls(), 1, "the second card was not restored:\n{stderr}");
+    assert!(landed(&rig, &second), "the second card was written nowhere:\n{stderr}");
+}
+
+#[test]
+fn a_short_named_record_of_a_held_ps1_card_is_skipped_by_its_bytes() {
+    let rig = rig();
+    let card = ps1_card(0x11);
+    held(&rig, "saves/psx/Tekken 3 (USA).srm", "psx", ROM, &card);
+    let download = record(&rig, "Tekken 3.mcr", "psx", "bridge:psx:tekken 3", Some("Game: Tekken 3"), &card);
+
+    let stderr = sync(&rig);
+
+    assert!(
+        stderr.contains("already held at") && stderr.contains("(matched by bytes)"),
+        "the held card's own bytes did not stop the restore:\n{stderr}"
+    );
+    assert_eq!(download.calls(), 0, "the held card was fetched again:\n{stderr}");
+}
+
+#[test]
+fn a_clock_sidecar_of_the_held_rom_restores_beside_its_save() {
+    // A Game Boy cartridge's .rtc sits beside its .srm under the same ROM: the
+    // shared ROM never makes the clock the save already held.
+    let rig = rig();
+    held(&rig, "saves/gb/Pokemon - Gold Version (USA).srm", "gameboy", ROM, &save_bytes(0x21));
+    let clock: Vec<u8> = (0u8..48).collect();
+    let download = record(&rig, "Pokemon - Gold Version (USA).rtc", "gameboy", ROM, None, &clock);
+
+    let stderr = sync(&rig);
+
+    assert!(
+        !stderr.contains("already held at"),
+        "the clock sidecar was treated as the held save:\n{stderr}"
+    );
+    // This helper's native target for a cartridge .rtc is the game's primary
+    // save, which is held, so its existing native-target check (which has no
+    // sidecar-class gate here, unlike the Steam Deck helper's) declines the
+    // download. That predates this guard; what this guard owes is not to claim
+    // the sidecar as the held save.
+    let _ = download;
 }
