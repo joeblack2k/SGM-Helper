@@ -110,6 +110,117 @@ fn login_with_app_password_persists_token() {
     assert_eq!(auth["token"], "tok_test");
 }
 
+// A state entry for a file that is gone is restored from the server. The
+// entry names the system the file was synced as; without it on the request,
+// a server answering by ROM key alone offers another system's record (a Game
+// Boy save under the same ROM, written into the GBA folder).
+fn missing_restore_fixture(
+    server: &MockServer,
+) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_miss","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"miss@example.com"}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    let gba = root.join("GBA");
+    fs::create_dir_all(&gba).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let missing = gba.join("crystal.sav");
+    let state = serde_json::json!({
+        "entries": {
+            missing.to_string_lossy(): {
+                "sha256": "00",
+                "rom_sha1": "gb-rom-sha1",
+                "version": 1,
+                "system_slug": "gba",
+                "local_container": "native",
+                "adapter_profile": "identity",
+                "slot_name": "default",
+                "updated_at": "2026-11-05T00:00:00Z"
+            }
+        }
+    });
+    fs::write(state_dir.join("sync_state.json"), state.to_string()).unwrap();
+    let config = write_config(&tmp, server, &root, &state_dir);
+    let mut ini = fs::read_to_string(&config).unwrap();
+    ini.push_str(&format!(
+        "\n[source.gba]\nLABEL=\"gba\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}\"\nROM_PATH=\"{}\"\nRECURSIVE=\"true\"\nSYSTEMS=\"gameboy,gba\"\nCREATE_MISSING_SYSTEM_DIRS=\"false\"\nMANAGED=\"false\"\nORIGIN=\"manual\"\n",
+        root.display(),
+        tmp.path().join("roms").display()
+    ));
+    fs::write(&config, ini).unwrap();
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("miss@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    (tmp, config, missing)
+}
+
+#[test]
+fn a_missing_save_restore_names_the_system_it_was_synced_as() {
+    let server = MockServer::start();
+    // The server's answer for a request that names the gba system: this ROM
+    // key holds no gba record (its record is another system's).
+    let scoped = server.mock(|when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("romSha1", "gb-rom-sha1")
+            .query_param("system", "gba");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    // Asked without a system, a server answering by ROM key alone offers the
+    // other system's record.
+    let unscoped = server.mock(|when, then| {
+        when.method(GET).path("/save/latest").query_param("romSha1", "gb-rom-sha1");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":true,"sha256":"8a39d2abd3999ab73c34db2476849cddf303ce389b35826850f9a700589b4a90","version":3,"id":"save-gb"}"#);
+    });
+    let download = server.mock(|when, then| {
+        when.method(GET).path_includes("save-gb");
+        then.status(200).body(vec![0x11u8; 32768]);
+    });
+    let (_tmp, config, missing) = missing_restore_fixture(&server);
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .assert()
+        .success();
+    assert_eq!(
+        scoped.calls(),
+        1,
+        "the restore names the system the file was synced as"
+    );
+    assert_eq!(unscoped.calls(), 0, "no restore asks without a system");
+    assert_eq!(
+        download.calls(),
+        0,
+        "another system's record is not downloaded"
+    );
+    assert!(!missing.exists(), "nothing is written into the gba folder");
+}
+
 #[test]
 fn login_with_password_uses_login_and_token_endpoints() {
     let server = MockServer::start();
