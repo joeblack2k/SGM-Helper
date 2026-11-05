@@ -2607,6 +2607,57 @@ fn process_single_save(
         // Nothing agreed yet (first sync): not a conflict, fall through.
         None => (false, false),
     };
+    // A conflict someone decided, for exactly these two hashes: act on it once.
+    // keep_local uploads this file (the local-moved path); keep_server lets the
+    // download below replace it.  Either path records the result in sync_state.
+    let remote_for_decision = latest.sha256.as_deref().unwrap_or("");
+    let decision = if (local_moved && remote_moved)
+        || (prior_entry.is_none()
+            && latest.exists
+            && !remote_for_decision.is_empty()
+            && remote_for_decision != local_sha.as_str())
+    {
+        pending_decision(
+            api,
+            &active_rom_sha1,
+            &effective_slot_name,
+            device_type,
+            fingerprint,
+            app_password,
+            &runtime_target,
+            &local_sha,
+            remote_for_decision,
+        )
+    } else {
+        None
+    };
+    let keep_server = decision
+        .as_ref()
+        .is_some_and(|(_, resolution)| resolution == "keep_server");
+    let (local_moved, remote_moved) = match &decision {
+        Some((_, resolution)) if resolution == "keep_local" => (true, false),
+        Some(_) => (false, true),
+        None => (local_moved, remote_moved),
+    };
+    if let Some((conflict_id, resolution)) = &decision {
+        eprintln!(
+            "Acting on the {} decision for {}: local {} / server {}",
+            resolution,
+            save_path.display(),
+            &local_sha[..local_sha.len().min(8)],
+            &remote_for_decision[..remote_for_decision.len().min(8)]
+        );
+        if !options.dry_run {
+            report_decision_applied(
+                api,
+                conflict_id,
+                &local_sha,
+                remote_for_decision,
+                app_password,
+                save_path,
+            );
+        }
+    }
 
     if local_moved && remote_moved {
         // Both sides moved, and neither is more real.  Touch neither.
@@ -2813,7 +2864,9 @@ fn process_single_save(
         }
         Err(err) => return Err(err),
     };
-    if conflict.exists {
+    // A conflict decided for exactly this pair was acted on above; the server
+    // still lists it until the applied report lands, so it isn't a reason to stop.
+    if conflict.exists && !keep_server {
         let conflict_result = handle_conflict(
             api,
             save_path,
@@ -3010,6 +3063,7 @@ fn process_single_save(
         // local one).  A blank file an emulator creates before the first save holds
         // no progress, so it still takes the server's copy.
         if prior_entry.is_none()
+            && !keep_server
             && canonical_bytes != normalized_save.canonical_bytes
             && !is_blank_save(&normalized_save.canonical_bytes)
         {
@@ -4250,6 +4304,61 @@ fn filename_with_extension(filename: &str, target_ext: &str) -> Option<String> {
 /// before the game has saved anything.
 fn is_blank_save(bytes: &[u8]) -> bool {
     bytes.iter().all(|value| *value == 0x00) || bytes.iter().all(|value| *value == 0xFF)
+}
+/// The side a conflict decision chose, when the server holds one made for exactly
+/// this pair of hashes.  A decision for any other pair is stale and ignored here
+/// (the conflict is reported again), and a server without decisions, or one that
+/// can't be reached, yields none: the conflict stays as it is.
+#[allow(clippy::too_many_arguments)]
+fn pending_decision(
+    api: &ApiClient,
+    rom_sha1: &str,
+    slot_name: &str,
+    device_type: &str,
+    fingerprint: &str,
+    app_password: Option<&str>,
+    runtime_target: &RuntimeTarget,
+    local_sha: &str,
+    remote_sha: &str,
+) -> Option<(String, String)> {
+    let check = api
+        .conflict_decision(
+            rom_sha1,
+            slot_name,
+            device_type,
+            fingerprint,
+            app_password,
+            Some(runtime_target),
+        )
+        .ok()?;
+    let resolution = check
+        .resolution
+        .filter(|value| value == "keep_local" || value == "keep_server")?;
+    if check.local_sha256.as_deref() != Some(local_sha)
+        || check.cloud_sha256.as_deref() != Some(remote_sha)
+    {
+        return None;
+    }
+    Some((check.conflict_id?, resolution))
+}
+
+/// Tells the server the decision was acted on.  Failure leaves the conflict open
+/// on the server, which only costs a repeat report; it never undoes the action.
+fn report_decision_applied(
+    api: &ApiClient,
+    conflict_id: &str,
+    local_sha: &str,
+    remote_sha: &str,
+    app_password: Option<&str>,
+    save_path: &Path,
+) {
+    if let Err(err) = api.conflict_applied(conflict_id, local_sha, remote_sha, app_password) {
+        eprintln!(
+            "Acted on the conflict decision for {} but could not report it: {}",
+            save_path.display(),
+            err
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
