@@ -189,10 +189,44 @@ pub fn sha1_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// The ROM's md5, read in 8 KiB blocks. A ROM can be a whole CD image
+/// (hundreds of MiB), so reading it into memory at once can exhaust a small
+/// device: the kernel kills the helper mid-sync.
 pub fn md5_file(path: &Path) -> Result<String> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("kan ROM niet lezen: {}", path.display()))?;
-    Ok(format!("{:x}", md5::compute(bytes)))
+    let file =
+        File::open(path).with_context(|| format!("kan ROM niet openen: {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut context = md5::Context::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .with_context(|| format!("kan ROM niet lezen: {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        context.consume(&buffer[..read]);
+    }
+    Ok(format!("{:x}", context.finalize()))
+}
+
+#[cfg(test)]
+mod md5_file_tests {
+    use super::md5_file;
+
+    // A file larger than the read block hashes to the same md5 as the whole
+    // buffer: the streamed read is the same answer without holding the ROM.
+    #[test]
+    fn md5_of_a_file_is_streamed_and_matches_the_whole_buffer() {
+        let bytes: Vec<u8> = (0..100_003u32).map(|i| (i % 251) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rom.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            md5_file(&path).unwrap(),
+            format!("{:x}", md5::compute(&bytes))
+        );
+    }
 }
 
 pub fn sha256_bytes(bytes: &[u8]) -> String {
