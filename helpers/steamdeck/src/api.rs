@@ -547,14 +547,25 @@ impl ApiClient {
         payload.user.context("/auth/me response bevat geen user")
     }
 
-    pub fn lookup_rom(&self, filename_stem: &str) -> Result<LookupRomResponse> {
+    /// `system` scopes the lookup to one system's ROM key. A stem shared by
+    /// several systems (NBA Jam - Tournament Edition is a Genesis, 32X and Game
+    /// Gear game) otherwise gets one key for all of them, and `/save/latest`
+    /// offers one system's record to another. `None` asks the stem's key, the
+    /// form every record uploaded before the scoped key was written under.
+    pub fn lookup_rom(
+        &self,
+        filename_stem: &str,
+        system: Option<&str>,
+    ) -> Result<LookupRomResponse> {
         let url = self.url("/rom/lookup");
-        let response = self
+        let mut request = self
             .client
             .get(url)
-            .query(&[("filenameStem", filename_stem)])
-            .send()
-            .context("request naar /rom/lookup faalde")?;
+            .query(&[("filenameStem", filename_stem)]);
+        if let Some(system) = system.map(str::trim).filter(|value| !value.is_empty()) {
+            request = request.query(&[("system", system)]);
+        }
+        let response = request.send().context("request naar /rom/lookup faalde")?;
         parse_json_response(response)
     }
 

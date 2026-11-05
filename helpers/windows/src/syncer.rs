@@ -2313,8 +2313,17 @@ fn process_single_save(
             rom_md5 = Some(local_rom_md5);
         }
     }
+    // Set when the ROM key came from the server's lookup scoped to this
+    // system: a record uploaded before the scoped key existed sits under the
+    // stem's key instead, and is asked for once if the scoped key finds nothing.
+    let mut rom_key_from_scoped_lookup = false;
     if rom_sha1.is_none() {
-        let lookup = api.lookup_rom(&stem).ok();
+        let lookup = api.lookup_rom(&stem, Some(&system_slug)).ok();
+        rom_key_from_scoped_lookup = lookup
+            .as_ref()
+            .and_then(|value| value.rom.as_ref())
+            .and_then(|value| value.sha1.as_ref())
+            .is_some();
         rom_sha1 = lookup
             .as_ref()
             .and_then(|value| value.rom.as_ref())
@@ -2325,7 +2334,7 @@ fn process_single_save(
             .and_then(|value| value.md5.clone());
     }
 
-    let Some(active_rom_sha1) = rom_sha1 else {
+    let Some(mut active_rom_sha1) = rom_sha1 else {
         report.skipped += 1;
         if verbose {
             eprintln!("No ROM mapping found for save {}", stem);
@@ -2334,7 +2343,7 @@ fn process_single_save(
     };
 
     let latest_context = latest_save_context(save_path, &system_slug);
-    let latest = match api.latest_save(LatestSaveRequest {
+    let mut latest = match api.latest_save(LatestSaveRequest {
         rom_sha1: &active_rom_sha1,
         slot_name: &effective_slot_name,
         device_type,
@@ -2391,6 +2400,60 @@ fn process_single_save(
         }
         Err(err) => return Err(err),
     };
+
+    // The scoped ROM key found no record. A record uploaded before the scoped
+    // key existed sits under the stem's key: ask for it once. The request still
+    // names this system, so the server offers that record only when it is this
+    // system's save, never another system's that shares the stem.
+    if !latest.exists && rom_key_from_scoped_lookup {
+        let legacy_sha1 = api
+            .lookup_rom(&stem, None)
+            .ok()
+            .and_then(|value| value.rom)
+            .and_then(|value| value.sha1);
+        if let Some(legacy_sha1) = legacy_sha1.filter(|value| value != &active_rom_sha1) {
+            match api.latest_save(LatestSaveRequest {
+                rom_sha1: &legacy_sha1,
+                slot_name: &effective_slot_name,
+                device_type,
+                fingerprint,
+                app_password,
+                runtime_target: Some(&runtime_target),
+                context: Some(&latest_context),
+            }) {
+                Ok(legacy) if legacy.exists => {
+                    if verbose {
+                        eprintln!(
+                            "{}: the {} record sits under the stem's key; syncing against it",
+                            save_path.display(),
+                            system_slug
+                        );
+                    }
+                    active_rom_sha1 = legacy_sha1;
+                    latest = legacy;
+                }
+                // The server answers a request naming this system with this
+                // system's record only (RSM#68), so a record of another system
+                // under the stem's key comes back absent. Its system isn't in
+                // the answer, so the line names the stem's key instead.
+                Ok(_) => eprintln!(
+                    "{}: no {} record under the scoped key or the stem's key ({}); a record of another system under the stem's key is not taken",
+                    save_path.display(),
+                    system_slug,
+                    stem
+                ),
+                Err(err) => {
+                    if verbose {
+                        eprintln!(
+                            "{}: the stem's key could not be checked ({err:#}); keeping the {} key",
+                            save_path.display(),
+                            system_slug
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // The server holding these bytes means the save is in sync only if this
     // device last synced it under the card it is offered under now. A save

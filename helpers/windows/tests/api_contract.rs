@@ -69,6 +69,226 @@ fn write_config(
     config_path
 }
 
+// A lookup names this save's system; a stem shared by several systems
+// (NBA Jam - Tournament Edition is a Genesis, 32X and Game Gear game) otherwise
+// gets one ROM key for all of them, and /save/latest offers one system's record
+// to another.
+fn system_lookup_fixture(server: &MockServer) -> (TempDir, std::path::PathBuf) {
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_sys","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"sys@example.com"}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("Nintendo/Game Boy/wario.sav"),
+        vec![0x00u8; 32768],
+    )
+    .unwrap();
+    let config = write_config(&tmp, server, &root, &state_dir);
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("sys@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+    (tmp, config)
+}
+
+fn mock_scoped_lookups(server: &MockServer) -> (httpmock::Mock<'_>, httpmock::Mock<'_>) {
+    let scoped = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup").query_param_exists("system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"scoped-sha","md5":"m1","fileName":"wario.sav"}}"#);
+    });
+    let unscoped = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup").query_param_missing("system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"legacy-sha","md5":"m2","fileName":"wario.sav"}}"#);
+    });
+    (scoped, unscoped)
+}
+
+fn mock_latest<'a>(server: &'a MockServer, rom_sha1: &str, exists: bool) -> httpmock::Mock<'a> {
+    let body = if exists {
+        r#"{"success":true,"exists":true,"sha256":"8a39d2abd3999ab73c34db2476849cddf303ce389b35826850f9a700589b4a90","version":3,"id":"save-held"}"#
+    } else {
+        r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#
+    };
+    let rom_sha1 = rom_sha1.to_string();
+    server.mock(move |when, then| {
+        when.method(GET)
+            .path("/save/latest")
+            .query_param("romSha1", rom_sha1.as_str())
+            .query_param_exists("system");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(body);
+    })
+}
+
+fn mock_upload(server: &MockServer) -> httpmock::Mock<'_> {
+    server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-up","sha256":"up","version":1}}"#);
+    })
+}
+
+fn sync_once(config: &std::path::Path) {
+    Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(config)
+        .arg("sync")
+        .assert()
+        .success();
+}
+
+#[test]
+fn a_rom_lookup_names_the_save_system() {
+    let server = MockServer::start();
+    let (scoped, unscoped) = mock_scoped_lookups(&server);
+    let _latest = mock_latest(&server, "scoped-sha", true);
+    let _upload = mock_upload(&server);
+    let (_tmp, config) = system_lookup_fixture(&server);
+    sync_once(&config);
+    assert_eq!(
+        scoped.calls(),
+        1,
+        "the ROM lookup must name the save's system"
+    );
+    assert_eq!(
+        unscoped.calls(),
+        0,
+        "a scoped key that finds a record needs no lookup of the stem's key"
+    );
+}
+
+#[test]
+fn a_record_of_this_system_under_the_stem_key_is_found() {
+    let server = MockServer::start();
+    let (scoped, unscoped) = mock_scoped_lookups(&server);
+    let _scoped_latest = mock_latest(&server, "scoped-sha", false);
+    // The server answers a request naming this system with this system's
+    // record only, so a hit on the stem's key is this save's own record.
+    let legacy_latest = mock_latest(&server, "legacy-sha", true);
+    let upload = mock_upload(&server);
+    let (_tmp, config) = system_lookup_fixture(&server);
+    sync_once(&config);
+    assert_eq!(scoped.calls(), 1, "the scoped key is asked first");
+    assert_eq!(
+        unscoped.calls(),
+        1,
+        "a scoped miss asks the stem's key once"
+    );
+    assert_eq!(
+        legacy_latest.calls(),
+        1,
+        "the stem's key is checked, naming this system"
+    );
+    assert_eq!(
+        upload.calls(),
+        0,
+        "the record under the stem's key is this save: nothing goes up"
+    );
+}
+
+#[test]
+fn another_system_record_under_the_stem_key_is_not_taken() {
+    let server = MockServer::start();
+    let (_scoped, unscoped) = mock_scoped_lookups(&server);
+    let _scoped_latest = mock_latest(&server, "scoped-sha", false);
+    // Another system's record under the stem's key: a server that is told the
+    // system answers it as absent, and the save goes up under its own key.
+    let legacy_latest = mock_latest(&server, "legacy-sha", false);
+    let upload_scoped = server.mock(|when, then| {
+        when.method(POST).path("/saves").body_includes("scoped-sha");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-s","sha256":"up","version":1}}"#);
+    });
+    let upload_legacy = server.mock(|when, then| {
+        when.method(POST).path("/saves").body_includes("legacy-sha");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-l","sha256":"up","version":1}}"#);
+    });
+    let (_tmp, config) = system_lookup_fixture(&server);
+    let output = Command::cargo_bin("sgm-windows-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a record of another system under the stem's key is not taken"),
+        "the rejection is reported: {stderr}"
+    );
+    assert_eq!(unscoped.calls(), 1);
+    assert_eq!(legacy_latest.calls(), 1);
+    assert_eq!(
+        upload_scoped.calls(),
+        1,
+        "the save goes up under this system's own key"
+    );
+    assert_eq!(
+        upload_legacy.calls(),
+        0,
+        "never under the key another system's record holds"
+    );
+}
+
+#[test]
+fn a_server_without_scoped_keys_behaves_as_before() {
+    let server = MockServer::start();
+    // An older server ignores `system` and answers the stem's key both times.
+    let lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"same-sha","md5":"m","fileName":"wario.sav"}}"#);
+    });
+    let latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = mock_upload(&server);
+    let (_tmp, config) = system_lookup_fixture(&server);
+    sync_once(&config);
+    assert_eq!(
+        latest.calls(),
+        1,
+        "the same key is not asked of /save/latest twice"
+    );
+    assert_eq!(upload.calls(), 1);
+    assert_eq!(lookup.calls(), 2);
+}
+
 #[test]
 fn login_with_app_password_persists_token() {
     let server = MockServer::start();
@@ -498,7 +718,9 @@ fn sync_uploads_when_no_cloud_save_exists() {
         .assert()
         .success();
 
-    assert_eq!(rom_lookup.calls(), 1);
+    // The scoped lookup, then the stem's key once because the scoped key found
+    // nothing; the same sha1 for both is not asked of /save/latest twice.
+    assert_eq!(rom_lookup.calls(), 2);
     assert_eq!(save_latest.calls(), 1);
     assert_eq!(upload.calls(), 1);
 }
@@ -721,7 +943,9 @@ fn sync_auto_enrolls_when_gate_is_open_without_login() {
 
     assert_eq!(auto_status.calls(), 1);
     assert_eq!(auto_token.calls(), 1);
-    assert_eq!(rom_lookup.calls(), 1);
+    // The scoped lookup, then the stem's key once because the scoped key found
+    // nothing; the same sha1 for both is not asked of /save/latest twice.
+    assert_eq!(rom_lookup.calls(), 2);
     assert_eq!(save_latest.calls(), 1);
     assert_eq!(upload.calls(), 1);
 
