@@ -3605,3 +3605,95 @@ fn an_n64_component_beside_the_bundle_is_not_a_save() {
     let _ = &rom_lookup;
     assert_eq!(upload.calls(), 1, "the bundle was not the file that synced");
 }
+
+// Under n64/retroarch the core keeps controller-pak data inside the bundle,
+// so a standalone .mpk beside it is a leftover too. It has its own selection
+// key, so without this it uploads as its own record every pass while the
+// restore retargets it to the bundle.
+#[test]
+fn an_n64_controller_pak_beside_the_bundle_is_not_a_save() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_n64_skip","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"n64@example.com"}}"#);
+    });
+    let rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"success":true,"count":1,"rom":{"sha1":"n64-sha","md5":null,"fileName":"GOLDENEYE.srm"}}"#,
+            );
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-ge","sha256":"n64-sha"}}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves/n64")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    // The device's shape: the bundle the core reads, plus a component left
+    // behind by an older restore. The server answers with the bundle, and the
+    // size guard refuses it over the component on every pass.
+    fs::write(root.join("saves/n64/GOLDENEYE.srm"), vec![0xC7u8; 296960]).unwrap();
+    fs::write(root.join("saves/n64/GOLDENEYE.mpk"), vec![0xC7u8; 32768]).unwrap();
+    let config = writeback_config_for(&tmp, &server, &root, &state_dir, "n64");
+
+    Command::cargo_bin("sgm-mister-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("n64@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("sgm-mister-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(config)
+        .arg("sync")
+        .arg("--verbose")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("GOLDENEYE.mpk: a component beside the"),
+        "the controller pak beside the bundle was not skipped by name: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Refusing to write record"),
+        "the component still reached the size guard: {stderr}"
+    );
+    // The bundle is the save that goes up; the component is never uploaded.
+    let _ = &rom_lookup;
+    assert_eq!(upload.calls(), 1, "the bundle was not the file that synced");
+}

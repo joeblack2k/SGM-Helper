@@ -2677,17 +2677,16 @@ fn n64_component_beside_bundle(
     system_slug: &str,
     profile: &EmulatorProfile,
 ) -> bool {
-    if !system_slug.eq_ignore_ascii_case("n64") || !matches!(profile, EmulatorProfile::RetroArch) {
+    if !matches!(profile, EmulatorProfile::RetroArch) {
         return false;
     }
-    let extension = save_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
-    if !matches!(extension.as_deref(), Some("eep" | "sra" | "fla")) {
-        return false;
+    // The components are the ones the restore retargets to the bundle, so the
+    // two cannot disagree: a controller pak is inside the bundle too.
+    let extension = save_path.extension().and_then(|value| value.to_str());
+    match n64_bundle_target(system_slug, Some("n64/retroarch"), extension) {
+        Some(bundle) => save_path.with_extension(bundle).is_file(),
+        None => false,
     }
-    save_path.with_extension("srm").is_file()
 }
 
 fn n64_bundle_target(
