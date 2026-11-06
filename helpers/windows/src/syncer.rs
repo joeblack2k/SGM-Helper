@@ -60,6 +60,9 @@ pub struct SyncReport {
     pub refused_size_mismatch: usize,
     pub errors: usize,
     pub dry_run: bool,
+    /// Cloud records of systems this helper never restores, per system. Printed
+    /// once at the end of every pass, quiet or not, so the skip is never silent.
+    pub unrestored_systems: std::collections::BTreeMap<String, usize>,
 }
 
 /// Marks a summary whose counters describe what would have happened, not what did.
@@ -196,6 +199,23 @@ impl Drop for SyncLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// One line naming each system whose cloud records this pass left alone because
+/// the helper never restores that system, or None when there were none.
+pub fn unrestored_systems_summary(report: &SyncReport) -> Option<String> {
+    if report.unrestored_systems.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = report
+        .unrestored_systems
+        .iter()
+        .map(|(slug, n)| format!("{slug}={n}"))
+        .collect();
+    Some(format!(
+        "Not restored (this helper never restores these systems): {}",
+        parts.join(" ")
+    ))
 }
 
 pub fn run_sync(
@@ -543,6 +563,9 @@ pub fn run_sync(
         save_sync_state(&state_dir, &sync_state)?;
     }
 
+    if let Some(line) = unrestored_systems_summary(&report) {
+        eprintln!("{line}");
+    }
     Ok(report)
 }
 
@@ -753,6 +776,10 @@ fn restore_single_cloud_save(
 
     if !supports_cloud_restore_system(&system_slug) {
         report.skipped += 1;
+        *report
+            .unrestored_systems
+            .entry(system_slug.clone())
+            .or_insert(0) += 1;
         if verbose {
             eprintln!(
                 "{}",
@@ -4499,6 +4526,56 @@ mod tests {
 
     // The server's error text is `… status=<code> <reason> body=…`; the parse
     // has to take the code and decide on it, not on the reason phrase.
+    #[test]
+    fn a_record_of_an_unrestored_system_is_counted_for_the_pass_summary() {
+        // Returns before any request, so the client points nowhere.
+        let api = ApiClient::new("http://127.0.0.1:9".to_string(), String::new(), None).unwrap();
+        let save = cloud_save("Cave Story.sav", "Cave Story", "ports", "original", ".bin");
+        let mut report = SyncReport::default();
+        restore_single_cloud_save(
+            &api,
+            &save,
+            "test",
+            &SourceKind::Windows,
+            &EmulatorProfile::Generic,
+            &[PathBuf::from("/nonexistent")],
+            &["ports".to_string()],
+            &BTreeMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+            "fp",
+            None,
+            &SyncOptions {
+                force_upload: false,
+                dry_run: true,
+                scan: false,
+                deep_scan: false,
+                apply_scan: false,
+                slot_name: "default".to_string(),
+                default_source_kind: SourceKind::Windows,
+            },
+            &mut HashMap::new(),
+            &mut HashSet::new(),
+            &mut report,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.unrestored_systems.get("ports"), Some(&1));
+    }
+
+    #[test]
+    fn a_pass_names_the_systems_it_never_restores() {
+        let mut report = SyncReport::default();
+        assert_eq!(unrestored_systems_summary(&report), None);
+        report.unrestored_systems.insert("psp".to_string(), 2);
+        report.unrestored_systems.insert("arcade".to_string(), 34);
+        assert_eq!(
+            unrestored_systems_summary(&report).as_deref(),
+            Some("Not restored (this helper never restores these systems): arcade=34 psp=2")
+        );
+    }
+
     #[test]
     fn an_unrestored_system_is_named_in_the_log() {
         assert_eq!(

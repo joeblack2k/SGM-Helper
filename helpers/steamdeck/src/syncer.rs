@@ -61,6 +61,9 @@ pub struct SyncReport {
     pub refused_size_mismatch: usize,
     pub errors: usize,
     pub dry_run: bool,
+    /// Cloud records of systems this helper never restores, per system. Printed
+    /// once at the end of every pass, quiet or not, so the skip is never silent.
+    pub unrestored_systems: std::collections::BTreeMap<String, usize>,
 }
 
 /// Marks a summary whose counters describe what would have happened, not what did.
@@ -197,6 +200,23 @@ impl Drop for SyncLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// One line naming each system whose cloud records this pass left alone because
+/// the helper never restores that system, or None when there were none.
+pub fn unrestored_systems_summary(report: &SyncReport) -> Option<String> {
+    if report.unrestored_systems.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = report
+        .unrestored_systems
+        .iter()
+        .map(|(slug, n)| format!("{slug}={n}"))
+        .collect();
+    Some(format!(
+        "Not restored (this helper never restores these systems): {}",
+        parts.join(" ")
+    ))
 }
 
 pub fn run_sync(
@@ -606,6 +626,9 @@ pub fn run_sync(
         save_sync_state(&state_dir, &sync_state)?;
     }
 
+    if let Some(line) = unrestored_systems_summary(&report) {
+        eprintln!("{line}");
+    }
     Ok(report)
 }
 
@@ -816,6 +839,10 @@ fn restore_single_cloud_save(
 
     if !supports_cloud_restore_system(&system_slug) {
         report.skipped += 1;
+        *report
+            .unrestored_systems
+            .entry(system_slug.clone())
+            .or_insert(0) += 1;
         if verbose {
             eprintln!(
                 "Skipping cloud {} save '{}': this helper does not restore {} saves",
@@ -5734,6 +5761,18 @@ mod tests {
         assert_eq!(
             existing_target.to_string_lossy(),
             "/userdata/saves/gb/Super Mario Bros. Deluxe.srm"
+        );
+    }
+
+    #[test]
+    fn a_pass_names_the_systems_it_never_restores() {
+        let mut report = SyncReport::default();
+        assert_eq!(unrestored_systems_summary(&report), None);
+        report.unrestored_systems.insert("psp".to_string(), 2);
+        report.unrestored_systems.insert("arcade".to_string(), 34);
+        assert_eq!(
+            unrestored_systems_summary(&report).as_deref(),
+            Some("Not restored (this helper never restores these systems): arcade=34 psp=2")
         );
     }
 
