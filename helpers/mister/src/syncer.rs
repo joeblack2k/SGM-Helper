@@ -679,6 +679,12 @@ fn restore_single_cloud_save(
 
     if !supports_cloud_restore_system(&system_slug) {
         report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "{}",
+                unrestored_system_message(&system_slug, cloud_save.display_name())
+            );
+        }
         return Ok(());
     }
     if !source_allows_system(source_systems, &system_slug) {
@@ -875,6 +881,14 @@ fn restore_single_cloud_save(
 
 /// MiSTer has no PSP core, so PSP is not here: a PSP record, a loose file or a PPSSPP SAVEDATA
 /// bundle, has nowhere on this device a game reads it from.
+/// The line a verbose sync prints for a record of a system this helper never
+/// restores: without it the record is dropped with only a skipped count.
+fn unrestored_system_message(system_slug: &str, display_name: &str) -> String {
+    format!(
+        "Skipping cloud {system_slug} save '{display_name}': this helper does not restore {system_slug} saves"
+    )
+}
+
 fn supports_cloud_restore_system(system_slug: &str) -> bool {
     matches!(
         system_slug,
@@ -4780,6 +4794,14 @@ mod tests {
         assert_eq!(
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
+        );
+    }
+
+    #[test]
+    fn an_unrestored_system_is_named_in_the_log() {
+        assert_eq!(
+            unrestored_system_message("psp", "Dissidia"),
+            "Skipping cloud psp save 'Dissidia': this helper does not restore psp saves"
         );
     }
 
