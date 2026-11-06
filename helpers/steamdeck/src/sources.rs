@@ -263,6 +263,8 @@ fn normalize_system_slug(value: &str) -> Option<String> {
         "ps4" | "playstation4" => "ps4",
         "ps5" | "playstation5" => "ps5",
         "ports" | "port" | "nativeports" | "nativeport" | "decompports" | "decompport" => "ports",
+        // Arcade NVRAM is opt-in per source (SYSTEMS names it); it isn't in any default list.
+        "arcade" | "mame" => "arcade",
         _ => {
             let candidate = token.split_whitespace().collect::<Vec<_>>().join("-");
             if ALL_SYNC_SYSTEMS.contains(&candidate.as_str())
@@ -1613,6 +1615,17 @@ fn backup_corrupt(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    // A SYSTEMS entry this helper doesn't know is dropped without a word, so a source that names
+    // arcade must get it, and the defaults must not gain it on their own.
+    #[test]
+    fn a_source_that_names_arcade_syncs_it_and_the_defaults_do_not() {
+        let raw = "snes,arcade".to_string();
+        let systems = parse_systems(Some(&raw), &SourceKind::RetroArch);
+        assert!(systems.iter().any(|s| s == "arcade"), "{systems:?}");
+        let defaults = parse_systems(None, &SourceKind::RetroArch);
+        assert!(!defaults.iter().any(|s| s == "arcade"), "{defaults:?}");
+    }
     use super::*;
 
     #[test]

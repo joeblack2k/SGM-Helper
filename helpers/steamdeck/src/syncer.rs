@@ -1220,6 +1220,7 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "wonderswan"
             | "sg-1000"
             | "colecovision"
+            | "arcade"
     )
 }
 
@@ -1459,6 +1460,11 @@ fn cloud_target_path_inner(
         };
         return target_dir.join("data.bin");
     }
+    if system_slug == "arcade"
+        && let Some(target) = mame_nvram_target(root, cloud_save)
+    {
+        return target;
+    }
     let filename = cloud_restore_filename(cloud_save, target_extension);
     let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
         root.to_path_buf()
@@ -1483,6 +1489,30 @@ fn cloud_target_path_inner(
     target_dir
         .join(opera_per_game_subdir(system_slug, &filename))
         .join(filename)
+}
+
+/// MAME (RetroArch's core) keeps a set's NVRAM at `<save dir>/mame/mame/nvram/<set>/<chip file>`:
+/// the folder is the set name and each chip is its own file, named by MAME with no extension.
+/// The record carries the set as `game.name` and the chip file as `filename`, so both are used as
+/// written; a record missing either has no MAME path and falls back to the general layout.
+fn mame_nvram_target(root: &Path, cloud_save: &CloudSaveSummary) -> Option<PathBuf> {
+    let set_name = cloud_save
+        .game
+        .as_ref()
+        .map(|game| game.name.trim())
+        .filter(|name| !name.is_empty())?;
+    let chip = cloud_save.filename.trim();
+    if chip.is_empty() || sanitize_filename(set_name) != set_name || sanitize_filename(chip) != chip
+    {
+        return None;
+    }
+    Some(
+        root.join("mame")
+            .join("mame")
+            .join("nvram")
+            .join(set_name)
+            .join(chip),
+    )
 }
 
 /// Opera (3DO) saves a game's NVRAM as `<save dir>/opera/per_game/<game>.<version>.srm` and reads
@@ -5140,6 +5170,61 @@ mod tests {
             metadata: None,
             rom_sha1: None,
             rom_md5: None,
+        }
+    }
+
+    fn arcade_nvram_save(set_name: &str, filename: &str) -> CloudSaveSummary {
+        let mut save = cloud_save(filename, set_name, "arcade", "original", "");
+        save.download_profiles.clear();
+        save.game = Some(crate::api::CloudSaveGame {
+            name: set_name.to_string(),
+            display_title: set_name.to_string(),
+            system: Some(crate::api::CloudSaveSystem {
+                slug: "arcade".to_string(),
+            }),
+        });
+        save
+    }
+
+    // RetroDECK's MAME core reads a set's NVRAM from <saves>/mame/mame/nvram/<set>/<file>, the
+    // folder MAME names by set and the chip file names by part. The cabinet's records carry the
+    // set as game.name and the chip file as filename (digdug, earom).
+    #[test]
+    fn an_arcade_nvram_record_restores_where_retroarchs_mame_reads_it() {
+        assert!(supports_cloud_restore_system("arcade"));
+        let save = arcade_nvram_save("digdug", "earom");
+        let target = cloud_target_path(
+            &save,
+            &[PathBuf::from("/home/deck/retrodeck/saves")],
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "arcade",
+            None,
+        );
+        assert_eq!(
+            target.to_string_lossy(),
+            "/home/deck/retrodeck/saves/mame/mame/nvram/digdug/earom"
+        );
+    }
+
+    // A set with several NVRAM chips is one record per chip; each goes in the set's own folder
+    // under its own name, with no extension added.
+    #[test]
+    fn each_chip_of_a_multi_file_arcade_set_keeps_its_own_name() {
+        for chip in ["m48t58", "29f016a.27h"] {
+            let save = arcade_nvram_save("ddr2m", chip);
+            let target = cloud_target_path(
+                &save,
+                &[PathBuf::from("/home/deck/retrodeck/saves")],
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                "arcade",
+                None,
+            );
+            assert_eq!(
+                target,
+                PathBuf::from("/home/deck/retrodeck/saves/mame/mame/nvram/ddr2m").join(chip)
+            );
         }
     }
 
