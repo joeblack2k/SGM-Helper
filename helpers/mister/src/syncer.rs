@@ -1691,6 +1691,10 @@ fn mister_system_directory(system_slug: &str) -> &'static str {
         "wonderswan" => "WonderSwan",
         "sg-1000" => "SMS",
         "colecovision" => "Coleco",
+        "pc-engine" => "TGFX16",
+        "ngp" => "NGPC",
+        "virtualboy" => "VirtualBoy",
+        "neogeo-cd" => "NeoGeoCD",
         _ => "Other",
     }
 }
@@ -4803,6 +4807,20 @@ mod tests {
             unrestored_system_message("psp", "Dissidia"),
             "Skipping cloud psp save 'Dissidia': this helper does not restore psp saves"
         );
+    }
+
+    #[test]
+    fn mister_restores_each_system_into_its_core_folder() {
+        // The folders the MiSTer cores read and the scanner recognises; "Other" is
+        // never present, so a restore there is dropped as a missing folder.
+        for (slug, folder) in [
+            ("pc-engine", "TGFX16"),
+            ("ngp", "NGPC"),
+            ("virtualboy", "VirtualBoy"),
+            ("neogeo-cd", "NeoGeoCD"),
+        ] {
+            assert_eq!(mister_system_directory(slug), folder, "{slug}");
+        }
     }
 
     #[test]
