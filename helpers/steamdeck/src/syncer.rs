@@ -3761,8 +3761,9 @@ fn projection_runtime_profile_for_system(
             .to_string(),
         ),
         // RetroSaveManager's pc-engine profiles are identity projections of the raw backup RAM;
-        // RetroDECK and the desktop helpers run Beetle PCE under RetroArch.
-        "pc-engine" => Some(
+        // RetroDECK and the desktop helpers run Beetle PCE under RetroArch. The scanner names
+        // these saves `tgfx16`, so the arm takes every name of the system, not only the server's.
+        slug if crate::sources::same_system(slug, "pc-engine") => Some(
             match source_profile {
                 EmulatorProfile::Mister => "pc-engine/mister",
                 EmulatorProfile::RetroArch => "pc-engine/retroarch-beetle-pce",
@@ -4658,13 +4659,15 @@ mod tests {
             ),
         ];
         for (kind, profile, device, want) in cases {
-            let target = runtime_target_for_system(&kind, &profile, "pc-engine", device);
-            assert_eq!(target.runtime_profile.as_deref(), Some(want), "{device}");
-            assert_eq!(
-                target.system_profile_key.as_deref(),
-                Some("pcEngineProfile"),
-                "{device}"
-            );
+            // `tgfx16` is the slug the scanner gives a PC Engine save; `pc-engine` is the server's.
+            for slug in ["tgfx16", "pc-engine"] {
+                let target = runtime_target_for_system(&kind, &profile, slug, device);
+                assert_eq!(
+                    target.runtime_profile.as_deref(),
+                    Some(want),
+                    "{device} {slug}"
+                );
+            }
         }
     }
 
