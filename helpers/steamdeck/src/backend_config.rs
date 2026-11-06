@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::api::ApiClient;
 use crate::config::AppConfig;
@@ -487,7 +486,6 @@ fn write_backend_policy_to_config(
         return Ok(());
     }
 
-    let backup = backup_config_if_exists(&config.config_path)?;
     let existing = read_file_if_exists(&config.config_path)?;
     let global_updates = collect_global_writeback(response);
     let with_globals = apply_global_writeback_to_ini(&existing, &global_updates);
@@ -498,18 +496,10 @@ fn write_backend_policy_to_config(
     save_source_store(&config.config_path, &store)?;
 
     if verbose {
-        if let Some(backup) = backup {
-            eprintln!(
-                "Backend config policy written to {}; backup: {}",
-                config.config_path.display(),
-                backup.display()
-            );
-        } else {
-            eprintln!(
-                "Backend config policy written to {}",
-                config.config_path.display()
-            );
-        }
+        eprintln!(
+            "Backend config policy written to {}",
+            config.config_path.display()
+        );
     }
 
     Ok(())
@@ -803,31 +793,13 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("kan config map niet maken: {}", parent.display()))?;
     }
-    fs::write(path, content)
-        .with_context(|| format!("kan config niet schrijven: {}", path.display()))
-}
-
-fn backup_config_if_exists(path: &Path) -> Result<Option<PathBuf>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let backup = path.with_extension(format!("ini.backend.{}", timestamp_suffix()));
-    fs::copy(path, &backup).with_context(|| {
-        format!(
-            "kan config backup niet schrijven: {} -> {}",
-            path.display(),
-            backup.display()
-        )
-    })?;
-    Ok(Some(backup))
-}
-
-fn timestamp_suffix() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
-        .replace([':', '-'], "")
-        .replace(['T', 'Z'], "")
+    // Replace in place: write a sibling temp file, then rename it over the
+    // config, so a crash mid-write never leaves a half-written config.ini and
+    // no copy of the old one is kept.
+    let tmp = path.with_extension("ini.tmp");
+    fs::write(&tmp, content)
+        .with_context(|| format!("kan config niet schrijven: {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("kan config niet vervangen: {}", path.display()))
 }
 
 fn escape_ini(value: &str) -> String {
@@ -1135,13 +1107,16 @@ mod tests {
         assert!(body.contains("[source.super_nintendo_snes9x]"));
         assert!(body.contains("PROFILE=\"snes9x\""));
         assert!(body.contains("SAVE_PATH=\"/media/snes9x/saves\""));
-        assert!(tmp.path().read_dir().unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains("backend")
-        }));
+        // The config is replaced in place: no timestamped copy and no temp
+        // file is left beside it.
+        let left: Vec<String> = tmp
+            .path()
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("config.ini") && name != "config.ini")
+            .collect();
+        assert!(left.is_empty(), "files kept beside config.ini: {left:?}");
 
         let store = load_source_store(&config_path).unwrap();
         let added = store
