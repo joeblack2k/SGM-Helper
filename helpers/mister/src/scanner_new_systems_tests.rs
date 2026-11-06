@@ -142,3 +142,33 @@ fn a_lynx_eeprom_save_is_discovered() {
         "the .eeprom save was not discovered: {found:?}"
     );
 }
+
+// 3DO (Opera keeps one NVRAM image per game under 3do/opera/per_game) and
+// Atari Jaguar (Virtual Jaguar's EEPROM .srm) were uploaded by older builds and
+// then classified by none: a new save of either was skipped on every device.
+#[test]
+fn an_opera_nvram_save_is_3do() {
+    let (_tmp, path) = save_with("3do/opera/per_game", "Bust-A-Move (USA).0.srm", 32_768);
+    assert_eq!(
+        infer_supported_console_slug(&path, None).as_deref(),
+        Some("3do")
+    );
+}
+
+#[test]
+fn a_virtual_jaguar_eeprom_save_is_atari_jaguar() {
+    let (_tmp, path) = save_with("atarijaguar", "Doom (World).srm", 128);
+    assert_eq!(
+        infer_supported_console_slug(&path, None).as_deref(),
+        Some("atari-jaguar")
+    );
+}
+
+#[test]
+fn a_jaguar_save_in_a_retroarch_core_folder_is_atari_jaguar() {
+    let (_tmp, path) = save_with("Virtual Jaguar", "Iron Soldier (World).srm", 128);
+    assert_eq!(
+        infer_supported_console_slug(&path, None).as_deref(),
+        Some("atari-jaguar")
+    );
+}

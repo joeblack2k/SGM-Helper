@@ -108,6 +108,8 @@ pub const SCANNER_SYSTEM_SLUGS: &[&str] = &[
     "wonderswan",
     "sg-1000",
     "colecovision",
+    "3do",
+    "atari-jaguar",
     "wii",
     "psx",
     "ps2",
@@ -1176,6 +1178,21 @@ pub fn classify_supported_save(
     // core folders.
     for (slug, needles) in [
         (
+            "3do",
+            &["/3do/", "\\3do\\", "panasonic 3do", "/opera/", "\\opera\\"][..],
+        ),
+        (
+            "atari-jaguar",
+            &[
+                "atarijaguar",
+                "atari jaguar",
+                "atari - jaguar",
+                "/jaguar/",
+                "\\jaguar\\",
+                "virtual jaguar",
+            ][..],
+        ),
+        (
             "atari-lynx",
             &[
                 "atarilynx",
@@ -1881,6 +1898,8 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             ext,
             "sav" | "srm" | "eep" | "eeprom" | "nv" | "nvram" | "ram"
         ),
+        "3do" => matches!(ext, "sav" | "srm" | "nv" | "nvram" | "ram"),
+        "atari-jaguar" => matches!(ext, "sav" | "srm" | "eep" | "eeprom"),
         "wii" => ext == "bin",
         "psx" => matches!(
             ext,
@@ -1978,6 +1997,10 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             size,
             128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16_384 | 32_768
         ),
+        // Opera's NVRAM image is the console's 32 KiB.
+        "3do" => size == 32_768,
+        // Virtual Jaguar's cartridge EEPROM.
+        "atari-jaguar" => matches!(size, 128 | 256 | 512 | 1024 | 2048),
         "tgfx16" => {
             // TurboGrafx-16 / PC Engine HuCard battery saves are typically 2KB SRAM.
             // PCE CD / TGFX-CD adds backup RAM (BRAM) — 2KB stock, 8KB extended,
@@ -3234,6 +3257,8 @@ mod tests {
                 "sg-1000" => ("sav", 8192),
                 // Gearcoleco's EEPROM games (Boxxle, Black Onyx): 2 KiB .srm.
                 "colecovision" => ("srm", 2048),
+                "3do" => ("srm", 32_768),
+                "atari-jaguar" => ("srm", 128),
                 other => panic!("{other} has no sample save; add one"),
             }
         };
