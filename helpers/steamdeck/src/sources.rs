@@ -52,6 +52,10 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "neogeo-cd",
     "ngp",
     "virtualboy",
+    "atari-lynx",
+    "wonderswan",
+    "sg-1000",
+    "colecovision",
 ];
 
 /// A MiSTer source's default systems: the ones MiSTer has cores for. From
@@ -76,6 +80,10 @@ const MISTER_SYNC_SYSTEMS: &[&str] = &[
     "neogeo",
     "pc-engine",
     "psx",
+    "atari-lynx",
+    "wonderswan",
+    "sg-1000",
+    "colecovision",
 ];
 
 const PORT_SYNC_SYSTEMS: &[&str] = &["ports"];
@@ -184,7 +192,7 @@ fn system_list_from(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
-fn parse_systems(value: Option<&String>, kind: &SourceKind) -> Vec<String> {
+pub(crate) fn parse_systems(value: Option<&String>, kind: &SourceKind) -> Vec<String> {
     let Some(raw) = value.map(|value| value.trim()) else {
         return default_systems_for_kind(kind);
     };
@@ -242,6 +250,10 @@ fn normalize_system_slug(value: &str) -> Option<String> {
         "neogeocd" | "neocd" => "neogeo-cd",
         "ngp" | "ngpc" | "neogeopocket" | "neogeopocketcolor" => "ngp",
         "virtualboy" | "vb" => "virtualboy",
+        "atarilynx" | "lynx" => "atari-lynx",
+        "wonderswan" | "wonderswancolor" | "ws" | "wsc" | "wswan" => "wonderswan",
+        "sg1000" | "segasg1000" | "sg" => "sg-1000",
+        "colecovision" | "coleco" => "colecovision",
         "wii" | "nintendowii" | "dolphin" => "wii",
         "psx" | "ps1" | "playstation" | "playstation1" => "psx",
         "ps2" | "playstation2" => "ps2",
@@ -1276,6 +1288,10 @@ const SAVE_SUBDIR_ALIASES: &[&[&str]] = &[
     &["sega-cd", "segacd", "megacd"],
     &["sega-32x", "sega32x", "32x"],
     &["gameboy", "gb"],
+    &["atari-lynx", "atarilynx", "lynx"],
+    &["wonderswan", "wonderswancolor", "ws", "wsc"],
+    &["sg-1000", "sg1000"],
+    &["colecovision", "coleco"],
 ];
 
 /// The declared `SAVE_SUBDIR_*` directory for `system_slug`, looked up by

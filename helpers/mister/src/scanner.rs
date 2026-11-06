@@ -15,7 +15,8 @@ const SAVE_EXTENSIONS: &[&str] = &[
     "sav", "srm", "eep", "fla", "sa1", "rtc", "ram", "sra", "mpk", "cpk", "dsv", "gme", "mcr",
     "mc", "mcd", "vmp", "psv", "ps2", "bin", "vms", "dci", "bkr", "brm",
     // Mednafen's Neo Geo Pocket flash save.
-    "flash",
+    "flash", // Handy's Lynx EEPROM, and MAME's ColecoVision NVRAM.
+    "eeprom", "nvram",
 ];
 
 #[cfg(test)]
@@ -103,6 +104,10 @@ pub const SCANNER_SYSTEM_SLUGS: &[&str] = &[
     "neogeo-cd",
     "ngp",
     "virtualboy",
+    "atari-lynx",
+    "wonderswan",
+    "sg-1000",
+    "colecovision",
     "wii",
     "psx",
     "ps2",
@@ -116,7 +121,7 @@ pub const SCANNER_SYSTEM_SLUGS: &[&str] = &[
 const ROM_EXTENSIONS: &[&str] = &[
     "nes", "fds", "sfc", "smc", "gb", "gbc", "gba", "n64", "z64", "v64", "nds", "md", "gen", "32x",
     "sms", "gg", "cue", "iso", "chd", "gdi", "cdi", "rvz", "wbfs", "wad", "pce", "a26", "a78",
-    "col", "bin", "zip", "7z", "pbp", "cso", "vpk",
+    "col", "bin", "zip", "7z", "pbp", "cso", "vpk", "lnx", "lyx", "ws", "wsc", "sg",
 ];
 
 #[derive(Debug, Clone)]
@@ -791,6 +796,69 @@ pub fn classify_supported_save(
         return None;
     }
 
+    // Ahead of the Sega arm, whose "sega" needle would file an SG-1000 save
+    // under a Sega cartridge system. Folder names are MiSTer's (AtariLynx,
+    // WonderSwan, WonderSwanColor, SG1000, Coleco), ES-DE's (atarilynx,
+    // wonderswan, wonderswancolor, sg-1000, colecovision) and RetroArch's
+    // core folders.
+    for (slug, needles) in [
+        (
+            "atari-lynx",
+            &[
+                "atarilynx",
+                "atari lynx",
+                "atari - lynx",
+                "/lynx/",
+                "\\lynx\\",
+                "handy",
+                "beetle lynx",
+                "mednafen lynx",
+            ][..],
+        ),
+        (
+            "wonderswan",
+            &[
+                "wonderswan",
+                "wonder swan",
+                "bandai - wonderswan",
+                "/ws/",
+                "\\ws\\",
+                "/wsc/",
+                "\\wsc\\",
+                "beetle wonderswan",
+                "beetle cygne",
+                "mednafen wswan",
+            ][..],
+        ),
+        (
+            "sg-1000",
+            &["sg-1000", "sg1000", "sega sg", "/sg/", "\\sg\\"][..],
+        ),
+        (
+            "colecovision",
+            &[
+                "colecovision",
+                "coleco vision",
+                "/coleco/",
+                "\\coleco\\",
+                "gearcoleco",
+            ][..],
+        ),
+    ] {
+        if contains_any(&save_lower, needles) {
+            if is_plausible_save_for_system(&save_ext, save_size, slug) {
+                return classify_if_valid(
+                    save_path,
+                    &save_ext,
+                    save_size,
+                    slug,
+                    format!("path hint {} + .{} ({} bytes)", slug, save_ext, save_size),
+                );
+            }
+            return None;
+        }
+    }
+
     if contains_any(
         &save_lower,
         &[
@@ -1108,6 +1176,10 @@ fn system_slug_from_rom_extension(ext: String) -> Option<&'static str> {
         "md" | "gen" => Some("genesis"),
         "32x" => Some("sega-32x"),
         "sms" => Some("master-system"),
+        "lnx" | "lyx" => Some("atari-lynx"),
+        "ws" | "wsc" => Some("wonderswan"),
+        "sg" => Some("sg-1000"),
+        "col" => Some("colecovision"),
         "gg" => Some("game-gear"),
         "gdi" | "cdi" => Some("dreamcast"),
         "rvz" | "wbfs" | "wad" => Some("wii"),
@@ -1430,6 +1502,12 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
         "neogeo-cd" | "virtualboy" => matches!(ext, "sav" | "srm"),
         "ngp" => ext == "flash",
         "tgfx16" => matches!(ext, "sav" | "srm" | "ram" | "bkr" | "brm"),
+        "atari-lynx" | "wonderswan" => matches!(ext, "sav" | "srm" | "eep" | "eeprom" | "ram"),
+        "sg-1000" => matches!(ext, "sav" | "srm" | "ram"),
+        "colecovision" => matches!(
+            ext,
+            "sav" | "srm" | "eep" | "eeprom" | "nv" | "nvram" | "ram"
+        ),
         "wii" => ext == "bin",
         "psx" => matches!(
             ext,
@@ -1517,6 +1595,16 @@ fn is_plausible_save_for_system(ext: &str, size: u64, slug: &str) -> bool {
             // a power-of-two size.
             size == 0x12000 || (size.is_power_of_two() && (512..=2_097_152).contains(&size))
         }
+        // RetroSaveManager's legacy_raw_validation sizes for each.
+        "atari-lynx" => matches!(size, 128 | 256 | 512 | 1024 | 2048 | 8192),
+        "wonderswan" => matches!(
+            size,
+            128 | 256 | 512 | 1024 | 2048 | 8192 | 32_768 | 65_536 | 131_072
+        ),
+        "sg-1000" | "colecovision" => matches!(
+            size,
+            128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16_384 | 32_768
+        ),
         "tgfx16" => {
             // TurboGrafx-16 / PC Engine HuCard battery saves are typically 2KB SRAM.
             // PCE CD / TGFX-CD adds backup RAM (BRAM) — 2KB stock, 8KB extended,
@@ -2745,6 +2833,14 @@ mod tests {
                 "psx" => ("mcr", PS1_MEMCARD_SIZE as u64),
                 "ps2" => ("ps2", 8 * 1024 * 1024),
                 "psp" | "psvita" | "ps3" | "ps4" | "ps5" => ("sav", 65536),
+                // RetroArch Handy's Lynx EEPROM (93C46: 128 bytes).
+                "atari-lynx" => ("srm", 128),
+                // Beetle WonderSwan's cartridge SRAM: 32 KiB.
+                "wonderswan" => ("srm", 32_768),
+                // Genesis Plus GX's SG-1000 battery RAM: 8 KiB .sav.
+                "sg-1000" => ("sav", 8192),
+                // Gearcoleco's EEPROM games (Boxxle, Black Onyx): 2 KiB .srm.
+                "colecovision" => ("srm", 2048),
                 other => panic!("{other} has no sample save; add one"),
             }
         };

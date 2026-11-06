@@ -72,3 +72,73 @@ fn a_flash_file_outside_a_neo_geo_pocket_folder_is_not_a_save() {
     let (_tmp, path) = save_with("misc", "Firmware.flash", 536);
     assert_eq!(infer_supported_console_slug(&path, None), None);
 }
+
+// Atari Lynx, WonderSwan, SG-1000 and ColecoVision, under the folder names the
+// devices write: MiSTer's saves/ (AtariLynx, WonderSwan, WonderSwanColor,
+// Coleco), RetroDECK/ES-DE's (atarilynx, wonderswancolor, sg-1000,
+// colecovision) and a RetroArch core folder. Each must come out as the slug
+// RetroSaveManager knows, so the upload names a system and a runtime profile.
+#[test]
+fn lynx_wonderswan_sg1000_and_colecovision_saves_are_classified_where_devices_write_them() {
+    for (dir, name, size, want) in [
+        (
+            "AtariLynx",
+            "Gates of Zendocon (USA).sav",
+            128,
+            "atari-lynx",
+        ),
+        (
+            "atarilynx",
+            "Gates of Zendocon (USA).srm",
+            128,
+            "atari-lynx",
+        ),
+        ("Handy", "Gates of Zendocon (USA).srm", 128, "atari-lynx"),
+        ("WonderSwan", "Gunpey (Japan).sav", 32_768, "wonderswan"),
+        (
+            "WonderSwanColor",
+            "Final Fantasy (Japan).sav",
+            65_536,
+            "wonderswan",
+        ),
+        (
+            "wonderswancolor",
+            "Final Fantasy (Japan).srm",
+            65_536,
+            "wonderswan",
+        ),
+        ("sg-1000", "Girl's Garden (Japan).sav", 8192, "sg-1000"),
+        ("SG1000", "Girl's Garden (Japan).sav", 8192, "sg-1000"),
+        ("Coleco", "Boxxle (USA).sav", 2048, "colecovision"),
+        ("colecovision", "Boxxle (USA).srm", 2048, "colecovision"),
+    ] {
+        let (_tmp, path) = save_with(dir, name, size);
+        assert_eq!(
+            infer_supported_console_slug(&path, None).as_deref(),
+            Some(want),
+            "{dir}/{name}"
+        );
+    }
+}
+
+// The Sega arm's "sega" needle comes after these: an SG-1000 save in an
+// ES-DE "sega sg-1000" style folder is still SG-1000, not Master System.
+#[test]
+fn an_sg1000_save_is_not_a_sega_cartridge_save() {
+    let (_tmp, path) = save_with("Sega SG-1000", "Girl's Garden (Japan).sav", 8192);
+    assert_eq!(
+        infer_supported_console_slug(&path, None).as_deref(),
+        Some("sg-1000")
+    );
+}
+
+// Handy writes the Lynx EEPROM as .eeprom; it must be discovered at all.
+#[test]
+fn a_lynx_eeprom_save_is_discovered() {
+    let (tmp, path) = save_with("atarilynx", "Gates of Zendocon (USA).eeprom", 128);
+    let found = discover_save_files(&[tmp.path().join("saves")], true).unwrap();
+    assert!(
+        found.contains(&path),
+        "the .eeprom save was not discovered: {found:?}"
+    );
+}

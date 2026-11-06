@@ -1189,6 +1189,10 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "ngp"
             | "pc-engine"
             | "virtualboy"
+            | "atari-lynx"
+            | "wonderswan"
+            | "sg-1000"
+            | "colecovision"
     )
 }
 
@@ -2207,6 +2211,10 @@ fn mister_system_directory(system_slug: &str) -> &'static str {
         "ps3" => "PS3",
         "ps4" => "PS4",
         "ps5" => "PS5",
+        "atari-lynx" => "AtariLynx",
+        "wonderswan" => "WonderSwan",
+        "sg-1000" => "SMS",
+        "colecovision" => "Coleco",
         _ => "Other",
     }
 }
@@ -2241,6 +2249,10 @@ fn generic_system_directory(system_slug: &str) -> &'static str {
         "ngp" => "ngp",
         "pc-engine" => "pcengine",
         "virtualboy" => "virtualboy",
+        "atari-lynx" => "atarilynx",
+        "wonderswan" => "wonderswan",
+        "sg-1000" => "sg-1000",
+        "colecovision" => "colecovision",
         _ => "unknown",
     }
 }
@@ -2275,6 +2287,10 @@ fn system_directory_aliases(system_slug: &str) -> &'static [&'static str] {
         "ngp" => &["ngp", "ngpc", "neo geo pocket", "neogeo pocket"],
         "pc-engine" => &["pcengine", "pce", "tg16", "turbografx", "pc engine"],
         "virtualboy" => &["virtualboy", "virtual boy", "vb"],
+        "atari-lynx" => &["atarilynx", "atari lynx", "lynx"],
+        "wonderswan" => &["wonderswan", "wonderswancolor", "wonder swan", "ws", "wsc"],
+        "sg-1000" => &["sg-1000", "sg1000", "sg"],
+        "colecovision" => &["colecovision", "coleco"],
         _ => &[],
     }
 }
@@ -3969,6 +3985,58 @@ fn projection_runtime_profile_for_system(
         "ngp" => Some("ngp/mednafen".to_string()),
         "virtualboy" => Some("virtualboy/mednafen".to_string()),
         "neogeo-cd" => Some("neogeo-cd/retroarch".to_string()),
+        // RetroSaveManager marks these projection-capable; each profile is one
+        // of its runtime_profiles.go entries. RetroDECK runs Handy, Beetle
+        // WonderSwan, Genesis Plus GX and Gearcoleco under RetroArch; the MiSTer
+        // has no profile of its own, so it names the core its saves match.
+        slug if crate::sources::same_system(slug, "atari-lynx") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "atari-lynx/retroarch-handy",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "atari-lynx/retroarch-handy"
+                    }
+                    _ => "atari-lynx/handy",
+                },
+            }
+            .to_string(),
+        ),
+        slug if crate::sources::same_system(slug, "wonderswan") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "wonderswan/retroarch-beetle-wswan",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "wonderswan/retroarch-beetle-wswan"
+                    }
+                    _ => "wonderswan/mednafen",
+                },
+            }
+            .to_string(),
+        ),
+        slug if crate::sources::same_system(slug, "sg-1000") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sg-1000/retroarch-genesis-plus-gx",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "sg-1000/retroarch-genesis-plus-gx"
+                    }
+                    _ => "sg-1000/genesis-plus-gx",
+                },
+            }
+            .to_string(),
+        ),
+        slug if crate::sources::same_system(slug, "colecovision") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "colecovision/retroarch-gearcoleco",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "colecovision/retroarch-gearcoleco"
+                    }
+                    _ => "colecovision/gearcoleco",
+                },
+            }
+            .to_string(),
+        ),
         "gba" => Some(
             match source_profile {
                 EmulatorProfile::RetroArch => "gba/retroarch-mgba",
@@ -6233,6 +6301,60 @@ mod runtime_profile_map {
                 got.as_deref(),
                 Some(expected),
                 "{system} has no profile on the wire"
+            );
+        }
+    }
+
+    // The slug an upload carries is the scanner's, taken from the folder the
+    // device writes. Drive the profile from that, not from the server's slug:
+    // #97's first test named "pc-engine" while the device sent "tgfx16".
+    #[test]
+    fn lynx_wonderswan_sg1000_and_colecovision_uploads_name_a_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (dir, name, size, expected) in [
+            (
+                "atarilynx",
+                "Gates of Zendocon (USA).srm",
+                128usize,
+                "atari-lynx/retroarch-handy",
+            ),
+            (
+                "wonderswancolor",
+                "Final Fantasy (Japan).srm",
+                65_536,
+                "wonderswan/retroarch-beetle-wswan",
+            ),
+            (
+                "sg-1000",
+                "Girl's Garden (Japan).sav",
+                8192,
+                "sg-1000/retroarch-genesis-plus-gx",
+            ),
+            (
+                "colecovision",
+                "Boxxle (USA).srm",
+                2048,
+                "colecovision/retroarch-gearcoleco",
+            ),
+        ] {
+            let path = tmp.path().join("saves").join(dir).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(31) | 1).collect();
+            std::fs::write(&path, bytes).unwrap();
+            let slug = crate::scanner::infer_supported_console_slug(&path, None)
+                .unwrap_or_else(|| panic!("{dir}/{name} is not classified"));
+            let got = projection_runtime_profile_for_system(
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                &slug,
+                "retroarch",
+            );
+            assert_eq!(got.as_deref(), Some(expected), "{dir}/{name} as {slug}");
+            assert!(
+                crate::sources::parse_systems(None, &SourceKind::RetroArch)
+                    .iter()
+                    .any(|s| crate::sources::same_system(s, &slug)),
+                "{slug} is not synced by default"
             );
         }
     }
