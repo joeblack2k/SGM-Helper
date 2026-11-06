@@ -149,16 +149,15 @@ pub fn folder_line_key(kind: FolderSaveKind, save_dir: &str) -> String {
     format!("{}-folder:{}", kind.system_slug(), save_dir)
 }
 
-/// True when a folder holds at least one regular file: a folder an emulator made and never
-/// wrote a file into is not a save.
+/// True when a folder or any folder in it holds a regular file: a folder an emulator made
+/// and never wrote a file into is not a save.
 fn has_regular_file(dir: &Path) -> bool {
     fs::read_dir(dir)
         .map(|entries| {
-            entries.flatten().any(|entry| {
-                entry
-                    .file_type()
-                    .map(|kind| kind.is_file())
-                    .unwrap_or(false)
+            entries.flatten().any(|entry| match entry.file_type() {
+                Ok(kind) if kind.is_file() => true,
+                Ok(kind) if kind.is_dir() => has_regular_file(&entry.path()),
+                _ => false,
             })
         })
         .unwrap_or(false)
@@ -234,30 +233,63 @@ pub fn emulator_root_of(save: &FolderSave) -> Option<PathBuf> {
     save.path.ancestors().nth(levels).map(Path::to_path_buf)
 }
 
-/// Pack a folder's regular files into one payload, and its sha256: the same deterministic
-/// stored zip a PSP SAVEDATA folder uses, so equal folders always hash equal.
+/// The most file bytes a folder bundle carries, the same cap the server enforces: a larger
+/// folder is skipped rather than uploaded and refused.
+pub const FOLDER_SAVE_MAX_BYTES: u64 = 64 << 20;
+
+/// Every regular file in a save folder and the folders in it, as its path relative to the
+/// folder (`sce_sys/param.sfo`) and its size, sorted by path. Symlinks and other entries
+/// are not save files and are left out.
+pub fn folder_save_files(dir: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf, u64)>) -> Result<()> {
+        for entry in fs::read_dir(dir)
+            .with_context(|| format!("cannot read save folder: {}", dir.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("cannot read save folder: {}", dir.display()))?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|name| anyhow::anyhow!("save file has no UTF-8 name: {:?}", name))?;
+            if !flat_name(&name) {
+                anyhow::bail!(
+                    "save file {:?} in {} has a name a bundle cannot carry",
+                    name,
+                    dir.display()
+                );
+            }
+            let relative = format!("{prefix}{name}");
+            let kind = entry
+                .file_type()
+                .with_context(|| format!("cannot read {}", entry.path().display()))?;
+            if kind.is_dir() {
+                walk(&entry.path(), &format!("{relative}/"), out)?;
+            } else if kind.is_file() {
+                let size = entry
+                    .metadata()
+                    .with_context(|| format!("cannot read {}", entry.path().display()))?
+                    .len();
+                out.push((relative, entry.path(), size));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, "", &mut out)?;
+    out.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(out)
+}
+
+/// Pack every file in a save folder and the folders in it into one payload, and its
+/// sha256: the deterministic stored zip a PSP SAVEDATA folder uses, with each file named by
+/// its relative path, so equal folders always hash equal.
 pub fn pack_folder_save(dir: &Path) -> Result<(Vec<u8>, String)> {
     let mut entries = Vec::new();
-    for entry in
-        fs::read_dir(dir).with_context(|| format!("cannot read save folder: {}", dir.display()))?
-    {
-        let entry = entry.with_context(|| format!("cannot read save folder: {}", dir.display()))?;
-        if !entry
-            .file_type()
-            .map(|kind| kind.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|name| anyhow::anyhow!("save file has no UTF-8 name: {:?}", name))?;
-        let bytes = fs::read(entry.path())
-            .with_context(|| format!("cannot read file: {}", entry.path().display()))?;
-        entries.push((name, bytes));
+    for (relative, path, _) in folder_save_files(dir)? {
+        let bytes =
+            fs::read(&path).with_context(|| format!("cannot read file: {}", path.display()))?;
+        entries.push((relative, bytes));
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
     let bytes = build_stored_zip(&entries)?;
     let sha = sha256_bytes(&bytes);
     Ok((bytes, sha))
@@ -270,9 +302,15 @@ fn flat_name(name: &str) -> bool {
         && !name.chars().any(|ch| matches!(ch, '/' | '\\' | ':' | '\0'))
 }
 
-/// Replace a save folder with the files a bundle holds. Every entry is checked before
+/// A bundle entry path that stays inside the save folder: `/`-separated plain names.
+fn safe_entry_path(name: &str) -> bool {
+    !name.is_empty() && name.split('/').all(flat_name)
+}
+
+/// Replace a save folder with the files a bundle holds. Every entry path is checked before
 /// anything is written; the files go to `<folder>.rsm-tmp` beside it, the old folder is
-/// removed, and the new one renamed into place. The emulator's folder (the NAND or Vita3K
+/// renamed aside to `<folder>.rsm-old`, the new one renamed into place, and only then is the
+/// old one removed, so the folder is never missing. The emulator's folder (the NAND or Vita3K
 /// savedata root) must already exist; a restore never creates it. Inside it, the title's own
 /// folders are created as Dolphin and Vita3K would.
 pub fn restore_folder_save(
@@ -299,9 +337,9 @@ pub fn restore_folder_save(
     }
     let mut seen = HashSet::new();
     for (name, _) in &entries {
-        if !flat_name(name) {
+        if !safe_entry_path(name) {
             anyhow::bail!(
-                "folder bundle entry {:?} is not a plain file name; nothing was written",
+                "folder bundle entry {:?} is not a path inside the folder; nothing was written",
                 name
             );
         }
@@ -321,21 +359,48 @@ pub fn restore_folder_save(
     remove_path_if_present(&staging)?;
     fs::create_dir(&staging).with_context(|| format!("cannot create {}", staging.display()))?;
     let written = entries.iter().try_for_each(|(name, bytes)| {
-        fs::write(staging.join(name), bytes)
-            .with_context(|| format!("cannot write {}", staging.join(name).display()))
+        let path = staging.join(name);
+        if let Some(folder) = path.parent() {
+            fs::create_dir_all(folder)
+                .with_context(|| format!("cannot create {}", folder.display()))?;
+        }
+        fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))
     });
     if let Err(err) = written {
         let _ = fs::remove_dir_all(&staging);
         return Err(err);
     }
-    remove_path_if_present(target_dir)?;
-    fs::rename(&staging, target_dir).with_context(|| {
-        format!(
-            "cannot rename {} to {}",
-            staging.display(),
-            target_dir.display()
-        )
-    })?;
+    let aside = parent.join(format!("{leaf}.rsm-old"));
+    remove_path_if_present(&aside)?;
+    let had_old = match fs::symlink_metadata(target_dir) {
+        Ok(_) => {
+            fs::rename(target_dir, &aside).with_context(|| {
+                format!(
+                    "cannot rename {} to {}",
+                    target_dir.display(),
+                    aside.display()
+                )
+            })?;
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot read {}", target_dir.display()));
+        }
+    };
+    if let Err(err) = fs::rename(&staging, target_dir) {
+        if had_old {
+            let _ = fs::rename(&aside, target_dir);
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "cannot rename {} to {}",
+                staging.display(),
+                target_dir.display()
+            )
+        });
+    }
+    remove_path_if_present(&aside)?;
     Ok(entries.len())
 }
 
@@ -446,6 +511,89 @@ mod tests {
         );
         assert_eq!(fs::read(target.join("banner.bin")).unwrap(), b"WIBN banner");
         assert_eq!(pack_folder_save(&target).unwrap().1, sha);
+    }
+
+    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        folder_save_files(dir)
+            .unwrap()
+            .into_iter()
+            .map(|(relative, path, _)| (relative, fs::read(path).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn a_vita_save_with_sce_sys_round_trips_every_file() {
+        let device_a = tempfile::tempdir().unwrap();
+        let save = device_a.path().join("psvita/vita3k/PCSE00746");
+        write(&save.join("SAVEDATA.BIN"), b"progress");
+        write(&save.join("sce_sys/param.sfo"), b"\0PSF sfo");
+        write(&save.join("sce_sys/sdslot.dat"), &[3u8; 4096]);
+        write(&save.join("sce_sys/keystone"), b"keystone");
+        let (bundle, sha) = pack_folder_save(&save).unwrap();
+
+        let device_b = tempfile::tempdir().unwrap();
+        let vita_b = FolderSaveKind::Vita3k.root_under(device_b.path());
+        let target = FolderSaveKind::Vita3k
+            .folder_for(&vita_b, "PCSE00746")
+            .unwrap();
+        // An older save with its own sce_sys is replaced, not merged.
+        write(&target.join("sce_sys/stale.dat"), b"old");
+        write(&target.join("SAVEDATA.BIN"), b"old");
+        assert_eq!(restore_folder_save(&vita_b, &target, &bundle).unwrap(), 4);
+        assert_eq!(snapshot(&target), snapshot(&save));
+        assert_eq!(pack_folder_save(&target).unwrap().1, sha);
+        assert!(!vita_b.join("PCSE00746.rsm-tmp").exists());
+        assert!(!vita_b.join("PCSE00746.rsm-old").exists());
+    }
+
+    #[test]
+    fn a_wii_save_with_a_subfolder_round_trips() {
+        let device_a = tempfile::tempdir().unwrap();
+        let data = device_a.path().join("Wii/title/00010000/52534245/data");
+        write(&data.join("banner.bin"), b"WIBN");
+        write(&data.join("replays/rep01.bin"), &[9u8; 2048]);
+        let (bundle, _) = pack_folder_save(&data).unwrap();
+
+        let device_b = tempfile::tempdir().unwrap();
+        let nand_b = device_b.path().join("wii/dolphin");
+        fs::create_dir_all(&nand_b).unwrap();
+        let target = FolderSaveKind::WiiNand
+            .folder_for(&nand_b, "00010000/52534245")
+            .unwrap();
+        assert_eq!(restore_folder_save(&nand_b, &target, &bundle).unwrap(), 2);
+        assert_eq!(snapshot(&target), snapshot(&data));
+    }
+
+    #[test]
+    fn an_entry_leaving_the_folder_is_refused_and_the_save_is_untouched() {
+        let device = tempfile::tempdir().unwrap();
+        let vita = device.path().join("psvita/vita3k");
+        let target = FolderSaveKind::Vita3k
+            .folder_for(&vita, "PCSE00746")
+            .unwrap();
+        write(&target.join("SAVEDATA.BIN"), b"keep");
+        write(&target.join("sce_sys/param.sfo"), b"keep sfo");
+        let before = snapshot(&target);
+        for bad in [
+            "../escape.bin",
+            "sce_sys/../../escape.bin",
+            "/escape.bin",
+            "sce_sys//x",
+        ] {
+            let bundle = build_stored_zip(&[
+                ("SAVEDATA.BIN".to_string(), b"new".to_vec()),
+                (bad.to_string(), b"x".to_vec()),
+            ])
+            .unwrap();
+            assert!(
+                restore_folder_save(&vita, &target, &bundle).is_err(),
+                "{bad}"
+            );
+            assert_eq!(snapshot(&target), before, "{bad}");
+            assert!(!vita.join("escape.bin").exists());
+            assert!(!device.path().join("psvita/escape.bin").exists());
+            assert!(!vita.join("PCSE00746.rsm-tmp").exists());
+        }
     }
 
     #[test]

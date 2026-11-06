@@ -11,8 +11,9 @@ use crate::api::{
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
 use crate::folder_saves::{
-    FolderSave, FolderSaveKind, discover_folder_saves, emulator_root_of, folder_line_key,
-    pack_folder_save, restore_folder_save, valid_folder_save_dir,
+    FOLDER_SAVE_MAX_BYTES, FolderSave, FolderSaveKind, discover_folder_saves, emulator_root_of,
+    folder_line_key, folder_save_files, pack_folder_save, restore_folder_save,
+    valid_folder_save_dir,
 };
 use crate::scanner::{
     PSP_SAVEDATA_SUBPATHS, RomIndexEntry, SaveAdapterProfile, SaveContainerFormat,
@@ -4607,6 +4608,21 @@ fn process_folder_save(
                 source_name
             );
         }
+        return Ok(None);
+    }
+    let folder_bytes: u64 = folder_save_files(&save.path)?
+        .iter()
+        .map(|(_, _, size)| size)
+        .sum();
+    if folder_bytes > FOLDER_SAVE_MAX_BYTES {
+        report.skipped += 1;
+        eprintln!(
+            "Skipping {} folder save {}: {} bytes is over the {} byte bundle limit",
+            system_slug,
+            save.path.display(),
+            folder_bytes,
+            FOLDER_SAVE_MAX_BYTES
+        );
         return Ok(None);
     }
     let (bytes, local_sha) = pack_folder_save(&save.path)?;

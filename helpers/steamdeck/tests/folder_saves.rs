@@ -265,3 +265,132 @@ fn with_folder_save_bundles_off_no_folder_bundle_is_uploaded() {
         );
     }
 }
+
+fn serve_vita_record(server: &MockServer, bundle: Vec<u8>) -> httpmock::Mock<'_> {
+    mock_auth(server);
+    server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let record = serde_json::json!({
+        "success": true,
+        "total": 1,
+        "saves": [{
+            "id": "save-vita",
+            "filename": "PCSE00746.vitasave",
+            "systemSlug": "psvita",
+            "game": {"system": {"slug": "psvita"}, "name": "PCSE00746"},
+            "displayTitle": "PCSE00746",
+            "sha256": "vita",
+            "version": 1,
+            "metadata": {"rsm": {"folder": {"saveDir": VITA_TITLE, "bundle": "folder-zip"}}}
+        }]
+    });
+    server.mock(move |when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(record.to_string());
+    });
+    server.mock(move |when, then| {
+        when.method(GET)
+            .path("/saves/download")
+            .query_param("id", "save-vita");
+        then.status(200).body(bundle.clone());
+    })
+}
+
+fn files_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    sgm_steamdeck_helper::folder_saves::folder_save_files(dir)
+        .unwrap()
+        .into_iter()
+        .map(|(relative, path, _)| (relative, fs::read(path).unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_vita_save_with_sce_sys_restores_through_sync_with_every_file_intact() {
+    let source = tempfile::tempdir().unwrap();
+    let save = source.path().join("psvita/vita3k").join(VITA_TITLE);
+    fs::create_dir_all(save.join("sce_sys")).unwrap();
+    fs::write(save.join("SAVEDATA.BIN"), vec![0x33u8; 4096]).unwrap();
+    fs::write(save.join("sce_sys/param.sfo"), b"\0PSF param").unwrap();
+    fs::write(save.join("sce_sys/sdslot.dat"), vec![0x07u8; 8192]).unwrap();
+    fs::write(save.join("sce_sys/keystone"), b"keystone").unwrap();
+    let (bundle, _) = sgm_steamdeck_helper::folder_saves::pack_folder_save(&save).unwrap();
+    let server = MockServer::start();
+    let download = serve_vita_record(&server, bundle);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    // Device B runs Vita3K (its savedata root exists) but has never played the title.
+    fs::create_dir_all(saves.join("psvita/vita3k")).unwrap();
+    let config = write_config(tmp.path(), &server, &saves, Some("true"));
+    let stderr = sync(&config);
+
+    assert_eq!(
+        download.calls(),
+        1,
+        "the Vita bundle was not downloaded: {stderr}"
+    );
+    let restored = saves.join("psvita/vita3k").join(VITA_TITLE);
+    assert_eq!(files_under(&restored), files_under(&save), "{stderr}");
+}
+
+#[test]
+fn a_vita_save_with_sce_sys_uploads_its_subfolder_files() {
+    let server = MockServer::start();
+    mock_auth(&server);
+    empty_server(&server);
+    let vita = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("filename=\"PCSE00746.vitasave\"")
+            .body_includes("sce_sys/param.sfo")
+            .body_includes("sce_sys/sdslot.dat");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-vita","sha256":"s","version":1}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let save = saves.join("psvita/vita3k").join(VITA_TITLE);
+    fs::create_dir_all(save.join("sce_sys")).unwrap();
+    fs::write(save.join("SAVEDATA.BIN"), vec![0x33u8; 4096]).unwrap();
+    fs::write(save.join("sce_sys/param.sfo"), b"\0PSF param").unwrap();
+    fs::write(save.join("sce_sys/sdslot.dat"), vec![0x07u8; 8192]).unwrap();
+    let config = write_config(tmp.path(), &server, &saves, Some("true"));
+    let stderr = sync(&config);
+    assert_eq!(
+        vita.calls(),
+        1,
+        "sce_sys was not in the uploaded bundle: {stderr}"
+    );
+}
+
+#[test]
+fn a_folder_over_the_server_s_size_limit_is_skipped_not_uploaded() {
+    let server = MockServer::start();
+    mock_auth(&server);
+    empty_server(&server);
+    let any = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-x","sha256":"s","version":1}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let save = saves.join("psvita/vita3k").join(VITA_TITLE);
+    fs::create_dir_all(&save).unwrap();
+    // A sparse file one byte over the limit: its size counts, not what is on disk.
+    let big = fs::File::create(save.join("SAVEDATA.BIN")).unwrap();
+    big.set_len(sgm_steamdeck_helper::folder_saves::FOLDER_SAVE_MAX_BYTES + 1)
+        .unwrap();
+    let config = write_config(tmp.path(), &server, &saves, Some("true"));
+    let stderr = sync(&config);
+    assert_eq!(any.calls(), 0, "an oversized folder was uploaded: {stderr}");
+    assert!(stderr.contains("bundle limit"), "no skip line: {stderr}");
+}
