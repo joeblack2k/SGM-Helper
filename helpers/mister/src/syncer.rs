@@ -2946,14 +2946,6 @@ fn projection_runtime_profile_for_system(
             }
             .to_string(),
         ),
-        "pc-engine" => Some(
-            match source_profile {
-                EmulatorProfile::Mister => "pc-engine/mister",
-                EmulatorProfile::RetroArch => "pc-engine/retroarch-beetle-pce",
-                _ => "pc-engine/mednafen",
-            }
-            .to_string(),
-        ),
         "3do" => Some(
             match source_profile {
                 EmulatorProfile::RetroArch => "3do/retroarch-opera",
@@ -5041,6 +5033,45 @@ mod runtime_profile_map {
                     .any(|s| crate::sources::same_system(s, &slug)),
                 "{slug} is not synced by default"
             );
+        }
+    }
+
+    // A PC Engine save found where RetroDECK writes it is classified by the
+    // scanner, and that slug, not the server's "pc-engine", picks the profile.
+    // A Steam Deck or Windows source with a generic profile runs Beetle PCE
+    // under RetroArch; a plain "pc-engine" arm ahead of the grouped one
+    // answered mednafen for the server's slug.
+    #[test]
+    fn a_generic_desktop_pc_engine_save_names_beetle_pce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("saves")
+            .join("pcengine")
+            .join("Ballistix (USA).srm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes: Vec<u8> = (0..2048usize)
+            .map(|i| (i as u8).wrapping_mul(31) | 1)
+            .collect();
+        std::fs::write(&path, bytes).unwrap();
+        let slug = crate::scanner::infer_supported_console_slug(&path, None).expect("classified");
+        for (kind, device) in [
+            (SourceKind::SteamDeck, "steamdeck"),
+            (SourceKind::Windows, "windows"),
+        ] {
+            for name in [slug.as_str(), "pc-engine"] {
+                assert_eq!(
+                    projection_runtime_profile_for_system(
+                        &kind,
+                        &EmulatorProfile::Generic,
+                        name,
+                        device
+                    )
+                    .as_deref(),
+                    Some("pc-engine/retroarch-beetle-pce"),
+                    "{device} {name}"
+                );
+            }
         }
     }
 }
