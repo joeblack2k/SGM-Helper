@@ -3350,6 +3350,22 @@ fn projection_runtime_profile_for_system(
             }
             .to_string(),
         ),
+        // RetroSaveManager's pc-engine profiles are identity projections of the raw backup RAM;
+        // RetroDECK and the desktop helpers run Beetle PCE under RetroArch.
+        "pc-engine" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "pc-engine/mister",
+                EmulatorProfile::RetroArch => "pc-engine/retroarch-beetle-pce",
+                _ => match source_kind {
+                    SourceKind::MisterFpga => "pc-engine/mister",
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "pc-engine/retroarch-beetle-pce"
+                    }
+                    _ => "pc-engine/mednafen",
+                },
+            }
+            .to_string(),
+        ),
         _ => None,
     }
 }
@@ -4151,6 +4167,53 @@ mod tests {
             metadata: None,
             rom_sha1: None,
             rom_md5: None,
+        }
+    }
+
+    // RetroSaveManager lists pc-engine as projection-capable and refuses a helper upload of it
+    // without a runtimeProfile (400), so every source must name one of its pc-engine profiles.
+    #[test]
+    fn runtime_target_names_a_pc_engine_profile_for_every_source() {
+        let cases = [
+            (
+                SourceKind::MisterFpga,
+                EmulatorProfile::Mister,
+                "mister",
+                "pc-engine/mister",
+            ),
+            (
+                SourceKind::RetroArch,
+                EmulatorProfile::RetroArch,
+                "retroarch",
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                SourceKind::SteamDeck,
+                EmulatorProfile::Generic,
+                "steamdeck",
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                SourceKind::Windows,
+                EmulatorProfile::Generic,
+                "windows",
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                SourceKind::Custom,
+                EmulatorProfile::Generic,
+                "custom",
+                "pc-engine/mednafen",
+            ),
+        ];
+        for (kind, profile, device, want) in cases {
+            let target = runtime_target_for_system(&kind, &profile, "pc-engine", device);
+            assert_eq!(target.runtime_profile.as_deref(), Some(want), "{device}");
+            assert_eq!(
+                target.system_profile_key.as_deref(),
+                Some("pcEngineProfile"),
+                "{device}"
+            );
         }
     }
 
