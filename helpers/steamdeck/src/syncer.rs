@@ -552,7 +552,8 @@ pub fn run_sync(
                 sync_state.entries.remove(&save_key);
                 continue;
             }
-            if missing_entry_names_no_rom(&save_key, &entry, &missing_rom_index) {
+            if missing_entry_names_no_rom(&save_key, &entry, &missing_rom_index, &source.rom_roots)
+            {
                 report.skipped += 1;
                 eprintln!(
                     "Not restoring missing save {}: no ROM on this device carries that name, so no emulator loads it; dropping its entry",
@@ -1982,12 +1983,19 @@ fn existing_cloud_target_for_alias(
 /// the device (a short name another tool gave the game, which the server keys
 /// on that short name) is a file nothing reads; writing it back only re-creates
 /// it after every delete. Judged only where the answer is known: a source that
-/// indexed ROMs, a one-save-per-ROM system, and a primary save, never a sidecar.
+/// indexed ROMs with every ROM root present, a one-save-per-ROM system, and a
+/// primary save, never a sidecar.
 fn missing_entry_names_no_rom(
     missing_key: &str,
     missing: &SyncedEntry,
     rom_index: &HashMap<String, RomIndexEntry>,
+    rom_roots: &[PathBuf],
 ) -> bool {
+    // A configured ROM root that is not there (an unmounted SD card) indexed
+    // nothing, so a name absent from the index may still be a ROM on it.
+    if rom_roots.iter().any(|root| !root.exists()) {
+        return false;
+    }
     let Some(system_slug) = missing.system_slug.as_deref() else {
         return false;
     };
@@ -4943,6 +4951,67 @@ fn synced_entry(
 
 #[cfg(test)]
 mod tests {
+
+    fn rom_index_of(roots: &[PathBuf]) -> HashMap<String, RomIndexEntry> {
+        crate::scanner::discover_rom_index("test", roots, true).unwrap()
+    }
+
+    fn gba_entry(rom: &str) -> SyncedEntry {
+        synced_entry(
+            "aa".repeat(32),
+            Some(rom.to_string()),
+            Some(1),
+            Some("gba"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    // A ROM root that is not there (an unmounted card) indexes nothing, so a
+    // name missing from the index says nothing about the ROMs on that root.
+    #[test]
+    fn a_missing_rom_root_keeps_a_missing_save_whose_name_no_indexed_rom_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present = tmp.path().join("internal");
+        let absent = tmp.path().join("sdcard/roms");
+        fs::create_dir_all(present.join("gba")).unwrap();
+        fs::write(present.join("gba/Other Game (USA).zip"), b"rom").unwrap();
+        let roots = vec![present, absent];
+        let index = rom_index_of(&roots);
+        assert!(!index.is_empty());
+
+        let key = tmp.path().join("saves/gba/Golden Sun (USA, Europe).srm");
+        assert!(
+            !missing_entry_names_no_rom(
+                &key.to_string_lossy(),
+                &gba_entry("golden-sun-rom"),
+                &index,
+                &roots,
+            ),
+            "an entry was judged while one of its source's ROM roots was missing"
+        );
+    }
+
+    #[test]
+    fn with_every_rom_root_present_a_name_no_rom_has_is_judged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present = tmp.path().join("internal");
+        fs::create_dir_all(present.join("gba")).unwrap();
+        fs::write(present.join("gba/Other Game (USA).zip"), b"rom").unwrap();
+        let roots = vec![present];
+        let index = rom_index_of(&roots);
+
+        let key = tmp.path().join("saves/gba/Golden Sun.srm");
+        assert!(missing_entry_names_no_rom(
+            &key.to_string_lossy(),
+            &gba_entry("golden-sun-short"),
+            &index,
+            &roots,
+        ));
+    }
 
     // The server's error text is `… status=<code> <reason> body=…`; the parse
     // has to take the code and decide on it, not on the reason phrase.
