@@ -500,6 +500,13 @@ pub fn run_sync(
             }
         }
 
+        // The ROMs this source holds, for the missing-save restore. A Ports
+        // source indexes none, and an empty index judges nothing.
+        let missing_rom_index = if matches!(source.kind, SourceKind::Ports) {
+            HashMap::new()
+        } else {
+            discover_rom_index(&source.name, &source.rom_roots, source.recursive)?
+        };
         let missing_entries: Vec<(String, SyncedEntry)> = sync_state
             .entries
             .iter()
@@ -541,6 +548,15 @@ pub fn run_sync(
                 eprintln!(
                     "Not restoring missing save {}: this save is already held at {} (matched by {}); dropping its entry",
                     save_key, held, arm
+                );
+                sync_state.entries.remove(&save_key);
+                continue;
+            }
+            if missing_entry_names_no_rom(&save_key, &entry, &missing_rom_index) {
+                report.skipped += 1;
+                eprintln!(
+                    "Not restoring missing save {}: no ROM on this device carries that name, so no emulator loads it; dropping its entry",
+                    save_key
                 );
                 sync_state.entries.remove(&save_key);
                 continue;
@@ -1957,6 +1973,29 @@ fn existing_cloud_target_for_alias(
         }
     }
     None
+}
+
+/// Whether a missing entry's file is named after no ROM this source holds.
+///
+/// The missing-save restore writes the entry's own path, and an emulator loads a
+/// cartridge save only under its ROM's name. A path whose stem names no ROM on
+/// the device (a short name another tool gave the game, which the server keys
+/// on that short name) is a file nothing reads; writing it back only re-creates
+/// it after every delete. Judged only where the answer is known: a source that
+/// indexed ROMs, a one-save-per-ROM system, and a primary save, never a sidecar.
+fn missing_entry_names_no_rom(
+    missing_key: &str,
+    missing: &SyncedEntry,
+    rom_index: &HashMap<String, RomIndexEntry>,
+) -> bool {
+    let Some(system_slug) = missing.system_slug.as_deref() else {
+        return false;
+    };
+    if rom_index.is_empty() || !one_save_per_rom(system_slug) || is_sidecar_path(missing_key) {
+        return false;
+    }
+    let stem = filename_stem(Path::new(missing_key)).to_ascii_lowercase();
+    !rom_index.contains_key(&stem)
 }
 
 /// Another file this helper holds as the same save as a missing entry.
