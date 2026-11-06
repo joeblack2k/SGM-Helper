@@ -1107,6 +1107,12 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "wonderswan"
             | "sg-1000"
             | "colecovision"
+            | "3do"
+            | "atari-jaguar"
+            | "neogeo-cd"
+            | "ngp"
+            | "pc-engine"
+            | "virtualboy"
     )
 }
 
@@ -4479,6 +4485,25 @@ mod tests {
 
     // The server's error text is `… status=<code> <reason> body=…`; the parse
     // has to take the code and decide on it, not on the reason phrase.
+    #[test]
+    fn windows_restores_every_system_retroarch_runs_on_it() {
+        // The cabinet's RetroArch runs these; a record another device uploaded
+        // has to come back down instead of being dropped before a target is chosen.
+        for slug in [
+            "3do",
+            "atari-jaguar",
+            "neogeo-cd",
+            "ngp",
+            "pc-engine",
+            "virtualboy",
+        ] {
+            assert!(
+                supports_cloud_restore_system(slug),
+                "{slug} is not restored"
+            );
+        }
+    }
+
     #[test]
     fn permanent_rejection_status_reads_the_status_code() {
         let refused = anyhow::anyhow!(

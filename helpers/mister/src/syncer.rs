@@ -903,6 +903,10 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "wonderswan"
             | "sg-1000"
             | "colecovision"
+            | "pc-engine"
+            | "neogeo-cd"
+            | "ngp"
+            | "virtualboy"
     )
 }
 
@@ -4777,6 +4781,18 @@ mod tests {
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
         );
+    }
+
+    #[test]
+    fn mister_restores_every_system_it_syncs_and_has_a_core_for() {
+        // A record another device uploaded for one of these has to come back down
+        // to the MiSTer: each has a core, and the server allows it on a MiSTer.
+        for slug in ["pc-engine", "neogeo-cd", "ngp", "virtualboy"] {
+            assert!(
+                supports_cloud_restore_system(slug),
+                "{slug} is not restored"
+            );
+        }
     }
 
     #[test]
