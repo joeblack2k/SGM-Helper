@@ -2591,6 +2591,104 @@ fn a_permanently_refused_save_is_not_uploaded_again() {
     );
 }
 
+/// An unformatted Neo Geo CD card is 8 KiB of zeros. RSM refuses it as blank;
+/// that is a skipped save, not a sync error, and it is still remembered so the
+/// card is not sent again. Needs the Neo Geo CD scanner arm (#78) and the
+/// per-build refusal record (#59).
+#[test]
+fn a_blank_neo_geo_cd_card_refused_by_the_server_is_skipped_not_an_error() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_blank","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"blank@example.com"}}"#);
+    });
+    let _rom_lookup = server.mock(|when, then| {
+        when.method(GET).path("/rom/lookup");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"count":1,"rom":{"sha1":"ngcd123","md5":"md5v","fileName":"Art of Fighting.srm"}}"#);
+    });
+    let _save_latest = server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":false,"sha256":null,"version":null,"id":null}"#);
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST).path("/saves");
+        then.status(422)
+            .header("content-type", "application/json")
+            .body(r#"{"error":"Unprocessable Entity","message":"unsupported or unrecognized save format; only known consoles/arcade are allowed","reason":"neo geo cd raw save payload is blank (all 0x00)","statusCode":422}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("neogeocd")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        root.join("neogeocd/Art of Fighting (World).srm"),
+        vec![0x00u8; 8192],
+    )
+    .unwrap();
+    let config = write_config(&tmp, &server, &root, &state_dir);
+
+    Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("blank@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    let first = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "sync failed: {stdout}{stderr}");
+    assert_eq!(
+        upload.calls(),
+        1,
+        "the card was not offered: {stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains("errors=0"),
+        "a blank-card refusal counted as an error: {stdout}"
+    );
+    let state = fs::read_to_string(state_dir.join("sync_state.json")).unwrap();
+    assert!(
+        state.contains("terminal_rejections") && state.contains("Art of Fighting"),
+        "the refusal was not remembered: {state}"
+    );
+
+    let second = Command::cargo_bin("sgm-steamdeck-helper")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("sync")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&second.stdout).contains("errors=0"));
+    assert_eq!(upload.calls(), 1, "the blank card was sent again");
+}
+
 /// Seeds a refusal for the save at its current bytes, recorded by `version`,
 /// then syncs once and returns how many uploads the server saw.
 fn uploads_after_a_refusal_recorded_by(version: Option<&str>) -> (usize, String) {

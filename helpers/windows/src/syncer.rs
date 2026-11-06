@@ -429,8 +429,16 @@ pub fn run_sync(
                     }
                 }
                 Err(err) => {
-                    report.errors += 1;
-                    eprintln!("Sync error for {}: {}", save_path.display(), err);
+                    if is_blank_card_rejection(&err) {
+                        report.skipped += 1;
+                        eprintln!(
+                            "Skipping blank card {}: the server holds no save for it",
+                            save_path.display()
+                        );
+                    } else {
+                        report.errors += 1;
+                        eprintln!("Sync error for {}: {}", save_path.display(), err);
+                    }
                     if let Some(status) = permanent_rejection_status(&err) {
                         let sha = sha256_file(&save_path).unwrap_or_default();
                         sync_state.terminal_rejections.insert(
@@ -4041,6 +4049,21 @@ fn is_missing_cloud_payload_reference(err: &anyhow::Error) -> bool {
     payload_hint && missing_hint
 }
 
+/// RSM refuses a blank Neo Geo CD, Neo Geo Pocket or Virtual Boy card through
+/// the raw-save profile (legacy_raw_validation.go): "<display name> raw save payload is blank
+/// (all 0x00)" or "(all 0xFF)". An unformatted Neo Geo CD card is 8 KiB of zeros
+/// until a game formats it, so such a refusal is a skipped save, not an error.
+fn is_blank_card_rejection(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("status=422 unprocessable entity")
+        && ["neo geo cd", "neo geo pocket", "virtual boy"]
+            .iter()
+            .any(|display| {
+                message.contains(&format!("{display} raw save payload is blank (all 0x00)"))
+                    || message.contains(&format!("{display} raw save payload is blank (all 0xff)"))
+            })
+}
+
 fn is_empty_n64_controller_pak_rejection(err: &anyhow::Error, system_slug: &str) -> bool {
     if system_slug != "n64" {
         return false;
@@ -4845,6 +4868,27 @@ mod tests {
             "HTTP request faalde: status=500 Internal Server Error body={\"error\":\"Internal Server Error\",\"message\":\"database unavailable\",\"statusCode\":500}",
         );
         assert!(!is_missing_cloud_payload_reference(&not_missing));
+    }
+
+    #[test]
+    fn detects_blank_card_rejection() {
+        let blank = anyhow::Error::msg(
+            "POST /saves (multipart upload): HTTP request faalde: status=422 Unprocessable Entity body={\"error\":\"Unprocessable Entity\",\"message\":\"unsupported or unrecognized save format; only known consoles/arcade are allowed\",\"reason\":\"neo geo cd raw save payload is blank (all 0x00)\",\"statusCode\":422}",
+        );
+        assert!(is_blank_card_rejection(&blank));
+        let ff = anyhow::Error::msg(
+            "HTTP request faalde: status=422 Unprocessable Entity body={\"reason\":\"virtual boy raw save payload is blank (all 0xFF)\",\"statusCode\":422}",
+        );
+        assert!(is_blank_card_rejection(&ff));
+        let other = anyhow::Error::msg(
+            "HTTP request faalde: status=422 Unprocessable Entity body={\"reason\":\"neo geo pocket raw save size 7 is not recognized\",\"statusCode\":422}",
+        );
+        assert!(!is_blank_card_rejection(&other));
+        // A system whose blank refusal is a loud error stays one.
+        let gba = anyhow::Error::msg(
+            "HTTP request faalde: status=422 Unprocessable Entity body={\"reason\":\"gba raw save payload is blank (all 0xFF)\",\"statusCode\":422}",
+        );
+        assert!(!is_blank_card_rejection(&gba));
     }
 
     #[test]
