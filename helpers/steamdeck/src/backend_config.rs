@@ -799,6 +799,14 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension("ini.tmp");
     fs::write(&tmp, content)
         .with_context(|| format!("kan config niet schrijven: {}", tmp.display()))?;
+    // config.ini can hold APP_PASSWORD: the replacement keeps the old file's
+    // mode (a 0600 config stays 0600) instead of taking the process default.
+    // Windows has no mode to carry; the folder's ACL applies to both files.
+    #[cfg(unix)]
+    if let Ok(existing) = fs::metadata(path) {
+        fs::set_permissions(&tmp, existing.permissions())
+            .with_context(|| format!("kan config rechten niet zetten: {}", tmp.display()))?;
+    }
     fs::rename(&tmp, path).with_context(|| format!("kan config niet vervangen: {}", path.display()))
 }
 
@@ -1127,6 +1135,31 @@ mod tests {
         assert_eq!(added.systems, vec!["snes"]);
         assert_eq!(added.profile, EmulatorProfile::Snes9x);
         assert_eq!(added.origin, "backend-ui");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backend_policy_write_back_keeps_the_config_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.ini");
+        fs::write(&config_path, "URL=\"127.0.0.1\"\nAPP_PASSWORD=\"secret\"\n").unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = test_config(&config_path, tmp.path());
+        let response: BackendConfigSyncResponse = serde_json::from_value(serde_json::json!({
+            "policy": { "global": { "watchInterval": 15 } }
+        }))
+        .unwrap();
+
+        write_backend_policy_to_config(&config, &response, false).unwrap();
+
+        assert!(
+            fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("WATCH_INTERVAL=\"15\"")
+        );
+        let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rewritten config.ini is {mode:o}, not 600");
     }
 
     #[test]
