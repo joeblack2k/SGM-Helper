@@ -1167,6 +1167,11 @@ fn cloud_target_path_inner(
         };
         return target_dir.join("data.bin");
     }
+    if system_slug == "ps2"
+        && let Some(card) = cloud_ps2_card_target(cloud_save, root, source_kind, source_profile)
+    {
+        return card;
+    }
     let filename = cloud_restore_filename(cloud_save, target_extension);
     let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
         root.to_path_buf()
@@ -1189,6 +1194,56 @@ fn cloud_target_path_inner(
         ))
     };
     target_dir.join(filename)
+}
+
+/// PS2 memory card a cloud PS2 record restores to: the card the emulator loads for the record's slot.
+/// RetroSaveManager stores one game's save per record and builds a whole card per slot from every game
+/// on it, so a restore replaces the slot's card file. A title-named `.ps2` beside the cards is a file
+/// no PCSX2 build mounts. An existing card for the slot (LRPS2 under `retroarch-core/LRPS2/memcards`,
+/// PCSX2 under `pcsx2/memcards` or a `memcards` source root) is the target; with none, the slot's file
+/// goes in `memcards` in the system folder.
+fn cloud_ps2_card_target(
+    cloud_save: &CloudSaveSummary,
+    root: &Path,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+) -> Option<PathBuf> {
+    let card_file = ps2_card_filename(cloud_save.card_slot.as_deref()?)?;
+    for dir in [
+        root.to_path_buf(),
+        root.join("memcards"),
+        root.join("ps2")
+            .join("retroarch-core")
+            .join("LRPS2")
+            .join("memcards"),
+        root.join("ps2").join("pcsx2").join("memcards"),
+        root.join("ps2").join("memcards"),
+    ] {
+        let candidate = dir.join(card_file);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let system_dir = if root_is_system_specific(root, source_profile, "ps2") {
+        root.to_path_buf()
+    } else {
+        root.join(preferred_system_directory_for_root(
+            root,
+            source_kind,
+            source_profile,
+            "ps2",
+        ))
+    };
+    Some(system_dir.join("memcards").join(card_file))
+}
+
+/// The card file PCSX2 and LRPS2 load for a RetroSaveManager card slot ("Memory Card 1" is Mcd001.ps2).
+fn ps2_card_filename(card_slot: &str) -> Option<&'static str> {
+    match parse_playstation_slot(card_slot)?.as_str() {
+        "Memory Card 1" => Some("Mcd001.ps2"),
+        "Memory Card 2" => Some("Mcd002.ps2"),
+        _ => None,
+    }
 }
 
 fn cloud_wii_title_code(cloud_save: &CloudSaveSummary) -> Option<String> {
@@ -4044,6 +4099,77 @@ mod tests {
             rom_sha1: None,
             rom_md5: None,
         }
+    }
+
+    fn ps2_card_record(card_slot: &str) -> CloudSaveSummary {
+        let mut save = cloud_save("Burnout 3.zip", "Burnout 3", "ps2", "ps2/pcsx2", ".ps2");
+        save.card_slot = Some(card_slot.to_string());
+        save
+    }
+
+    #[test]
+    fn a_ps2_record_restores_over_retrodecks_lrps2_card_for_its_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        let memcards = root.join("ps2/retroarch-core/LRPS2/memcards");
+        fs::create_dir_all(&memcards).unwrap();
+        fs::write(memcards.join("Mcd001.ps2"), vec![0xFFu8; 64]).unwrap();
+        fs::write(memcards.join("Mcd002.ps2"), vec![0xFFu8; 64]).unwrap();
+
+        let target = cloud_target_path(
+            &ps2_card_record("Memory Card 1"),
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "ps2",
+            Some(".ps2"),
+        );
+        assert_eq!(target, memcards.join("Mcd001.ps2"));
+
+        let target = cloud_target_path(
+            &ps2_card_record("Memory Card 2"),
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "ps2",
+            Some(".ps2"),
+        );
+        assert_eq!(target, memcards.join("Mcd002.ps2"));
+    }
+
+    #[test]
+    fn a_ps2_record_restores_over_a_pcsx2_memcards_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("PCSX2/memcards");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Mcd001.ps2"), vec![0xFFu8; 64]).unwrap();
+
+        let target = cloud_target_path(
+            &ps2_card_record("Memory Card 1"),
+            std::slice::from_ref(&root),
+            &SourceKind::Windows,
+            &EmulatorProfile::Generic,
+            "ps2",
+            Some(".ps2"),
+        );
+        assert_eq!(target, root.join("Mcd001.ps2"));
+    }
+
+    #[test]
+    fn a_ps2_record_with_no_card_on_disk_goes_to_the_slots_memcards_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        fs::create_dir_all(root.join("ps2")).unwrap();
+
+        let target = cloud_target_path(
+            &ps2_card_record("Memory Card 1"),
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "ps2",
+            Some(".ps2"),
+        );
+        assert_eq!(target, root.join("ps2/memcards/Mcd001.ps2"));
     }
 
     #[test]
