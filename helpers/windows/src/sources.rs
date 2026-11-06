@@ -1902,6 +1902,7 @@ mod tests {
             binary_dir: PathBuf::from("/tmp"),
             config_path: PathBuf::from("/tmp/config.ini"),
             psp_savedata_bundles: false,
+            folder_save_bundles: false,
         };
 
         let source = default_source(&cfg, SourceKind::Windows).unwrap();

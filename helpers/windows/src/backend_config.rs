@@ -1197,6 +1197,7 @@ mod tests {
             binary_dir: root.to_path_buf(),
             config_path: config_path.to_path_buf(),
             psp_savedata_bundles: false,
+            folder_save_bundles: false,
         }
     }
 }

@@ -37,6 +37,10 @@ pub struct AppConfig {
     /// data file alone. Off by default until the server stores bundles.
     #[serde(default)]
     pub psp_savedata_bundles: bool,
+    /// Sync each Dolphin NAND title and Vita3K savedata folder as one bundle. Off by default
+    /// until the server stores folder bundles.
+    #[serde(default)]
+    pub folder_save_bundles: bool,
     pub dry_run: bool,
     pub route_prefix: String,
     pub secure: bool,
@@ -61,6 +65,9 @@ impl LoadedConfig {
         let mut env_values = collect_env_values();
         if let Some(value) = read_env_aliases("PSP_SAVEDATA_BUNDLES") {
             env_values.insert("PSP_SAVEDATA_BUNDLES".to_string(), value);
+        }
+        if let Some(value) = read_env_aliases("FOLDER_SAVE_BUNDLES") {
+            env_values.insert("FOLDER_SAVE_BUNDLES".to_string(), value);
         }
 
         let config = AppConfig::from_sources(
@@ -181,6 +188,8 @@ impl AppConfig {
         )?;
         let psp_savedata_bundles =
             choose_bool(None, env_values, ini_values, "PSP_SAVEDATA_BUNDLES", false)?;
+        let folder_save_bundles =
+            choose_bool(None, env_values, ini_values, "FOLDER_SAVE_BUNDLES", false)?;
         let dry_run = choose_bool(overrides.dry_run, env_values, ini_values, "DRY_RUN", false)?;
         let route_prefix = normalize_route_prefix(&choose_string(
             overrides.route_prefix.clone(),
@@ -206,6 +215,7 @@ impl AppConfig {
             watch_interval,
             force_upload,
             psp_savedata_bundles,
+            folder_save_bundles,
             dry_run,
             route_prefix,
             secure,

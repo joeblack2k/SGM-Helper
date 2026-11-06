@@ -674,6 +674,47 @@ impl ApiClient {
         parse_json_response(response)
     }
 
+    /// Upload a save an emulator keeps as a folder (a Dolphin NAND title, a Vita3K savedata
+    /// folder) as one bundle. `folder_save_dir` names the folder so the server keeps it with
+    /// the record and any device can restore it in the same place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_folder_save(
+        &self,
+        filename: &str,
+        bytes: Vec<u8>,
+        rom_sha1: &str,
+        slot_name: &str,
+        device_type: &str,
+        fingerprint: &str,
+        app_password: Option<&str>,
+        system_slug: &str,
+        folder_save_dir: &str,
+    ) -> Result<UploadSaveResponse> {
+        let url = self.url("/saves");
+        let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(filename.to_string());
+        let mut form = reqwest::blocking::multipart::Form::new()
+            .part("file", part)
+            .text("rom_sha1", rom_sha1.to_string())
+            .text("slotName", slot_name.to_string())
+            .text("device_type", device_type.to_string())
+            .text("fingerprint", fingerprint.to_string())
+            .text("system", system_slug.to_string())
+            .text("folderSaveDir", folder_save_dir.to_string());
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            form = form.text("app_password", app_password.to_string());
+        }
+        let response = self
+            .client
+            .post(url)
+            .header("X-CSRF-Protection", "1")
+            .multipart(form)
+            .send()
+            .context("request naar /saves (multipart) faalde")?;
+        parse_json_response(response)
+    }
+
     pub fn list_saves(
         &self,
         limit: usize,

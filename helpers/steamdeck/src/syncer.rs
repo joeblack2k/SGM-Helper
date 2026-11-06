@@ -10,6 +10,10 @@ use crate::api::{
 };
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
+use crate::folder_saves::{
+    FolderSave, FolderSaveKind, discover_folder_saves, emulator_root_of, folder_line_key,
+    pack_folder_save, restore_folder_save, valid_folder_save_dir,
+};
 use crate::ports::{PortSaveMatch, discover_port_save_matches};
 use crate::scanner::{
     PSP_SAVEDATA_SUBPATHS, RomIndexEntry, SaveAdapterProfile, SaveContainerFormat,
@@ -359,6 +363,58 @@ pub fn run_sync(
                         source.kind.as_str(),
                         psp_bundles.len()
                     );
+                }
+            }
+            // With FOLDER_SAVE_BUNDLES on, a Dolphin NAND title or Vita3K savedata folder is one
+            // save and its files are not synced on their own.
+            let folder_saves = if config.folder_save_bundles {
+                discover_folder_saves(&source.save_roots)
+            } else {
+                Vec::new()
+            };
+            let save_files: Vec<PathBuf> = save_files
+                .into_iter()
+                .filter(|path| !folder_saves.iter().any(|save| path.starts_with(&save.path)))
+                .collect();
+            if verbose && config.folder_save_bundles {
+                eprintln!(
+                    "Source '{}' ({}) discovered {} folder save(s)",
+                    source.name,
+                    source.kind.as_str(),
+                    folder_saves.len()
+                );
+            }
+            report.scanned += folder_saves.len();
+            for folder_save in &folder_saves {
+                let state_key = folder_save.path.to_string_lossy().to_string();
+                let result = process_folder_save(
+                    &api,
+                    folder_save,
+                    sync_state
+                        .entries
+                        .get(&state_key)
+                        .map(|entry| entry.sha256.as_str()),
+                    &fingerprint,
+                    &source.name,
+                    &source.kind,
+                    &source.profile,
+                    &source.systems,
+                    app_password,
+                    options,
+                    &mut report,
+                    verbose,
+                );
+                match result {
+                    Ok(Some(processed)) => {
+                        sync_state
+                            .entries
+                            .insert(processed.state_key, processed.entry);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        report.errors += 1;
+                        eprintln!("Sync error for {}: {}", folder_save.path.display(), err);
+                    }
                 }
             }
             report.scanned += psp_bundles.len();
@@ -826,6 +882,29 @@ fn restore_single_cloud_save(
     // This closure shadows the free function for every call below it in this
     // function and nowhere else: a call moved into a helper function, or added
     // above this line, gets the unshadowed check and the rewrite loop returns.
+    // A folder bundle (a Dolphin NAND title, a Vita3K savedata folder) restores as the whole
+    // folder; only the server's folder-bundle records carry /rsm/folder, so no flag is needed.
+    if let Some(kind) = FolderSaveKind::from_system_slug(&system_slug)
+        && source_allows_system(source_systems, &system_slug)
+        && restore_cloud_folder_save(
+            api,
+            cloud_save,
+            kind,
+            source_name,
+            source_kind,
+            source_profile,
+            save_roots,
+            fingerprint,
+            app_password,
+            options,
+            sync_entries,
+            restored_targets,
+            report,
+            verbose,
+        )?
+    {
+        return Ok(());
+    }
     let known_entries = &*sync_entries;
     let existing_local_save_is_valid = |path: &Path, system_slug: &str, expect_sidecar: bool| {
         existing_local_save_is_valid(path, system_slug, expect_sidecar)
@@ -4915,6 +4994,249 @@ fn default_adapter_profile_for_container(container: SaveContainerFormat) -> Save
         SaveContainerFormat::Ps1DexDrive => SaveAdapterProfile::Ps1DexDrive,
         SaveContainerFormat::Ps1Vmp => SaveAdapterProfile::Ps1Vmp,
     }
+}
+
+// --- Folder saves: Dolphin NAND titles and Vita3K savedata folders (folder_saves.rs) ---
+
+/// The slot a folder bundle is stored under: the folder is the save's identity.
+const FOLDER_SAVE_SLOT: &str = "default";
+
+/// Upload, settle or replace one folder save, by the rule a single file follows: a folder that
+/// changed since this device last synced it uploads; otherwise the server's copy replaces it.
+#[allow(clippy::too_many_arguments)]
+fn process_folder_save(
+    api: &ApiClient,
+    save: &FolderSave,
+    prior_local_sha: Option<&str>,
+    fingerprint: &str,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    source_systems: &[String],
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<Option<ProcessedEntry>> {
+    let system_slug = save.kind.system_slug();
+    if !source_allows_system(source_systems, system_slug) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping {}: {} is disabled for source '{}'",
+                save.path.display(),
+                system_slug,
+                source_name
+            );
+        }
+        return Ok(None);
+    }
+    let (bytes, local_sha) = pack_folder_save(&save.path)?;
+    let state_key = save.path.to_string_lossy().to_string();
+    let rom_key = save.line_key();
+    let filename = save.filename();
+    let device_type = helper_device_type_for_upload(source_kind, source_profile, system_slug);
+    let entry_for = |sha: String, version: Option<i64>| {
+        processed_entry(
+            state_key.clone(),
+            synced_entry(
+                sha,
+                Some(rom_key.clone()),
+                version,
+                Some(system_slug),
+                Some(SaveContainerFormat::Native),
+                Some(SaveAdapterProfile::Identity),
+                Some(source_kind),
+                Some(source_name),
+                Some(FOLDER_SAVE_SLOT),
+            ),
+        )
+    };
+    if verbose {
+        eprintln!(
+            "Detected {} folder save {} ({} bytes packed, line {})",
+            system_slug,
+            save.path.display(),
+            bytes.len(),
+            rom_key
+        );
+    }
+
+    let latest_context = LatestSaveContext {
+        filename: filename.clone(),
+        system_slug: system_slug.to_string(),
+        display_title: save.save_dir.clone(),
+        region_code: None,
+    };
+    let latest = api.latest_save(LatestSaveRequest {
+        rom_sha1: &rom_key,
+        slot_name: FOLDER_SAVE_SLOT,
+        device_type,
+        fingerprint,
+        app_password,
+        runtime_target: None,
+        context: Some(&latest_context),
+    })?;
+
+    let upload = |report: &mut SyncReport| -> Result<Option<ProcessedEntry>> {
+        if options.dry_run {
+            report.uploaded += 1;
+            return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+        }
+        let response = api.upload_folder_save(
+            &filename,
+            bytes.clone(),
+            &rom_key,
+            FOLDER_SAVE_SLOT,
+            device_type,
+            fingerprint,
+            app_password,
+            system_slug,
+            &save.save_dir,
+        )?;
+        let Some(stored) = stored_save(response) else {
+            report_accepted_not_stored(report, &save.path);
+            return Ok(None);
+        };
+        report.uploaded += 1;
+        Ok(Some(entry_for(
+            local_sha.clone(),
+            stored.version.or(latest.version),
+        )))
+    };
+
+    if !latest.exists || options.force_upload {
+        return upload(report);
+    }
+    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
+        report.in_sync += 1;
+        return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+    }
+    let local_edited_since_sync = prior_local_sha
+        .map(|prior| prior != local_sha.as_str())
+        .unwrap_or(false);
+    if local_edited_since_sync {
+        return upload(report);
+    }
+    let Some(save_id) = latest.id.as_deref() else {
+        report.skipped += 1;
+        return Ok(None);
+    };
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+    }
+    let emulator_root = emulator_root_of(save)
+        .with_context(|| format!("no emulator folder above {}", save.path.display()))?;
+    let cloud_bytes = api.download_save(save_id, device_type, fingerprint, app_password, None)?;
+    let files = restore_folder_save(&emulator_root, &save.path, &cloud_bytes)?;
+    report.downloaded += 1;
+    if verbose {
+        eprintln!(
+            "Replaced {} with record {} ({} files)",
+            save.path.display(),
+            save_id,
+            files
+        );
+    }
+    Ok(Some(entry_for(sha256_bytes(&cloud_bytes), latest.version)))
+}
+
+/// The folder a bundle record restores into: `/rsm/folder/saveDir`, present only when
+/// `/rsm/folder/bundle` says the payload is the whole folder, and only when it is the
+/// system's form of folder id.
+fn cloud_folder_save_dir(cloud_save: &CloudSaveSummary, kind: FolderSaveKind) -> Option<String> {
+    let bundle = cloud_json_string(&cloud_save.metadata, "/rsm/folder/bundle")?;
+    if bundle != FOLDER_SAVE_BUNDLE_KIND {
+        return None;
+    }
+    cloud_json_string(&cloud_save.metadata, "/rsm/folder/saveDir")
+        .filter(|save_dir| valid_folder_save_dir(kind, save_dir))
+}
+
+/// What `/rsm/folder/bundle` holds for a zipped save folder.
+const FOLDER_SAVE_BUNDLE_KIND: &str = "folder-zip";
+
+/// Restore a folder bundle the device does not hold yet, into the emulator's folder under the
+/// source's save root. The emulator's folder must exist: a device that does not run the
+/// emulator gets nothing.
+#[allow(clippy::too_many_arguments)]
+fn restore_cloud_folder_save(
+    api: &ApiClient,
+    cloud_save: &CloudSaveSummary,
+    kind: FolderSaveKind,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    save_roots: &[PathBuf],
+    fingerprint: &str,
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    sync_entries: &mut HashMap<String, SyncedEntry>,
+    restored_targets: &mut HashSet<String>,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<bool> {
+    let Some(save_dir) = cloud_folder_save_dir(cloud_save, kind) else {
+        return Ok(false);
+    };
+    let root = select_cloud_restore_root(save_roots);
+    let emulator_root = kind.root_under(root);
+    let Some(target) = kind.folder_for(&emulator_root, &save_dir) else {
+        return Ok(false);
+    };
+    let target_key = target.to_string_lossy().to_string();
+    if restored_targets.contains(&target_key) || target.is_dir() {
+        return Ok(true);
+    }
+    if !emulator_root.is_dir() {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud {} save '{}': no {} folder at {} for source '{}'",
+                kind.system_slug(),
+                cloud_save.display_name(),
+                kind.system_slug(),
+                emulator_root.display(),
+                source_name
+            );
+        }
+        return Ok(true);
+    }
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(true);
+    }
+    let device_type =
+        helper_device_type_for_upload(source_kind, source_profile, kind.system_slug());
+    let bundle = api.download_save(&cloud_save.id, device_type, fingerprint, app_password, None)?;
+    let files = restore_folder_save(&emulator_root, &target, &bundle)?;
+    sync_entries.insert(
+        target_key.clone(),
+        synced_entry(
+            sha256_bytes(&bundle),
+            Some(folder_line_key(kind, &save_dir)),
+            cloud_save.version,
+            Some(kind.system_slug()),
+            Some(SaveContainerFormat::Native),
+            Some(SaveAdapterProfile::Identity),
+            Some(source_kind),
+            Some(source_name),
+            Some(FOLDER_SAVE_SLOT),
+        ),
+    );
+    restored_targets.insert(target_key);
+    report.downloaded += 1;
+    if verbose {
+        eprintln!(
+            "Restored cloud-only {} save '{}' to {} ({} files)",
+            kind.system_slug(),
+            cloud_save.display_name(),
+            target.display(),
+            files
+        );
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

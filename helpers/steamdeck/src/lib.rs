@@ -2,6 +2,7 @@ pub mod api;
 pub mod backend_config;
 pub mod cli;
 pub mod config;
+pub mod folder_saves;
 pub mod ports;
 pub mod scanner;
 pub mod scheduler;
