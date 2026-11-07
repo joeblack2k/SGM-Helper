@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,20 +6,29 @@ use anyhow::{Context, Result};
 
 use crate::api::{
     ApiClient, CloudSaveSummary, ConflictCheckResponse, LatestSaveContext, LatestSaveRequest,
-    LatestSaveResponse, PortUploadMetadata, RuntimeTarget,
+    LatestSaveResponse, PortUploadMetadata, RuntimeTarget, UploadSaveResponse, UploadedSave,
 };
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
+use crate::folder_saves::{
+    FOLDER_SAVE_MAX_BYTES, FolderSave, FolderSaveKind, discover_folder_saves, emulator_root_of,
+    folder_line_key, folder_save_files, pack_folder_save, restore_folder_save,
+    valid_folder_save_dir,
+};
 use crate::ports::{PortSaveMatch, discover_port_save_matches};
 use crate::scanner::{
-    RomIndexEntry, SaveAdapterProfile, SaveContainerFormat, classify_supported_save,
-    discover_rom_index, discover_save_files, dreamcast_skip_reason,
-    encode_download_for_local_container, filename_stem, md5_file, normalize_save_bytes_for_sync,
-    normalize_save_for_sync, saturn_skip_reason, sha1_file, sha256_bytes, wii_skip_reason,
-    wii_title_code_from_path,
+    PSP_SAVEDATA_SUBPATHS, RomIndexEntry, SaveAdapterProfile, SaveContainerFormat,
+    classify_supported_save, discover_rom_index, discover_save_files,
+    discover_save_files_and_psp_bundles, dreamcast_skip_reason,
+    encode_download_for_local_container, filename_stem, is_psp_savedata_parent, md5_file,
+    normalize_save_bytes_for_sync, normalize_save_for_sync, pack_psp_savedata,
+    parse_param_sfo_savedir, saturn_skip_reason, sha1_file, sha256_bytes, sha256_file,
+    unpack_psp_savedata, wii_skip_reason, wii_title_code_from_path,
 };
-use crate::sources::{EmulatorProfile, SourceKind, prepare_sources_for_sync};
-use crate::state::{AuthState, SyncedEntry, load_sync_state, now_rfc3339, save_sync_state};
+use crate::sources::{EmulatorProfile, ResolvedSource, SourceKind, prepare_sources_for_sync};
+use crate::state::{
+    AuthState, SyncedEntry, TerminalRejection, load_sync_state, now_rfc3339, save_sync_state,
+};
 
 #[derive(Debug, Clone)]
 pub struct SyncOptions {
@@ -36,11 +45,35 @@ pub struct SyncOptions {
 pub struct SyncReport {
     pub scanned: usize,
     pub uploaded: usize,
+    pub would_upload: usize,
     pub downloaded: usize,
+    pub would_download: usize,
     pub in_sync: usize,
     pub conflicts: usize,
     pub skipped: usize,
+    /// The server refused an N64 controller-pak upload. Counted apart from
+    /// `skipped`, which also holds saves with nothing to do, and apart from
+    /// `errors`, which holds refusals and failures on every other system.
+    pub rejected_n64_controller_pak: usize,
+    /// The server answered 2xx but returned no save, so nothing was stored.
+    pub accepted_not_stored: usize,
+    /// Saves the server refused permanently. Not re-attempted until the
+    /// payload changes.
+    pub rejected_permanent: usize,
+    /// Downloads refused because they would change the size of the local save
+    /// they replace: a payload of another length is a different save or a
+    /// canonical form the game never wrote.
+    pub refused_size_mismatch: usize,
     pub errors: usize,
+    pub dry_run: bool,
+    /// Cloud records of systems this helper never restores, per system. Printed
+    /// once at the end of every pass, quiet or not, so the skip is never silent.
+    pub unrestored_systems: std::collections::BTreeMap<String, usize>,
+}
+
+/// Marks a summary whose counters describe what would have happened, not what did.
+pub fn dry_run_marker(report: &SyncReport) -> &'static str {
+    if report.dry_run { " (DRY RUN)" } else { "" }
 }
 
 struct ProcessedEntry {
@@ -72,7 +105,13 @@ impl SyncLock {
                 Ok(Self { path })
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display());
+                // A sync that died leaves its lock behind, and every later sync would stop here for
+                // good. The lock names its owner; one whose process is gone is taken over, once.
+                let existing = fs::read_to_string(&path).unwrap_or_default();
+                match lock_owner(&existing) {
+                    Some(pid) if !pid_alive(pid) => Self::take_over(&path, pid, &lock_content),
+                    _ => anyhow::bail!("sync is al actief (lockfile bestaat): {}", path.display()),
+                }
             }
             Err(err) => Err(err)
                 .with_context(|| format!("kan sync lockfile niet maken: {}", path.display())),
@@ -80,10 +119,109 @@ impl SyncLock {
     }
 }
 
+impl SyncLock {
+    /// Take over a lock whose owner `dead` is gone. Two syncs can find the same dead lock: a rename
+    /// to a name of this process's own moves the file once, so only one of them gets it, and a
+    /// remove by path could delete the lock the other has just created. The renamed file must still
+    /// name `dead`; one naming anyone else is a live lock, put back.
+    fn take_over(path: &Path, dead: u32, lock_content: &str) -> Result<Self> {
+        let busy = || anyhow::anyhow!("sync is al actief (lockfile bestaat): {}", path.display());
+        let stale = path.with_extension(format!("lock.stale.{}", std::process::id()));
+        if fs::rename(path, &stale).is_err() {
+            return Err(busy());
+        }
+        if lock_owner(&fs::read_to_string(&stale).unwrap_or_default()) != Some(dead) {
+            let _ = fs::rename(&stale, path);
+            return Err(busy());
+        }
+        let _ = fs::remove_file(&stale);
+        eprintln!(
+            "oude sync.lock van pid={} verwijderd (proces draait niet meer): {}",
+            dead,
+            path.display()
+        );
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| busy())?;
+        use std::io::Write;
+        file.write_all(lock_content.as_bytes())
+            .with_context(|| format!("kan lockfile niet schrijven: {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// The pid a `sync.lock` names on its `pid=` line.
+fn lock_owner(contents: &str) -> Option<u32> {
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.trim().parse().ok())
+}
+
+/// Whether a process with this pid is running. A process that exists but this user may not
+/// signal or open (another user's) counts as running, so its lock is never taken.
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess only reads the pid; the handle is closed below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            // SAFETY: reads this thread's last error, set by OpenProcess.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        // SAFETY: the handle is open and valid; code is a valid out pointer.
+        let ok = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+        // SAFETY: closes the handle opened above, once.
+        unsafe { CloseHandle(handle) };
+        !ok || code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 impl Drop for SyncLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// One line naming each system whose cloud records this pass left alone because
+/// the helper never restores that system, or None when there were none.
+pub fn unrestored_systems_summary(report: &SyncReport) -> Option<String> {
+    if report.unrestored_systems.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = report
+        .unrestored_systems
+        .iter()
+        .map(|(slug, n)| format!("{slug}={n}"))
+        .collect();
+    Some(format!(
+        "Not restored (this helper never restores these systems): {}",
+        parts.join(" ")
+    ))
 }
 
 pub fn run_sync(
@@ -140,7 +278,10 @@ pub fn run_sync(
     }
     let options = &effective_options;
 
-    let mut report = SyncReport::default();
+    let mut report = SyncReport {
+        dry_run: options.dry_run,
+        ..Default::default()
+    };
     let mut rom_hash_cache: HashMap<String, (String, String)> = HashMap::new();
 
     for source in sources {
@@ -149,6 +290,10 @@ pub fn run_sync(
             .and_then(|value| value.into_string().ok())
             .unwrap_or_else(|| source.kind.as_str().to_string());
 
+        // A restore places a title by its ROM's folder only where a
+        // SAVE_SUBDIR names `{content}`; every other source keeps an empty
+        // index and resolves exactly as before.
+        let mut content_rom_index: HashMap<String, RomIndexEntry> = HashMap::new();
         if matches!(source.kind, SourceKind::Ports) {
             let port_saves = discover_port_save_matches(&source.save_roots)?;
             if verbose {
@@ -190,14 +335,29 @@ pub fn run_sync(
                     }
                     Err(err) => {
                         report.errors += 1;
-                        if verbose {
-                            eprintln!("Port sync error for {}: {}", port_save.path.display(), err);
-                        }
+                        eprintln!("Port sync error for {}: {}", port_save.path.display(), err);
                     }
                 }
             }
         } else {
-            let save_files = discover_save_files(&source.save_roots, source.recursive)?;
+            // With PSP_SAVEDATA_BUNDLES on, a PPSSPP SAVEDATA folder is one save and its files
+            // are not discovered on their own.
+            let (save_files, psp_bundles) = if config.psp_savedata_bundles {
+                discover_save_files_and_psp_bundles(&source.save_roots, source.recursive)?
+            } else {
+                (
+                    discover_save_files(&source.save_roots, source.recursive)?,
+                    Vec::new(),
+                )
+            };
+            let mut save_files = save_files;
+            // Flycast with per-content VMUs off (RetroDECK's default) keeps every game's saves in the
+            // shared cards bios/dc/vmu_save_<slot>.bin beside the saves root, never under it.
+            for card in shared_dreamcast_vmus(&source.save_roots, &source.profile) {
+                if !save_files.contains(&card) {
+                    save_files.push(card);
+                }
+            }
             if verbose {
                 eprintln!(
                     "Source '{}' ({}) discovered {} save file(s)",
@@ -205,19 +365,140 @@ pub fn run_sync(
                     source.kind.as_str(),
                     save_files.len()
                 );
+                if config.psp_savedata_bundles {
+                    eprintln!(
+                        "Source '{}' ({}) discovered {} PPSSPP SAVEDATA folder(s)",
+                        source.name,
+                        source.kind.as_str(),
+                        psp_bundles.len()
+                    );
+                }
+            }
+            // With FOLDER_SAVE_BUNDLES on, a Dolphin NAND title or Vita3K savedata folder is one
+            // save and its files are not synced on their own.
+            let folder_saves = if config.folder_save_bundles {
+                discover_folder_saves(&source.save_roots)
+            } else {
+                Vec::new()
+            };
+            let save_files: Vec<PathBuf> = save_files
+                .into_iter()
+                .filter(|path| !folder_saves.iter().any(|save| path.starts_with(&save.path)))
+                .collect();
+            if verbose && config.folder_save_bundles {
+                eprintln!(
+                    "Source '{}' ({}) discovered {} folder save(s)",
+                    source.name,
+                    source.kind.as_str(),
+                    folder_saves.len()
+                );
+            }
+            report.scanned += folder_saves.len();
+            for folder_save in &folder_saves {
+                let state_key = folder_save.path.to_string_lossy().to_string();
+                let result = process_folder_save(
+                    &api,
+                    folder_save,
+                    sync_state
+                        .entries
+                        .get(&state_key)
+                        .map(|entry| entry.sha256.as_str()),
+                    &fingerprint,
+                    &source.name,
+                    &source.kind,
+                    &source.profile,
+                    &source.systems,
+                    app_password,
+                    options,
+                    &mut report,
+                    verbose,
+                );
+                match result {
+                    Ok(Some(processed)) => {
+                        sync_state
+                            .entries
+                            .insert(processed.state_key, processed.entry);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        report.errors += 1;
+                        eprintln!("Sync error for {}: {}", folder_save.path.display(), err);
+                    }
+                }
+            }
+            report.scanned += psp_bundles.len();
+            for bundle_dir in psp_bundles {
+                let save_key = bundle_dir.to_string_lossy().to_string();
+                let result = process_psp_savedata_dir(
+                    &api,
+                    &bundle_dir,
+                    &save_key,
+                    sync_state
+                        .entries
+                        .get(&save_key)
+                        .map(|entry| entry.sha256.as_str()),
+                    &fingerprint,
+                    &source.name,
+                    &source.kind,
+                    &source.profile,
+                    &source.systems,
+                    app_password,
+                    options,
+                    &mut report,
+                    verbose,
+                );
+                match result {
+                    Ok(processed) => {
+                        if let Some(processed) = processed {
+                            sync_state
+                                .entries
+                                .insert(processed.state_key, processed.entry);
+                        }
+                    }
+                    Err(err) => {
+                        report.errors += 1;
+                        if verbose {
+                            eprintln!("Sync error for {}: {}", bundle_dir.display(), err);
+                        }
+                    }
+                }
             }
 
-            let rom_index = discover_rom_index(&source.rom_roots, source.recursive)?;
+            let rom_index = discover_rom_index(&source.name, &source.rom_roots, source.recursive)?;
             let preferred_save_by_stem = select_preferred_save_per_stem(
                 &source.kind,
                 &source.profile,
                 &save_files,
                 &rom_index,
             );
+            if source
+                .save_subdirs
+                .values()
+                .any(|subdir| subdir.to_string_lossy().contains("{content}"))
+            {
+                content_rom_index = rom_index.clone();
+            }
+            // How many files share each selection key. The live-directory scan only
+            // runs where it can change the answer: one copy and no declared
+            // directory has nothing to decide.
+            let mut stem_counts: HashMap<String, usize> = HashMap::new();
+            for path in &save_files {
+                *stem_counts.entry(save_selection_key(path)).or_default() += 1;
+            }
             report.scanned += save_files.len();
 
             for save_path in save_files {
                 let selection_key = save_selection_key(&save_path);
+                let needs_live_check = stem_counts.get(&selection_key).copied().unwrap_or(0) > 1
+                    || !source.save_subdirs.is_empty();
+                if needs_live_check
+                    && let Some(reason) =
+                        live_upload_blocked(&source, &save_path, &selection_key, &rom_index)
+                {
+                    report.skipped += 1;
+                    eprintln!("{}", reason);
+                    continue;
+                }
                 if let Some(preferred_path) = preferred_save_by_stem.get(&selection_key)
                     && preferred_path != &save_path
                 {
@@ -233,10 +514,44 @@ pub fn run_sync(
                 }
 
                 let save_key = save_path.to_string_lossy().to_string();
+                // A refusal another release recorded is asked again once: the fix
+                // that makes a save acceptable usually ships in the helper or the
+                // server, and the record is keyed on bytes that never change. A
+                // fresh refusal re-records it under this release.
+                if let Some(prior) = sync_state.terminal_rejections.get(&save_key)
+                    && prior.build_id.as_deref() != Some(crate::state::build_identity())
+                {
+                    eprintln!(
+                        "Re-probing {}: the refusal was recorded by build {}",
+                        save_path.display(),
+                        prior.build_id.as_deref().unwrap_or("before versioning")
+                    );
+                    sync_state.terminal_rejections.remove(&save_key);
+                }
+                if let Some(prior) = sync_state.terminal_rejections.get(&save_key)
+                    && sha256_file(&save_path)
+                        .map(|current| current == prior.sha256)
+                        .unwrap_or(false)
+                {
+                    report.rejected_permanent += 1;
+                    eprintln!(
+                        "Not retrying {}: the server refused it with {}{}",
+                        save_path.display(),
+                        prior.status,
+                        if prior.reason.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", prior.reason)
+                        }
+                    );
+                    continue;
+                }
+
                 let process_result = process_single_save(
                     &api,
                     &save_path,
                     &save_key,
+                    sync_state.entries.get(&save_key),
                     &fingerprint,
                     &source.name,
                     &source.kind,
@@ -263,8 +578,19 @@ pub fn run_sync(
                     }
                     Err(err) => {
                         report.errors += 1;
-                        if verbose {
-                            eprintln!("Sync error for {}: {}", save_path.display(), err);
+                        eprintln!("Sync error for {}: {}", save_path.display(), err);
+                        if let Some(status) = permanent_rejection_status(&err) {
+                            let sha = sha256_file(&save_path).unwrap_or_default();
+                            sync_state.terminal_rejections.insert(
+                                save_key.clone(),
+                                TerminalRejection {
+                                    sha256: sha,
+                                    status,
+                                    reason: format!("{err:#}"),
+                                    recorded_at: now_rfc3339(),
+                                    build_id: Some(crate::state::build_identity().to_string()),
+                                },
+                            );
                         }
                     }
                 }
@@ -288,6 +614,15 @@ pub fn run_sync(
                         .unwrap_or(false);
                 if candidate.exists()
                     || !(path_is_under_roots(&candidate, &source.save_roots) || linked_to_source)
+                {
+                    return None;
+                }
+                // A SAVEDATA folder is a bundle, not a file: the cloud-only pass restores it.
+                if entry
+                    .rom_sha1
+                    .as_deref()
+                    .map(|key| key.starts_with("psp-savedir:"))
+                    .unwrap_or(false)
                 {
                     return None;
                 }
@@ -327,9 +662,7 @@ pub fn run_sync(
                 }
                 Err(err) => {
                     report.errors += 1;
-                    if verbose {
-                        eprintln!("Restore error for {}: {}", save_path.display(), err);
-                    }
+                    eprintln!("Restore error for {}: {}", save_path.display(), err);
                 }
             }
         }
@@ -341,7 +674,10 @@ pub fn run_sync(
             &source.profile,
             &source.save_roots,
             &source.systems,
+            &source.save_subdirs,
+            &content_rom_index,
             source.create_missing_system_dirs,
+            config.psp_savedata_bundles,
             &fingerprint,
             app_password,
             options,
@@ -355,6 +691,9 @@ pub fn run_sync(
         save_sync_state(&state_dir, &sync_state)?;
     }
 
+    if let Some(line) = unrestored_systems_summary(&report) {
+        eprintln!("{line}");
+    }
     Ok(report)
 }
 
@@ -362,14 +701,30 @@ fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
+/// A 4xx says the request itself was refused, so retrying identical bytes
+/// cannot succeed. 408 and 429 are the exceptions: a timeout or a rate limit
+/// means "later", not "no".
+fn permanent_rejection_status(err: &anyhow::Error) -> Option<u16> {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    let start = message.find("status=")? + "status=".len();
+    let code: u16 = message[start..].split_whitespace().next()?.parse().ok()?;
+    if (400..500).contains(&code) && code != 408 && code != 429 {
+        Some(code)
+    } else {
+        None
+    }
+}
+
 fn source_allows_system(source_systems: &[String], system_slug: &str) -> bool {
     let clean = system_slug.trim().to_ascii_lowercase();
     if clean.is_empty() {
         return false;
     }
+    // A source's SYSTEMS uses the server's names; a scanner may file the same
+    // system under another (PC Engine as `tgfx16`), so match any alias.
     source_systems
         .iter()
-        .any(|system| system == "*" || system.eq_ignore_ascii_case(&clean))
+        .any(|system| system == "*" || crate::sources::same_system(system, &clean))
 }
 
 fn target_parent_allowed(
@@ -410,7 +765,10 @@ fn restore_cloud_only_saves(
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
     source_systems: &[String],
+    save_subdirs: &BTreeMap<String, PathBuf>,
+    rom_index: &HashMap<String, RomIndexEntry>,
     create_missing_system_dirs: bool,
+    psp_savedata_bundles: bool,
     fingerprint: &str,
     app_password: Option<&str>,
     options: &SyncOptions,
@@ -430,12 +788,13 @@ fn restore_cloud_only_saves(
         let page = match api.list_saves(limit, offset, app_password) {
             Ok(page) => page,
             Err(err) => {
-                if verbose {
-                    eprintln!(
-                        "Cloud restore skipped for source '{}': /saves unavailable ({})",
-                        source_name, err
-                    );
-                }
+                // A restore that never ran is the failure mode nobody notices:
+                // the run reports success and the device simply does not
+                // restore. Say it every time, not only under --verbose.
+                eprintln!(
+                    "Cloud restore skipped for source '{}': /saves unavailable ({})",
+                    source_name, err
+                );
                 return Ok(());
             }
         };
@@ -461,7 +820,10 @@ fn restore_cloud_only_saves(
                 source_profile,
                 save_roots,
                 source_systems,
+                save_subdirs,
+                rom_index,
                 create_missing_system_dirs,
+                psp_savedata_bundles,
                 fingerprint,
                 app_password,
                 options,
@@ -473,10 +835,8 @@ fn restore_cloud_only_saves(
                 Ok(()) => {}
                 Err(err) => {
                     report.errors += 1;
-                    if verbose {
-                        let label = cloud_save.display_name();
-                        eprintln!("Cloud restore error for '{}': {}", label, err);
-                    }
+                    let label = cloud_save.display_name();
+                    eprintln!("Cloud restore error for '{}': {}", label, err);
                 }
             }
         }
@@ -503,7 +863,10 @@ fn restore_single_cloud_save(
     source_profile: &EmulatorProfile,
     save_roots: &[PathBuf],
     source_systems: &[String],
+    save_subdirs: &BTreeMap<String, PathBuf>,
+    rom_index: &HashMap<String, RomIndexEntry>,
     create_missing_system_dirs: bool,
+    psp_savedata_bundles: bool,
     fingerprint: &str,
     app_password: Option<&str>,
     options: &SyncOptions,
@@ -519,9 +882,63 @@ fn restore_single_cloud_save(
         report.skipped += 1;
         return Ok(());
     };
+    // Every "already present" check below goes through this. The path decides
+    // when it names the system; when it does not (a core folder such as
+    // "Mupen64Plus-Next OpenGL", or the Genesis folder a Game Gear core writes
+    // into), a file this helper synced as this system and that already holds
+    // the record's bytes is the save -- the target resolver chose it on the same
+    // state entry. Without this it reads as absent and is rewritten every pass.
+    // This closure shadows the free function for every call below it in this
+    // function and nowhere else: a call moved into a helper function, or added
+    // above this line, gets the unshadowed check and the rewrite loop returns.
+    // A folder bundle (a Dolphin NAND title, a Vita3K savedata folder) restores as the whole
+    // folder; only the server's folder-bundle records carry /rsm/folder, so no flag is needed.
+    if let Some(kind) = FolderSaveKind::from_system_slug(&system_slug)
+        && source_allows_system(source_systems, &system_slug)
+        && restore_cloud_folder_save(
+            api,
+            cloud_save,
+            kind,
+            source_name,
+            source_kind,
+            source_profile,
+            save_roots,
+            fingerprint,
+            app_password,
+            options,
+            sync_entries,
+            restored_targets,
+            report,
+            verbose,
+        )?
+    {
+        return Ok(());
+    }
+    let known_entries = &*sync_entries;
+    let existing_local_save_is_valid = |path: &Path, system_slug: &str, expect_sidecar: bool| {
+        existing_local_save_is_valid(path, system_slug, expect_sidecar)
+            || synced_here_with_these_bytes(
+                path,
+                system_slug,
+                cloud_save.sha256.as_deref(),
+                known_entries,
+            )
+    };
 
     if !supports_cloud_restore_system(&system_slug) {
         report.skipped += 1;
+        *report
+            .unrestored_systems
+            .entry(system_slug.clone())
+            .or_insert(0) += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud {} save '{}': this helper does not restore {} saves",
+                system_slug,
+                cloud_save.display_name(),
+                system_slug
+            );
+        }
         return Ok(());
     }
     if !source_allows_system(source_systems, &system_slug) {
@@ -537,25 +954,107 @@ fn restore_single_cloud_save(
         return Ok(());
     }
 
+    if let Some(reason) = psp_restore_refusal(cloud_save, &system_slug) {
+        report.skipped += 1;
+        eprintln!(
+            "Not restoring cloud psp save '{}': {}",
+            cloud_save.display_name(),
+            reason
+        );
+        return Ok(());
+    }
+    if system_slug == "psp" {
+        return restore_cloud_psp_bundle(
+            api,
+            cloud_save,
+            source_name,
+            source_kind,
+            source_profile,
+            save_roots,
+            psp_savedata_bundles,
+            fingerprint,
+            app_password,
+            options,
+            sync_entries,
+            restored_targets,
+            report,
+            verbose,
+        );
+    }
+
     let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
     let device_type = helper_device_type_for_upload(source_kind, &effective_profile, &system_slug);
     let runtime_target =
         runtime_target_for_system(source_kind, &effective_profile, &system_slug, device_type);
+    if verbose {
+        eprintln!(
+            "Runtime profile on the wire for {}: {:?} (source kind {}, profile {})",
+            system_slug,
+            runtime_target.runtime_profile,
+            source_kind.as_str(),
+            effective_profile.as_str()
+        );
+    }
     let runtime_profile = runtime_target
         .system_profile_value
         .as_deref()
         .or(runtime_target.runtime_profile.as_deref());
-    let target_extension = cloud_target_extension(cloud_save, runtime_profile);
-    let provisional_path = cloud_target_path(
+    // The cloud track's own format-class (primary vs sidecar), from its stored
+    // filename: it gates the "already present" checks below, so a local file of
+    // the other class can never satisfy this track's restore.
+    let cloud_is_sidecar = std::path::Path::new(&cloud_save.filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| crate::scanner::is_sidecar(&value.to_ascii_lowercase()))
+        .unwrap_or(false);
+    let target_extension = ps1_per_game_card_extension(cloud_save, source_profile)
+        .or_else(|| cloud_target_extension(cloud_save, runtime_profile));
+    // A shared Flycast card (bios/dc or system/dc vmu_save_<slot>.bin) holds every game's saves:
+    // it takes the record unless it already holds the record's bytes, whatever the per-file
+    // checks below would say about it.
+    if is_dreamcast_system(&system_slug)
+        && names_shared_dreamcast_card(cloud_save)
+        && let Some(card) = shared_dreamcast_vmu_for_slot(
+            save_roots,
+            &effective_profile,
+            cloud_save.card_slot.as_deref().unwrap_or("A1"),
+        )
+    {
+        return restore_shared_dreamcast_card(
+            api,
+            cloud_save,
+            &card,
+            source_name,
+            source_kind,
+            device_type,
+            &runtime_target,
+            fingerprint,
+            app_password,
+            options,
+            sync_entries,
+            restored_targets,
+            report,
+            verbose,
+        );
+    }
+    let Some(provisional_path) = cloud_target_path_with_known(
         cloud_save,
         save_roots,
         source_kind,
         &effective_profile,
         &system_slug,
         target_extension.as_deref(),
-    );
+        sync_entries,
+        save_subdirs,
+        rom_index,
+    ) else {
+        // Reported by the resolver: the title sits in more than one directory
+        // and nothing says which one the emulator reads.
+        report.skipped += 1;
+        return Ok(());
+    };
 
-    if existing_local_save_is_valid(&provisional_path, &system_slug) {
+    if existing_local_save_is_valid(&provisional_path, &system_slug, cloud_is_sidecar) {
         return Ok(());
     }
 
@@ -567,7 +1066,7 @@ fn restore_single_cloud_save(
         cloud_save,
     );
     if native_target_path != provisional_path
-        && existing_local_save_is_valid(&native_target_path, &system_slug)
+        && existing_local_save_is_valid(&native_target_path, &system_slug, cloud_is_sidecar)
     {
         return Ok(());
     }
@@ -594,7 +1093,7 @@ fn restore_single_cloud_save(
     }
 
     if options.dry_run {
-        report.downloaded += 1;
+        report.would_download += 1;
         return Ok(());
     }
 
@@ -632,7 +1131,7 @@ fn restore_single_cloud_save(
         Some(downloaded_bytes.len() as u64),
     );
 
-    if existing_local_save_is_valid(&target_path, &system_slug) {
+    if existing_local_save_is_valid(&target_path, &system_slug, cloud_is_sidecar) {
         return Ok(());
     }
     if !target_parent_allowed(&target_path, save_roots, create_missing_system_dirs) {
@@ -699,6 +1198,108 @@ fn restore_single_cloud_save(
     Ok(())
 }
 
+/// Restore a PPSSPP SAVEDATA bundle the device does not hold yet.
+///
+/// A folder that already exists is the upload pass's to compare, so it is left alone here, as an
+/// existing single-file save is. The SAVEDATA directory has to exist already: a device without
+/// PPSSPP set up has nowhere a game would read the folder from.
+#[allow(clippy::too_many_arguments)]
+fn restore_cloud_psp_bundle(
+    api: &ApiClient,
+    cloud_save: &CloudSaveSummary,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    save_roots: &[PathBuf],
+    psp_savedata_bundles: bool,
+    fingerprint: &str,
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    sync_entries: &mut HashMap<String, SyncedEntry>,
+    restored_targets: &mut HashSet<String>,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<()> {
+    if !psp_savedata_bundles {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud psp save '{}': PSP_SAVEDATA_BUNDLES is off",
+                cloud_save.display_name()
+            );
+        }
+        return Ok(());
+    }
+    let Some(save_dir) = cloud_psp_save_dir(cloud_save) else {
+        report.skipped += 1;
+        return Ok(());
+    };
+    let root = select_cloud_restore_root(save_roots);
+    let target = psp_savedata_root(root).join(&save_dir);
+    let target_key = target.to_string_lossy().to_string();
+    if restored_targets.contains(&target_key) {
+        return Ok(());
+    }
+    if fs::symlink_metadata(&target).is_ok() {
+        if verbose {
+            eprintln!(
+                "Cloud restore for psp: {} already holds this save",
+                target.display()
+            );
+        }
+        return Ok(());
+    }
+    let savedata_root = target.parent().map(Path::to_path_buf).unwrap_or_default();
+    if !savedata_root.is_dir() {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud psp save '{}': no PPSSPP SAVEDATA directory at {} for source '{}'",
+                cloud_save.display_name(),
+                savedata_root.display(),
+                source_name
+            );
+        }
+        return Ok(());
+    }
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(());
+    }
+
+    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
+    let device_type = helper_device_type_for_upload(source_kind, &effective_profile, "psp");
+    let bundle = api.download_save(&cloud_save.id, device_type, fingerprint, app_password, None)?;
+    let files = restore_psp_savedata_bundle(&target, &bundle)?;
+    sync_entries.insert(
+        target_key.clone(),
+        synced_entry(
+            sha256_bytes(&bundle),
+            Some(psp_line_key(&save_dir)),
+            cloud_save.version,
+            Some("psp"),
+            Some(SaveContainerFormat::Native),
+            Some(SaveAdapterProfile::Identity),
+            Some(source_kind),
+            Some(source_name),
+            Some(PSP_BUNDLE_SLOT),
+        ),
+    );
+    restored_targets.insert(target_key);
+    report.downloaded += 1;
+
+    if verbose {
+        eprintln!(
+            "Restored cloud-only psp save '{}' to {} ({} files)",
+            cloud_save.display_name(),
+            target.display(),
+            files
+        );
+    }
+
+    Ok(())
+}
+
 fn supports_cloud_restore_system(system_slug: &str) -> bool {
     matches!(
         system_slug,
@@ -725,6 +1326,17 @@ fn supports_cloud_restore_system(system_slug: &str) -> bool {
             | "ps4"
             | "ps5"
             | "ports"
+            | "3do"
+            | "atari-jaguar"
+            | "neogeo-cd"
+            | "ngp"
+            | "pc-engine"
+            | "virtualboy"
+            | "atari-lynx"
+            | "wonderswan"
+            | "sg-1000"
+            | "colecovision"
+            | "arcade"
     )
 }
 
@@ -741,6 +1353,29 @@ fn effective_profile_for_cloud_restore(
 }
 
 fn cloud_target_extension(
+    cloud_save: &CloudSaveSummary,
+    runtime_profile: Option<&str>,
+) -> Option<String> {
+    let profile_extension = profile_target_extension(cloud_save, runtime_profile);
+    // A sidecar must never land on a primary target: an `.rtc` mapped onto a
+    // `.srm` overwrites the real cartridge save with seconds of clock state.
+    // The cloud record carries no format field, so sidecar-ness comes from the
+    // filename it stored. Sidecar-to-sidecar is a container conversion the
+    // profile may legitimately ask for (a MiSTer controller pak writes `.cpk`
+    // for a record stored as `.mpk`), so only a sidecar heading for a
+    // non-sidecar target is redirected.
+    if let (Some(ext), Some(target)) = (
+        extension_from_filename(&cloud_save.filename),
+        profile_extension.as_deref(),
+    ) && crate::scanner::is_sidecar(&ext)
+        && !crate::scanner::is_sidecar(target)
+    {
+        return Some(ext);
+    }
+    profile_extension
+}
+
+fn profile_target_extension(
     cloud_save: &CloudSaveSummary,
     runtime_profile: Option<&str>,
 ) -> Option<String> {
@@ -796,6 +1431,10 @@ fn extension_from_filename(filename: &str) -> Option<String> {
         .and_then(normalize_extension_value)
 }
 
+/// The restore target without any record of what has been synced; used by the
+/// tests, which have no state to consult. A real restore goes through
+/// `cloud_target_path_with_known`.
+#[cfg(test)]
 fn cloud_target_path(
     cloud_save: &CloudSaveSummary,
     save_roots: &[PathBuf],
@@ -804,7 +1443,137 @@ fn cloud_target_path(
     system_slug: &str,
     target_extension: Option<&str>,
 ) -> PathBuf {
+    cloud_target_path_with_known(
+        cloud_save,
+        save_roots,
+        source_kind,
+        source_profile,
+        system_slug,
+        target_extension,
+        &HashMap::new(),
+        &BTreeMap::new(),
+        &HashMap::new(),
+    )
+    .unwrap_or_else(|| {
+        // These tests ask about the shape of a path, not about whether the
+        // device has decided where its saves live; a fixture with the same
+        // title in two directories still has to return a path.
+        cloud_target_path_inner(
+            cloud_save,
+            save_roots,
+            source_kind,
+            source_profile,
+            system_slug,
+            target_extension,
+            &HashMap::new(),
+        )
+    })
+}
+
+/// Resolve the restore target, letting the directory the emulator actually
+/// writes decide when a copy of this title already exists.
+///
+/// `None` means the save must not be restored: two copies exist and the
+/// operator has not declared which one is live. Guessing there is exactly the
+/// defect this rule removes, and a save that waits is better than one written
+/// where the game cannot see it.
+#[allow(clippy::too_many_arguments)]
+fn cloud_target_path_with_known(
+    cloud_save: &CloudSaveSummary,
+    save_roots: &[PathBuf],
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    target_extension: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
+    save_subdirs: &BTreeMap<String, PathBuf>,
+    rom_index: &HashMap<String, RomIndexEntry>,
+) -> Option<PathBuf> {
+    if is_dreamcast_system(system_slug)
+        && names_shared_dreamcast_card(cloud_save)
+        && let Some(card) = shared_dreamcast_vmu_for_slot(
+            save_roots,
+            source_profile,
+            cloud_save.card_slot.as_deref().unwrap_or("A1"),
+        )
+    {
+        return Some(card);
+    }
     let root = select_cloud_restore_root(save_roots);
+    let filename = cloud_restore_filename(cloud_save, target_extension);
+    let selection_key = save_selection_key(Path::new(filename.trim()));
+    let declared = declared_live_subdir(
+        rom_index,
+        save_subdirs,
+        system_slug,
+        &filename_stem(Path::new(filename.trim())),
+    );
+    match live_target_for(root, system_slug, &selection_key, declared.as_deref()) {
+        LiveTarget::Path { live, strays } => {
+            for stray in strays {
+                eprintln!(
+                    "Stray copy {}: {} is the live directory for {}",
+                    stray.join(&filename).display(),
+                    live.display(),
+                    system_slug
+                );
+            }
+            return Some(live.join(&filename));
+        }
+        LiveTarget::Ambiguous(directories) => {
+            let named: Vec<String> = directories
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect();
+            eprintln!(
+                "Not restoring {} ({}): it exists in {}, and no live directory is declared; set SAVE_SUBDIR_{} on this source",
+                filename,
+                system_slug,
+                named.join(", "),
+                system_slug.to_ascii_uppercase()
+            );
+            return None;
+        }
+        LiveTarget::FallThrough => {}
+    }
+    Some(cloud_target_path_inner(
+        cloud_save,
+        save_roots,
+        source_kind,
+        source_profile,
+        system_slug,
+        target_extension,
+        known_saves,
+    ))
+}
+
+fn cloud_target_path_inner(
+    cloud_save: &CloudSaveSummary,
+    save_roots: &[PathBuf],
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    system_slug: &str,
+    target_extension: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> PathBuf {
+    let root = select_cloud_restore_root(save_roots);
+    // Before every other branch: a shared Flycast card is the target whatever the per-file rules say.
+    if is_dreamcast_system(system_slug)
+        && names_shared_dreamcast_card(cloud_save)
+        && let Some(card) = shared_dreamcast_vmu_for_slot(
+            save_roots,
+            source_profile,
+            cloud_save.card_slot.as_deref().unwrap_or("A1"),
+        )
+    {
+        return card;
+    }
+    // A PPSSPP SAVEDATA bundle is a folder, and PPSSPP decides where it lives.
+    if system_slug == "psp"
+        && let Some(save_dir) = cloud_psp_save_dir(cloud_save)
+    {
+        return psp_savedata_root(root).join(save_dir);
+    }
     if system_slug == "ports"
         && let Some(root_relative_path) =
             cloud_json_string(&cloud_save.metadata, "/rsm/nativePort/rootRelativePath")
@@ -828,6 +1597,11 @@ fn cloud_target_path(
         };
         return target_dir.join("data.bin");
     }
+    if system_slug == "arcade"
+        && let Some(target) = mame_nvram_target(root, cloud_save)
+    {
+        return target;
+    }
     let filename = cloud_restore_filename(cloud_save, target_extension);
     let target_dir = if root_is_system_specific(root, source_profile, system_slug) {
         root.to_path_buf()
@@ -838,6 +1612,7 @@ fn cloud_target_path(
             source_profile,
             system_slug,
             &filename,
+            known_saves,
         ) {
             return existing_target;
         }
@@ -848,7 +1623,212 @@ fn cloud_target_path(
             system_slug,
         ))
     };
-    target_dir.join(filename)
+    target_dir
+        .join(opera_per_game_subdir(system_slug, &filename))
+        .join(filename)
+}
+
+/// MAME (RetroArch's core) keeps a set's NVRAM at `<save dir>/mame/mame/nvram/<set>/<chip file>`:
+/// the folder is the set name and each chip is its own file, named by MAME with no extension.
+/// The record carries the set as `game.name` and the chip file as `filename`, so both are used as
+/// written; a record missing either has no MAME path and falls back to the general layout.
+fn mame_nvram_target(root: &Path, cloud_save: &CloudSaveSummary) -> Option<PathBuf> {
+    let set_name = cloud_save
+        .game
+        .as_ref()
+        .map(|game| game.name.trim())
+        .filter(|name| !name.is_empty())?;
+    let chip = cloud_save.filename.trim();
+    if chip.is_empty() || sanitize_filename(set_name) != set_name || sanitize_filename(chip) != chip
+    {
+        return None;
+    }
+    Some(
+        root.join("mame")
+            .join("mame")
+            .join("nvram")
+            .join(set_name)
+            .join(chip),
+    )
+}
+
+/// Opera (3DO) saves a game's NVRAM as `<save dir>/opera/per_game/<game>.<version>.srm` and reads
+/// `<save dir>/<game>.srm` only as an unversioned fallback (opera-libretro `opera_lr_nvram.c`), so a
+/// versioned 3DO save goes in `opera/per_game` and an unversioned one stays in the save directory.
+fn opera_per_game_subdir(system_slug: &str, filename: &str) -> PathBuf {
+    let versioned = system_slug == "3do"
+        && Path::new(filename)
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(|version| version.to_str())
+            .is_some_and(|version| {
+                !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+            });
+    if versioned {
+        PathBuf::from("opera").join("per_game")
+    } else {
+        PathBuf::new()
+    }
+}
+
+/// Why a PSP save can't be restored, if it can't. PPSSPP keeps a game's save as a folder,
+/// `PSP/SAVEDATA/<dir>/` (the data file, PARAM.SFO, ICON0.PNG), and reads it from nowhere else.
+/// Only a record holding that whole folder, and naming it, can put it back; a record of one
+/// loose file restores nothing a game can read, whatever ids it carries.
+fn psp_restore_refusal(cloud_save: &CloudSaveSummary, system_slug: &str) -> Option<&'static str> {
+    if system_slug != "psp" {
+        return None;
+    }
+    if cloud_psp_save_dir(cloud_save).is_some() {
+        None
+    } else {
+        Some(
+            "PPSSPP reads a save only as a SAVEDATA/<dir>/ folder, and this record is not a SAVEDATA bundle naming one",
+        )
+    }
+}
+
+/// The SAVEDATA folder a PSP bundle record restores into: `/rsm/psp/saveDir`, present only
+/// when `/rsm/psp/bundle` says the payload is the whole folder, and only when it is a plain
+/// folder name.
+fn cloud_psp_save_dir(cloud_save: &CloudSaveSummary) -> Option<String> {
+    let bundle = cloud_json_string(&cloud_save.metadata, "/rsm/psp/bundle")?;
+    if bundle != PSP_SAVEDATA_BUNDLE_KIND {
+        return None;
+    }
+    cloud_json_string(&cloud_save.metadata, "/rsm/psp/saveDir")
+        .filter(|save_dir| psp_flat_name(save_dir))
+}
+
+/// What `/rsm/psp/bundle` holds for a zipped SAVEDATA folder.
+const PSP_SAVEDATA_BUNDLE_KIND: &str = "savedata-zip";
+
+/// Where a SAVEDATA folder goes when no SAVEDATA directory exists yet. A restore never creates
+/// it, so this only names the path in the log.
+const PSP_DEFAULT_SAVEDATA_SUBPATH: &str = "PSP/PPSSPP-SA";
+
+/// The slot a PPSSPP SAVEDATA bundle is stored under. The folder name is the save's identity,
+/// so one slot holds it.
+const PSP_BUNDLE_SLOT: &str = "default";
+
+/// A name that stays inside the directory it is joined to: no separators, no `..`, no drive
+/// or stream syntax.
+fn psp_flat_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.trim() == name
+        && !name.contains("..")
+        && !name.chars().any(|ch| matches!(ch, '/' | '\\' | ':' | '\0'))
+}
+
+/// The SAVEDATA directory under a source root: the root itself when it is one, otherwise the
+/// first of PPSSPP's known places that exists.
+fn psp_savedata_root(root: &Path) -> PathBuf {
+    if is_psp_savedata_parent(root) {
+        return root.to_path_buf();
+    }
+    PSP_SAVEDATA_SUBPATHS
+        .iter()
+        .map(|subpath| root.join(subpath))
+        .find(|path| path.is_dir())
+        .unwrap_or_else(|| root.join(PSP_DEFAULT_SAVEDATA_SUBPATH))
+}
+
+fn psp_line_key(save_dir: &str) -> String {
+    format!("psp-savedir:{}", save_dir.to_ascii_uppercase())
+}
+
+fn psp_bundle_filename(save_dir: &str) -> String {
+    // Never `.zip`: the server explodes a zip into one record per file.
+    format!("{save_dir}.pspsave")
+}
+
+/// Replace a PPSSPP SAVEDATA folder with the files a bundle holds.
+///
+/// Everything is checked before anything is written: every entry is a flat file name, and the
+/// bundle's PARAM.SFO names the folder it is going into. The files are written to
+/// `<dir>.rsm-tmp` beside the folder, the old folder is removed, and the new one is renamed into
+/// place. The old folder is not kept: a save is allowed to be overwritten. The SAVEDATA
+/// directory itself must already exist; a restore never creates it.
+fn restore_psp_savedata_bundle(target_dir: &Path, bundle: &[u8]) -> Result<usize> {
+    let save_dir = target_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| psp_flat_name(name))
+        .with_context(|| format!("geen geldige PSP SAVEDATA map: {}", target_dir.display()))?;
+    let parent = target_dir
+        .parent()
+        .with_context(|| format!("geen geldige PSP SAVEDATA map: {}", target_dir.display()))?;
+    if !parent.is_dir() || !is_psp_savedata_parent(parent) {
+        anyhow::bail!(
+            "no PPSSPP SAVEDATA directory at {}; a restore does not create one",
+            parent.display()
+        );
+    }
+
+    let entries = unpack_psp_savedata(bundle)?;
+    let mut seen = HashSet::new();
+    for (name, _) in &entries {
+        if !psp_flat_name(name) {
+            anyhow::bail!(
+                "PSP bundle entry {:?} is not a plain file name; nothing was written",
+                name
+            );
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("PSP bundle holds {:?} twice; nothing was written", name);
+        }
+    }
+    let param = entries
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PARAM.SFO"))
+        .context("PSP bundle holds no PARAM.SFO; nothing was written")?;
+    match parse_param_sfo_savedir(&param.1) {
+        Some(named) if named == save_dir => {}
+        named => anyhow::bail!(
+            "PSP bundle's PARAM.SFO names {:?}, not {:?}; nothing was written",
+            named,
+            save_dir
+        ),
+    }
+
+    let staging = parent.join(format!("{save_dir}.rsm-tmp"));
+    remove_path_if_present(&staging)?;
+    fs::create_dir(&staging)
+        .with_context(|| format!("kan map niet maken: {}", staging.display()))?;
+    let written = entries.iter().try_for_each(|(name, bytes)| {
+        fs::write(staging.join(name), bytes).with_context(|| {
+            format!(
+                "kan bestand niet schrijven: {}",
+                staging.join(name).display()
+            )
+        })
+    });
+    if let Err(err) = written {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err);
+    }
+    // No copy of the old folder is kept: a crash between this removal and the rename leaves the
+    // folder absent, and the next sync restores it from the server, which still holds the save.
+    remove_path_if_present(target_dir)?;
+    fs::rename(&staging, target_dir).with_context(|| {
+        format!(
+            "kan {} niet naar {} hernoemen",
+            staging.display(),
+            target_dir.display()
+        )
+    })?;
+    Ok(entries.len())
+}
+
+fn remove_path_if_present(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)
+            .with_context(|| format!("kan map niet verwijderen: {}", path.display())),
+        Ok(_) => fs::remove_file(path)
+            .with_context(|| format!("kan bestand niet verwijderen: {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("kan pad niet lezen: {}", path.display())),
+    }
 }
 
 fn cloud_wii_title_code(cloud_save: &CloudSaveSummary) -> Option<String> {
@@ -939,12 +1919,24 @@ fn wii_title_code_from_candidate(candidate: &str) -> Option<String> {
     None
 }
 
-fn existing_local_save_is_valid(path: &Path, system_slug: &str) -> bool {
+fn existing_local_save_is_valid(path: &Path, system_slug: &str, expect_sidecar: bool) -> bool {
     if system_slug == "ports" {
         return path.is_file() && path.metadata().map(|meta| meta.len() > 0).unwrap_or(false);
     }
+    // A local file satisfies a cloud track's "already present" check only when
+    // it is the same format-class: a kept `.rtc` must not stand in for a deleted
+    // `.srm` (which would then never be restored), and a `.srm` must not stand
+    // in for a `.rtc`.
+    let local_is_sidecar = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| crate::scanner::is_sidecar(&value.to_ascii_lowercase()))
+        .unwrap_or(false);
+    if local_is_sidecar != expect_sidecar {
+        return false;
+    }
     path.exists()
-        && classify_supported_save(path, None)
+        && classify_with_known_system(path, None, Some(system_slug))
             .map(|classification| classification.system_slug == system_slug)
             .unwrap_or(false)
 }
@@ -966,12 +1958,134 @@ fn cloud_restore_native_target_path(
     )
 }
 
+/// Directories a core-sorted emulator keeps another system's saves in.
+///
+/// Consulted only when looking for a file that already exists, never when
+/// choosing where a new save goes: on most devices the system's own directory
+/// is the right one. RetroArch with `sort_savefiles_enable` files saves by the
+/// core that reads them, and `genesis_plus_gx` serves Genesis and Game Gear
+/// alike, so a Game Gear save lives under `genesis/` and the core reads it
+/// there. This list is deliberately separate from `system_directory_aliases`,
+/// which also decides where new saves are written.
+fn writeback_directory_aliases(system_slug: &str) -> &'static [&'static str] {
+    match system_slug {
+        "game-gear" => &["genesis", "megadrive", "md"],
+        _ => &[],
+    }
+}
+
+/// Which directory a system's saves actually live in.
+///
+/// A device that sorts saves by core writes them under a directory named after
+/// the core (`Mupen64Plus-Next OpenGL`) while the helper's own system
+/// directory is `n64`. Both can hold a copy of one title, and the helper
+/// cannot infer which one the emulator reads: mtime is useless because the
+/// helper's own restores refresh the stale copy, and a table of core names
+/// goes stale. So the evidence is the disk, plus one key the operator may set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveTarget {
+    /// No copy of this title anywhere under the root: keep the existing rules.
+    FallThrough,
+    /// The directory the emulator uses, and the other copies, which are strays.
+    Path { live: PathBuf, strays: Vec<PathBuf> },
+    /// More than one copy and nothing declared: report it and do nothing.
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// The operator's `SAVE_SUBDIR_<system>` for one title, with `{content}`
+/// replaced by the name of the directory the title's ROM is in. RetroArch
+/// sorting saves by content directory files a Game Boy Color game's save under
+/// `gbc` and a Game Boy game's under `gb`, though the server calls both
+/// `gameboy`; on a device launched from frontend platform folders the same
+/// option gives `Super Nintendo Entertainment System/Snes9x`. A `{content}`
+/// value whose ROM isn't found, or whose stem is in two folders, declares
+/// nothing, and the copies on disk decide as before.
+fn declared_live_subdir(
+    rom_index: &HashMap<String, RomIndexEntry>,
+    save_subdirs: &BTreeMap<String, PathBuf>,
+    system_slug: &str,
+    stem: &str,
+) -> Option<PathBuf> {
+    let declared = crate::sources::declared_save_subdir(save_subdirs, system_slug)?
+        .to_string_lossy()
+        .into_owned();
+    if !declared.contains("{content}") {
+        return Some(PathBuf::from(declared));
+    }
+    let entry = rom_index.get(&stem.to_ascii_lowercase())?;
+    if entry.ambiguous {
+        return None;
+    }
+    let content = entry.path.parent()?.file_name()?.to_str()?;
+    Some(PathBuf::from(declared.replace("{content}", content)))
+}
+
+/// Resolve one title's live directory under a source root.
+///
+/// Depth is one level below the root, stated rather than assumed: a layout
+/// nested deeper is not found here and the caller's disagreement line is what
+/// makes that visible. A directory belongs to a system by classifying the
+/// saves inside it, not by its name, so a core nobody has seen yet still works.
+fn live_target_for(
+    root: &Path,
+    system_slug: &str,
+    selection_key: &str,
+    declared: Option<&Path>,
+) -> LiveTarget {
+    let mut copies: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut directories: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        directories.sort();
+        for directory in directories {
+            let Ok(files) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            // Count per directory, not per file: one title's .eep, .sra and
+            // .srm sitting side by side are one copy, not three.
+            let holds_copy = files.flatten().any(|file| {
+                let path = file.path();
+                path.is_file()
+                    && save_selection_key(&path) == selection_key
+                    && classify_with_known_system(&path, None, Some(system_slug))
+                        .map(|classification| classification.system_slug == system_slug)
+                        .unwrap_or(false)
+            });
+            if holds_copy {
+                copies.push(directory);
+            }
+        }
+    }
+
+    if let Some(subdir) = declared {
+        let live = root.join(subdir);
+        let strays: Vec<PathBuf> = copies
+            .into_iter()
+            .filter(|directory| *directory != live)
+            .collect();
+        return LiveTarget::Path { live, strays };
+    }
+
+    match copies.len() {
+        0 => LiveTarget::FallThrough,
+        1 => LiveTarget::Path {
+            live: copies.remove(0),
+            strays: Vec::new(),
+        },
+        _ => LiveTarget::Ambiguous(copies),
+    }
+}
+
 fn existing_cloud_target_for_alias(
     root: &Path,
     source_kind: &SourceKind,
     source_profile: &EmulatorProfile,
     system_slug: &str,
     filename: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
 ) -> Option<PathBuf> {
     let default_dir = system_directory_for_source(source_kind, source_profile, system_slug);
     let candidates = std::iter::once(default_dir).chain(
@@ -986,7 +2100,145 @@ fn existing_cloud_target_for_alias(
             return Some(candidate);
         }
     }
+
+    let declared = writeback_directory_aliases(system_slug);
+    let directories: Vec<(String, PathBuf)> = std::fs::read_dir(root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+                .filter_map(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| (name.to_string(), entry.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // A directory the core actually reads from, named by the operator or by the
+    // core itself ("Genesis Plus GX"). The directory says which core reads the
+    // file, not which system it belongs to: Sonic is a Genesis game and a Game
+    // Gear game, and a same-named file already sitting there may be the other
+    // one. Only a file this helper has synced for this system is this save.
+    for (name, path) in &directories {
+        let token = normalize_path_token(name);
+        if !declared
+            .iter()
+            .any(|alias| normalize_path_token(alias) == token)
+        {
+            continue;
+        }
+        let exact = path.join(filename);
+        if known_save_for_system(&exact, system_slug, known_saves) {
+            eprintln!(
+                "Restoring into {}: it already holds this {} save",
+                exact.display(),
+                system_slug
+            );
+            return Some(exact);
+        }
+        if exact.exists() {
+            eprintln!(
+                "Not restoring into {}: it holds a file this helper has not synced as {}",
+                exact.display(),
+                system_slug
+            );
+        }
+
+        // The record's filename carries the extension its profile declares, and
+        // that is not always the one the core writes: genesis-plus-gx is listed
+        // with ".sav" while the device holds ".srm". Matching the stem keeps a
+        // profile that disagrees with the core from silently defeating the
+        // write-back; the state still decides which file is this system's, and
+        // two known files on one stem is a guess this helper does not make.
+        let mut matches: Vec<PathBuf> = std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|entry| entry.is_file())
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| same_save_stem(name, filename))
+                            .unwrap_or(false)
+                    })
+                    .filter(|entry| known_save_for_system(entry, system_slug, known_saves))
+                    .collect()
+            })
+            .unwrap_or_default();
+        matches.sort();
+        match matches.len() {
+            0 => {}
+            1 => {
+                eprintln!(
+                    "Restoring into {}: it already holds this {} save under another extension",
+                    matches[0].display(),
+                    system_slug
+                );
+                return Some(matches[0].clone());
+            }
+            _ => {
+                eprintln!(
+                    "More than one file in {} holds the {} stem: {}; using the system directory instead",
+                    path.display(),
+                    save_stem(filename),
+                    matches
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
     None
+}
+
+/// Whether the helper's own state records `path` as a save of `system_slug`.
+fn known_save_for_system(
+    path: &Path,
+    system_slug: &str,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> bool {
+    known_saves
+        .get(path.to_string_lossy().as_ref())
+        .and_then(|entry| entry.system_slug.as_deref())
+        .map(|slug| slug == system_slug)
+        .unwrap_or(false)
+}
+
+/// The filename without its extension: "Sonic (USA).srm" and "Sonic (USA).sav"
+/// are the same save under two profiles' spellings of it.
+fn save_stem(filename: &str) -> &str {
+    Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(filename)
+}
+
+fn same_save_stem(candidate: &str, reference: &str) -> bool {
+    Path::new(candidate).extension().is_some() && save_stem(candidate) == save_stem(reference)
+}
+
+/// What `path` is, letting a system already known for it settle what the path
+/// cannot. A folder whose core runs two systems (RetroArch's mGBA serves Game
+/// Boy and GBA) names neither, so the record being restored, or the system this
+/// helper last synced the file as, decides. It never overrides a path or ROM
+/// that does name a system.
+fn classify_with_known_system(
+    path: &Path,
+    rom_path: Option<&Path>,
+    known_system: Option<&str>,
+) -> Option<crate::scanner::SaveClassification> {
+    classify_supported_save(path, rom_path).or_else(|| {
+        known_system.and_then(|system_slug| {
+            crate::scanner::classify_save_in_shared_core_as(path, system_slug)
+        })
+    })
 }
 
 fn preferred_system_directory_for_root(
@@ -1005,6 +2257,221 @@ fn preferred_system_directory_for_root(
         }
     }
     default_dir.to_string()
+}
+
+/// A file this helper synced as `system_slug` whose bytes are the record's:
+/// the cloud save is already here, whatever the path says.
+fn synced_here_with_these_bytes(
+    path: &Path,
+    system_slug: &str,
+    cloud_sha256: Option<&str>,
+    known_saves: &HashMap<String, SyncedEntry>,
+) -> bool {
+    let Some(cloud_sha256) = cloud_sha256.map(str::trim).filter(|sha| !sha.is_empty()) else {
+        return false;
+    };
+    known_save_for_system(path, system_slug, known_saves)
+        && crate::scanner::sha256_file(path)
+            .map(|local| same_sha256(&local, cloud_sha256))
+            .unwrap_or(false)
+}
+
+/// Two sha256 values agree when one is a prefix of the other: the server lists
+/// and some state entries carry a shortened digest.
+fn same_sha256(left: &str, right: &str) -> bool {
+    let (left, right) = (
+        left.trim().to_ascii_lowercase(),
+        right.trim().to_ascii_lowercase(),
+    );
+    let shorter = left.len().min(right.len());
+    shorter >= 16 && left[..shorter] == right[..shorter]
+}
+
+/// RetroArch's Flycast with per-content VMUs off writes one shared card per slot at
+/// `<root>/../bios/dc/vmu_save_<slot>.bin` (RetroDECK) or `<root>/../system/dc/` (RetroArch),
+/// beside the saves root.
+/// Returns the cards that exist for a RetroArch-profile source.
+fn shared_dreamcast_vmus(save_roots: &[PathBuf], profile: &EmulatorProfile) -> Vec<PathBuf> {
+    if !matches!(profile, EmulatorProfile::RetroArch) {
+        return Vec::new();
+    }
+    let mut cards = Vec::new();
+    for root in save_roots {
+        let Some(parent) = root.parent() else {
+            continue;
+        };
+        // RetroDECK names RetroArch's system folder bios/; a plain RetroArch install keeps system/.
+        for dir in [
+            parent.join("bios").join("dc"),
+            parent.join("system").join("dc"),
+        ] {
+            for bank in ['A', 'B', 'C', 'D'] {
+                for slot in ['1', '2', '3', '4'] {
+                    let card = dir.join(format!("vmu_save_{bank}{slot}.bin"));
+                    if card.is_file() {
+                        cards.push(card);
+                    }
+                }
+            }
+        }
+    }
+    cards
+}
+
+/// A record restores into a shared Flycast card only when it was uploaded from one: its filename is
+/// the card's own (`vmu_save_<slot>.bin`). A record from a per-game VMU (`<Game>.A1.bin`), which is
+/// every Dreamcast record made before shared cards synced, holds one game's card and would wipe the
+/// other games on a shared card, so it keeps the per-game path.
+fn names_shared_dreamcast_card(cloud_save: &CloudSaveSummary) -> bool {
+    std::path::Path::new(&cloud_save.filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase().starts_with("vmu_save_"))
+        .unwrap_or(false)
+}
+
+/// The shared card a Dreamcast record for `slot` restores to: `<dir>/vmu_save_<slot>.bin` in the
+/// source's shared-card folder (bios/dc or system/dc beside the saves root), whether or not the card
+/// exists yet, so a device with no card for that slot gets one there. None when the source has no
+/// shared-card folder, so a device that keeps per-game cards is not moved onto a shared one.
+fn shared_dreamcast_vmu_for_slot(
+    save_roots: &[PathBuf],
+    profile: &EmulatorProfile,
+    slot: &str,
+) -> Option<PathBuf> {
+    if !matches!(profile, EmulatorProfile::RetroArch) {
+        return None;
+    }
+    let slot = parse_dreamcast_slot(slot).unwrap_or_else(|| "A1".to_string());
+    save_roots.iter().find_map(|root| {
+        let parent = root.parent()?;
+        [
+            parent.join("bios").join("dc"),
+            parent.join("system").join("dc"),
+        ]
+        .into_iter()
+        .find(|dir| dir.is_dir())
+        .map(|dir| dir.join(format!("vmu_save_{slot}.bin")))
+    })
+}
+
+/// A shared Dreamcast card holds every game's saves, so it is already the record only when its
+/// bytes are the record's; a valid card with other bytes is still overwritten.
+fn shared_dreamcast_card_holds(path: &Path, cloud_sha256: Option<&str>) -> bool {
+    let Some(cloud) = cloud_sha256.map(str::trim).filter(|sha| !sha.is_empty()) else {
+        return false;
+    };
+    crate::scanner::sha256_file(path)
+        .map(|local| same_sha256(&local, cloud))
+        .unwrap_or(false)
+}
+
+/// Whether a shared card may take a cloud record: it is absent, holds no save, or is byte for byte
+/// what this device last synced.
+fn shared_dreamcast_card_replaceable(card: &Path, synced: Option<&SyncedEntry>) -> bool {
+    if !card.is_file() {
+        return true;
+    }
+    if crate::scanner::dreamcast_skip_reason(card, None).as_deref()
+        == Some("skip_empty_dreamcast_vmu")
+    {
+        return true;
+    }
+    let Some(synced) = synced else {
+        return false;
+    };
+    crate::scanner::sha256_file(card)
+        .map(|local| same_sha256(&local, &synced.sha256))
+        .unwrap_or(false)
+}
+
+/// Restores a Dreamcast record into a shared Flycast card: written unless the card already holds
+/// the record's bytes. The card is the record's whole payload, so no container adapter applies.
+#[allow(clippy::too_many_arguments)]
+fn restore_shared_dreamcast_card(
+    api: &ApiClient,
+    cloud_save: &CloudSaveSummary,
+    card: &Path,
+    source_name: &str,
+    source_kind: &SourceKind,
+    device_type: &str,
+    runtime_target: &RuntimeTarget,
+    fingerprint: &str,
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    sync_entries: &mut HashMap<String, SyncedEntry>,
+    restored_targets: &mut HashSet<String>,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<()> {
+    if shared_dreamcast_card_holds(card, cloud_save.sha256.as_deref()) {
+        return Ok(());
+    }
+    let card_key = card.to_string_lossy().to_string();
+    // A shared card holds every game's saves. It is replaced only when it is absent, blank, or still
+    // the bytes this device last synced; a card with saves the server has not seen (no sync record,
+    // or changed since) is left for the upload and conflict path, so none of them is lost.
+    if !shared_dreamcast_card_replaceable(card, sync_entries.get(&card_key)) {
+        if verbose {
+            eprintln!(
+                "Not restoring {} over {}: the card holds saves this device has not synced",
+                cloud_save.filename,
+                card.display()
+            );
+        }
+        report.skipped += 1;
+        return Ok(());
+    }
+    if restored_targets.contains(&card_key) {
+        return Ok(());
+    }
+    if options.dry_run {
+        report.would_download += 1;
+        return Ok(());
+    }
+    let bytes = api.download_save(
+        &cloud_save.id,
+        device_type,
+        fingerprint,
+        app_password,
+        Some(runtime_target),
+    )?;
+    if let Some(parent) = card.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("kan map niet maken: {}", parent.display()))?;
+    }
+    fs::write(card, &bytes)
+        .with_context(|| format!("kan cloud save niet herstellen: {}", card.display()))?;
+    let slot = cloud_save
+        .card_slot
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("A1")
+        .to_string();
+    let entry = synced_entry(
+        sha256_bytes(&bytes),
+        cloud_save.rom_sha1.clone(),
+        cloud_save.version,
+        Some("dreamcast"),
+        Some(SaveContainerFormat::Native),
+        Some(default_adapter_profile_for_container(
+            SaveContainerFormat::Native,
+        )),
+        Some(source_kind),
+        Some(source_name),
+        Some(&slot),
+    );
+    sync_entries.insert(card_key.clone(), entry);
+    restored_targets.insert(card_key);
+    report.downloaded += 1;
+    if verbose {
+        eprintln!(
+            "Restored cloud dreamcast save '{}' into shared card {}",
+            cloud_save.display_name(),
+            card.display()
+        );
+    }
+    Ok(())
 }
 
 fn select_cloud_restore_root(save_roots: &[PathBuf]) -> &PathBuf {
@@ -1125,6 +2592,10 @@ fn mister_system_directory(system_slug: &str) -> &'static str {
         "ps3" => "PS3",
         "ps4" => "PS4",
         "ps5" => "PS5",
+        "atari-lynx" => "AtariLynx",
+        "wonderswan" => "WonderSwan",
+        "sg-1000" => "SMS",
+        "colecovision" => "Coleco",
         _ => "Other",
     }
 }
@@ -1153,6 +2624,16 @@ fn generic_system_directory(system_slug: &str) -> &'static str {
         "ps3" => "ps3",
         "ps4" => "ps4",
         "ps5" => "ps5",
+        "3do" => "3do",
+        "atari-jaguar" => "atarijaguar",
+        "neogeo-cd" => "neogeocd",
+        "ngp" => "ngp",
+        "pc-engine" => "pcengine",
+        "virtualboy" => "virtualboy",
+        "atari-lynx" => "atarilynx",
+        "wonderswan" => "wonderswan",
+        "sg-1000" => "sg-1000",
+        "colecovision" => "colecovision",
         _ => "unknown",
     }
 }
@@ -1181,6 +2662,16 @@ fn system_directory_aliases(system_slug: &str) -> &'static [&'static str] {
         "ps3" => &["ps3", "playstation 3"],
         "ps4" => &["ps4", "playstation 4"],
         "ps5" => &["ps5", "playstation 5"],
+        "3do" => &["3do", "panasonic 3do"],
+        "atari-jaguar" => &["atarijaguar", "jaguar", "atari jaguar"],
+        "neogeo-cd" => &["neogeocd", "neo geo cd", "neogeo cd"],
+        "ngp" => &["ngp", "ngpc", "neo geo pocket", "neogeo pocket"],
+        "pc-engine" => &["pcengine", "pce", "tg16", "turbografx", "pc engine"],
+        "virtualboy" => &["virtualboy", "virtual boy", "vb"],
+        "atari-lynx" => &["atarilynx", "atari lynx", "lynx"],
+        "wonderswan" => &["wonderswan", "wonderswancolor", "wonder swan", "ws", "wsc"],
+        "sg-1000" => &["sg-1000", "sg1000", "sg"],
+        "colecovision" => &["colecovision", "coleco"],
         _ => &[],
     }
 }
@@ -1295,7 +2786,7 @@ fn process_port_save(
 
     let upload_port_save = |report: &mut SyncReport| -> Result<Option<ProcessedEntry>> {
         if options.dry_run {
-            report.uploaded += 1;
+            report.would_upload += 1;
             return Ok(Some(processed_entry(
                 state_key.clone(),
                 synced_entry(
@@ -1330,17 +2821,19 @@ fn process_port_save(
             None,
             Some(&runtime_target),
             Some(&upload_metadata),
+            None,
         )?;
+        let Some(stored) = stored_save(response) else {
+            report_accepted_not_stored(report, &port_save.path);
+            return Ok(None);
+        };
         report.uploaded += 1;
         Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
                 local_sha.clone(),
                 Some(rom_key.clone()),
-                response
-                    .save
-                    .and_then(|save| save.version)
-                    .or(latest.version),
+                stored.version.or(latest.version),
                 Some(PORT_SYSTEM_SLUG),
                 Some(SaveContainerFormat::Native),
                 Some(SaveAdapterProfile::Identity),
@@ -1429,7 +2922,7 @@ fn process_port_save(
         return Ok(None);
     };
     if options.dry_run {
-        report.downloaded += 1;
+        report.would_download += 1;
         return Ok(Some(processed_entry(
             state_key.clone(),
             synced_entry(
@@ -1476,11 +2969,227 @@ fn process_port_save(
     )))
 }
 
+/// Sync one PPSSPP `SAVEDATA/<dir>/` folder as a single bundle.
+///
+/// The folder is packed the same way every time, so its sha256 is compared with the server's
+/// latest for the folder's line, as a port save is. A local change since the last sync uploads;
+/// a server change over an unchanged folder replaces the folder; a conflict is reported the way a
+/// single-file save's is.
+#[allow(clippy::too_many_arguments)]
+fn process_psp_savedata_dir(
+    api: &ApiClient,
+    dir: &Path,
+    save_key: &str,
+    prior_local_sha: Option<&str>,
+    fingerprint: &str,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    source_systems: &[String],
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<Option<ProcessedEntry>> {
+    const PSP_SYSTEM_SLUG: &str = "psp";
+
+    if !source_allows_system(source_systems, PSP_SYSTEM_SLUG) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping {}: psp is disabled for source '{}'",
+                dir.display(),
+                source_name
+            );
+        }
+        return Ok(None);
+    }
+    let save_dir = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| psp_flat_name(name))
+        .map(ToString::to_string)
+        .with_context(|| format!("geen geldige PSP SAVEDATA map: {}", dir.display()))?;
+
+    let (bytes, local_sha) = pack_psp_savedata(dir)?;
+    let state_key = save_key.to_string();
+    let rom_key = psp_line_key(&save_dir);
+    let filename = psp_bundle_filename(&save_dir);
+    let slot_name = PSP_BUNDLE_SLOT;
+    let effective_profile = effective_profile_for_cloud_restore(source_kind, source_profile);
+    let device_type =
+        helper_device_type_for_upload(source_kind, &effective_profile, PSP_SYSTEM_SLUG);
+    let entry_for = |sha: String, version: Option<i64>| {
+        processed_entry(
+            state_key.clone(),
+            synced_entry(
+                sha,
+                Some(rom_key.clone()),
+                version,
+                Some(PSP_SYSTEM_SLUG),
+                Some(SaveContainerFormat::Native),
+                Some(SaveAdapterProfile::Identity),
+                Some(source_kind),
+                Some(source_name),
+                Some(slot_name),
+            ),
+        )
+    };
+
+    if verbose {
+        eprintln!(
+            "Detected PPSSPP SAVEDATA folder {} ({} bytes packed, line {})",
+            dir.display(),
+            bytes.len(),
+            rom_key
+        );
+    }
+
+    let latest_context = LatestSaveContext {
+        filename: filename.clone(),
+        system_slug: PSP_SYSTEM_SLUG.to_string(),
+        display_title: save_dir.clone(),
+        region_code: None,
+    };
+    let latest = api.latest_save(LatestSaveRequest {
+        rom_sha1: &rom_key,
+        slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+        runtime_target: None,
+        context: Some(&latest_context),
+    })?;
+
+    let upload = |report: &mut SyncReport| -> Result<Option<ProcessedEntry>> {
+        if options.dry_run {
+            report.uploaded += 1;
+            return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+        }
+        let response = api.upload_save(
+            &filename,
+            bytes.clone(),
+            &rom_key,
+            None,
+            slot_name,
+            device_type,
+            fingerprint,
+            app_password,
+            Some(PSP_SYSTEM_SLUG),
+            None,
+            None,
+            None,
+            Some(&save_dir),
+        )?;
+        let Some(stored) = stored_save(response) else {
+            report_accepted_not_stored(report, dir);
+            return Ok(None);
+        };
+        report.uploaded += 1;
+        Ok(Some(entry_for(
+            local_sha.clone(),
+            stored.version.or(latest.version),
+        )))
+    };
+
+    if !latest.exists || options.force_upload {
+        return upload(report);
+    }
+    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
+        report.in_sync += 1;
+        return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+    }
+
+    let conflict = api.conflict_check(
+        &rom_key,
+        slot_name,
+        device_type,
+        fingerprint,
+        app_password,
+        None,
+    )?;
+    if conflict.exists {
+        if !options.dry_run {
+            let cloud_sha = conflict
+                .cloud_sha256
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let device_name = format!("{} ({})", source_kind.as_str(), source_name);
+            let _ = api.conflict_report(
+                &filename,
+                bytes.clone(),
+                &rom_key,
+                slot_name,
+                &local_sha,
+                &cloud_sha,
+                &device_name,
+                device_type,
+                fingerprint,
+                app_password,
+                None,
+            )?;
+        }
+        report.conflicts += 1;
+        return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+    }
+
+    // The same rule as a single-file save: a folder that changed since this device last synced
+    // it is a local edit and uploads; otherwise the server's copy replaces it.
+    let local_edited_since_sync = prior_local_sha
+        .map(|prior| prior != local_sha.as_str())
+        .unwrap_or(false);
+    if local_edited_since_sync {
+        return upload(report);
+    }
+
+    let Some(save_id) = latest.id.as_deref() else {
+        report.skipped += 1;
+        return Ok(None);
+    };
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+    }
+    let cloud_bytes = api.download_save(save_id, device_type, fingerprint, app_password, None)?;
+    let files = restore_psp_savedata_bundle(dir, &cloud_bytes)?;
+    report.downloaded += 1;
+    if verbose {
+        eprintln!(
+            "Replaced {} with record {} ({} files)",
+            dir.display(),
+            save_id,
+            files
+        );
+    }
+    // The downloaded bundle's hash, not a repack: if another packer made it, the next pass sees
+    // the folder as a local edit and stores this helper's canonical form once.
+    Ok(Some(entry_for(sha256_bytes(&cloud_bytes), latest.version)))
+}
+
+/// Whether a ROM index can say a PS1 ROM is missing: it holds at least one ROM
+/// under a PlayStation folder. A source whose ROM root is its save root indexes
+/// an emulator's own `.bin` files, so its index is not empty yet holds no PS1
+/// ROM, and a card's ROM missing from it says nothing.
+fn rom_index_holds_ps1_roms(rom_index: &HashMap<String, RomIndexEntry>) -> bool {
+    rom_index.values().any(|entry| {
+        entry.path.components().any(|component| {
+            let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+            name == "psx"
+                || name == "ps1"
+                || (name.contains("playstation")
+                    && !name.contains("playstation 2")
+                    && !name.contains("portable")
+                    && !name.contains("vita"))
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_single_save(
     api: &ApiClient,
     save_path: &std::path::Path,
     save_key: &str,
+    prior_entry: Option<&SyncedEntry>,
     fingerprint: &str,
     source_name: &str,
     source_kind: &SourceKind,
@@ -1497,9 +3206,11 @@ fn process_single_save(
     let stem_key = stem.to_ascii_lowercase();
     let rom_entry = rom_index.get(&stem_key);
     let mut state_key = save_key.to_string();
-    let Some(classification) =
-        classify_supported_save(save_path, rom_entry.map(|entry| entry.path.as_path()))
-    else {
+    let Some(classification) = classify_with_known_system(
+        save_path,
+        rom_entry.map(|entry| entry.path.as_path()),
+        prior_entry.and_then(|entry| entry.system_slug.as_deref()),
+    ) else {
         report.skipped += 1;
         if let Some(reason) =
             dreamcast_skip_reason(save_path, rom_entry.map(|entry| entry.path.as_path()))
@@ -1525,6 +3236,24 @@ fn process_single_save(
     };
     let system_slug = classification.system_slug;
     let classification_evidence = classification.evidence;
+    // A PS1 card is named after its game, and the server keeps one line per
+    // card. A card whose name matches no ROM here (a title-named card a game
+    // or a converter wrote) opens a line of its own on the server, which then
+    // moves the game's save onto it and away from the game's card. Only an
+    // index that loaded can say a ROM is missing; with no ROM root the card
+    // syncs as before.
+    if rom_entry.is_none()
+        && rom_index_holds_ps1_roms(rom_index)
+        && system_slug == "psx"
+        && infer_playstation_slot_from_path(save_path).starts_with(PS1_PER_GAME_SLOT_PREFIX)
+    {
+        report.skipped += 1;
+        eprintln!(
+            "Not uploading {}: a PS1 card named after no ROM in the index would open its own line on the server",
+            save_path.display()
+        );
+        return Ok(None);
+    }
     if !source_allows_system(source_systems, &system_slug) {
         report.skipped += 1;
         if verbose {
@@ -1588,6 +3317,8 @@ fn process_single_save(
             wii_title_code_from_path(save_path).as_deref(),
             &effective_slot_name,
         ))
+    } else if system_slug == "sega-cd" && crate::scanner::is_sega_cd_shared_bram(save_path) {
+        crate::scanner::sega_cd_bram_line_key(device_type, save_path)
     } else {
         None
     };
@@ -1654,6 +3385,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_missing_cloud_payload_reference(&err) => {
@@ -1668,6 +3400,7 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) if is_playstation_projection_unavailable(&err, &system_slug) => {
@@ -1682,14 +3415,38 @@ fn process_single_save(
                 sha256: None,
                 version: None,
                 id: None,
+                card_slot: None,
             }
         }
         Err(err) => return Err(err),
     };
 
-    if !latest.exists {
+    // The server holding these bytes means the save is in sync only if this
+    // device last synced it under the card it is offered under now. A save
+    // that moved cards (a per-game card newly holding it) is a different offer
+    // of the same bytes: the server moves the save onto the line the new card
+    // names, so it is uploaded rather than treated as in sync or restored.
+    let moved_to_another_card = prior_entry
+        .and_then(|entry| entry.slot_name.as_deref())
+        .map(str::trim)
+        .filter(|slot| !slot.is_empty())
+        .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+        .unwrap_or(false)
+        // The device's own state is not the only witness to a move: the server
+        // can re-home a save (another device, a manual repair) while this device
+        // still records the card it last synced. The card the server reports is
+        // compared as well, so an unchanged-bytes offer still uploads and the
+        // save lands on the card this device names.
+        || latest
+            .card_slot
+            .as_deref()
+            .map(str::trim)
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| !slot.eq_ignore_ascii_case(effective_slot_name.trim()))
+            .unwrap_or(false);
+    if !latest.exists || moved_to_another_card {
         if options.dry_run {
-            report.uploaded += 1;
+            report.would_upload += 1;
             return Ok(Some(processed_entry(
                 state_key.clone(),
                 synced_entry(
@@ -1724,17 +3481,26 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(version) => version,
+            Ok(Some(save)) => save.version,
+            Ok(None) => {
+                // 2xx with no `save`: the server accepted the request but stored
+                // nothing.  Counting this as uploaded is how a client reports a
+                // hundred successful uploads while the store never grows.
+                report.accepted_not_stored += 1;
+                eprintln!(
+                    "Server accepted {} but returned no save; nothing was stored",
+                    save_path.display()
+                );
+                return Ok(None);
+            }
             Err(err) => {
                 if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
-                    report.skipped += 1;
-                    if verbose {
-                        eprintln!(
-                            "Skipping empty N64 controller pak {}: {}",
-                            save_path.display(),
-                            err
-                        );
-                    }
+                    report.rejected_n64_controller_pak += 1;
+                    eprintln!(
+                        "Rejected empty N64 controller pak {}: {}",
+                        save_path.display(),
+                        err
+                    );
                     return Ok(None);
                 }
                 return Err(err);
@@ -1758,9 +3524,41 @@ fn process_single_save(
         )));
     }
 
-    if options.force_upload {
+    // What did both sides last agree on?  Comparing local against remote alone
+    // cannot tell "the user just saved" from "the server has something new", so a
+    // divergence was resolved by asking the server, which can only see its own side.
+    let (local_moved, remote_moved) = match prior_entry {
+        Some(prior) => {
+            let last = prior.sha256.as_str();
+            let remote = latest.sha256.as_deref().unwrap_or("");
+            (last != local_sha.as_str(), last != remote)
+        }
+        // Nothing agreed yet (first sync): not a conflict, fall through.
+        None => (false, false),
+    };
+
+    if local_moved && remote_moved {
+        // Both sides moved, and neither is more real.  Touch neither.
+        let remote_sha = latest.sha256.as_deref().unwrap_or("");
+        report.conflicts += 1;
+        eprintln!(
+            "Sync conflict for {}: local {} and server {} both changed since the last sync; leaving both untouched",
+            save_path.display(),
+            &local_sha[..local_sha.len().min(8)],
+            &remote_sha[..remote_sha.len().min(8)]
+        );
+        return Ok(Some(processed_entry(
+            state_key.clone(),
+            prior_entry
+                .expect("conflict requires a prior entry")
+                .clone(),
+        )));
+    }
+
+    // Only the local side moved: the ordinary "player just saved" case.  Upload it.
+    if options.force_upload || local_moved {
         if options.dry_run {
-            report.uploaded += 1;
+            report.would_upload += 1;
             return Ok(Some(processed_entry(
                 state_key.clone(),
                 synced_entry(
@@ -1795,17 +3593,26 @@ fn process_single_save(
             verbose,
         );
         let upload_version = match upload_result {
-            Ok(version) => version,
+            Ok(Some(save)) => save.version,
+            Ok(None) => {
+                // 2xx with no `save`: the server accepted the request but stored
+                // nothing.  Counting this as uploaded is how a client reports a
+                // hundred successful uploads while the store never grows.
+                report.accepted_not_stored += 1;
+                eprintln!(
+                    "Server accepted {} but returned no save; nothing was stored",
+                    save_path.display()
+                );
+                return Ok(None);
+            }
             Err(err) => {
                 if is_empty_n64_controller_pak_rejection(&err, &system_slug) {
-                    report.skipped += 1;
-                    if verbose {
-                        eprintln!(
-                            "Skipping empty N64 controller pak {}: {}",
-                            save_path.display(),
-                            err
-                        );
-                    }
+                    report.rejected_n64_controller_pak += 1;
+                    eprintln!(
+                        "Rejected empty N64 controller pak {}: {}",
+                        save_path.display(),
+                        err
+                    );
                     return Ok(None);
                 }
                 return Err(err);
@@ -1863,7 +3670,7 @@ fn process_single_save(
                 );
             }
             if options.dry_run {
-                report.uploaded += 1;
+                report.would_upload += 1;
                 return Ok(Some(processed_entry(
                     state_key.clone(),
                     synced_entry(
@@ -1880,7 +3687,7 @@ fn process_single_save(
                 )));
             }
             let filename = upload_filename_for_sync(save_path, &system_slug);
-            api.upload_save(
+            let response = api.upload_save(
                 &filename,
                 normalized_save.canonical_bytes.clone(),
                 &active_rom_sha1,
@@ -1893,7 +3700,12 @@ fn process_single_save(
                 wii_title_code_from_path(save_path).as_deref(),
                 Some(&runtime_target),
                 None,
+                None,
             )?;
+            if stored_save(response).is_none() {
+                report_accepted_not_stored(report, save_path);
+                return Ok(None);
+            }
             report.uploaded += 1;
             return Ok(Some(processed_entry(
                 state_key.clone(),
@@ -1938,7 +3750,7 @@ fn process_single_save(
                     );
                 }
                 let filename = upload_filename_for_sync(save_path, &system_slug);
-                api.upload_save(
+                let response = api.upload_save(
                     &filename,
                     normalized_save.canonical_bytes.clone(),
                     &active_rom_sha1,
@@ -1951,7 +3763,12 @@ fn process_single_save(
                     wii_title_code_from_path(save_path).as_deref(),
                     Some(&runtime_target),
                     None,
+                    None,
                 )?;
+                if stored_save(response).is_none() {
+                    report_accepted_not_stored(report, save_path);
+                    return Ok(None);
+                }
                 report.uploaded += 1;
                 return Ok(Some(processed_entry(
                     state_key.clone(),
@@ -1989,7 +3806,7 @@ fn process_single_save(
 
     if let Some(save_id) = latest.id {
         if options.dry_run {
-            report.downloaded += 1;
+            report.would_download += 1;
             let target_save_path = preferred_save_path(
                 save_path,
                 source_kind,
@@ -2031,7 +3848,7 @@ fn process_single_save(
                     );
                 }
                 let filename = upload_filename_for_sync(save_path, &system_slug);
-                api.upload_save(
+                let response = api.upload_save(
                     &filename,
                     normalized_save.canonical_bytes.clone(),
                     &active_rom_sha1,
@@ -2044,7 +3861,12 @@ fn process_single_save(
                     wii_title_code_from_path(save_path).as_deref(),
                     Some(&runtime_target),
                     None,
+                    None,
                 )?;
+                if stored_save(response).is_none() {
+                    report_accepted_not_stored(report, save_path);
+                    return Ok(None);
+                }
                 report.uploaded += 1;
                 return Ok(Some(processed_entry(
                     state_key.clone(),
@@ -2073,6 +3895,25 @@ fn process_single_save(
             normalized_save.local_container,
             Some(canonical_bytes.len() as u64),
         );
+        // A save keeps its size. A downloaded payload of another length is a
+        // different save, or a canonical form (an N64 projection, a padded
+        // image) the game never wrote; writing it over the local save loses the
+        // save the game reads and starts a rewrite on every pass.
+        if target_save_path == save_path
+            && let Ok(existing) = std::fs::metadata(&target_save_path)
+            && existing.is_file()
+            && existing.len() != local_bytes.len() as u64
+        {
+            report.refused_size_mismatch += 1;
+            eprintln!(
+                "Refusing to write record {} ({} bytes) over {} ({} bytes): a save keeps its size, so this payload is a different save or a canonical form the game never wrote",
+                save_id,
+                local_bytes.len(),
+                target_save_path.display(),
+                existing.len()
+            );
+            return Ok(None);
+        }
         if let Some(parent) = target_save_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("kan map niet maken: {}", parent.display()))?;
@@ -2210,6 +4051,7 @@ fn process_missing_save(
             sha256: None,
             version: None,
             id: None,
+            card_slot: None,
         },
         Err(err) => return Err(err),
     };
@@ -2244,7 +4086,7 @@ fn process_missing_save(
     let state_key = save_path.to_string_lossy().to_string();
 
     if options.dry_run {
-        report.downloaded += 1;
+        report.would_download += 1;
         return Ok(Some(processed_entry(
             state_key,
             synced_entry(
@@ -2477,10 +4319,115 @@ fn projection_runtime_profile_for_system(
             }
             .to_string(),
         ),
+        // The profile is required by the server for every projection-capable
+        // system, on the latest check, the upload and the download alike. A
+        // system with no arm here sent no profile and was refused with
+        // "runtimeProfile is required" -- game boy and DS saves never synced
+        // for that reason alone.
+        "gameboy" => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "gameboy/mister",
+                EmulatorProfile::RetroArch => "gameboy/retroarch-gambatte",
+                _ => "gameboy/gambatte",
+            }
+            .to_string(),
+        ),
+        "nds" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "nds/retroarch-melonds",
+                _ => "nds/melonds",
+            }
+            .to_string(),
+        ),
+        "3do" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "3do/retroarch-opera",
+                _ => "3do/opera",
+            }
+            .to_string(),
+        ),
+        "atari-jaguar" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "atari-jaguar/retroarch-virtual-jaguar",
+                _ => "atari-jaguar/virtual-jaguar",
+            }
+            .to_string(),
+        ),
+        // The server publishes exactly one profile for each of these three
+        // (RetroSaveManager#56), so every source asks for it.
+        "ngp" => Some("ngp/mednafen".to_string()),
+        "virtualboy" => Some("virtualboy/mednafen".to_string()),
+        "neogeo-cd" => Some("neogeo-cd/retroarch".to_string()),
+        // RetroSaveManager marks these projection-capable; each profile is one
+        // of its runtime_profiles.go entries. RetroDECK runs Handy, Beetle
+        // WonderSwan, Genesis Plus GX and Gearcoleco under RetroArch; the MiSTer
+        // has no profile of its own, so it names the core its saves match.
+        slug if crate::sources::same_system(slug, "atari-lynx") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "atari-lynx/retroarch-handy",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "atari-lynx/retroarch-handy"
+                    }
+                    _ => "atari-lynx/handy",
+                },
+            }
+            .to_string(),
+        ),
+        slug if crate::sources::same_system(slug, "wonderswan") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "wonderswan/retroarch-beetle-wswan",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "wonderswan/retroarch-beetle-wswan"
+                    }
+                    _ => "wonderswan/mednafen",
+                },
+            }
+            .to_string(),
+        ),
+        slug if crate::sources::same_system(slug, "sg-1000") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sg-1000/retroarch-genesis-plus-gx",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "sg-1000/retroarch-genesis-plus-gx"
+                    }
+                    _ => "sg-1000/genesis-plus-gx",
+                },
+            }
+            .to_string(),
+        ),
+        slug if crate::sources::same_system(slug, "colecovision") => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "colecovision/retroarch-gearcoleco",
+                _ => match source_kind {
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "colecovision/retroarch-gearcoleco"
+                    }
+                    _ => "colecovision/gearcoleco",
+                },
+            }
+            .to_string(),
+        ),
         "gba" => Some(
             match source_profile {
                 EmulatorProfile::RetroArch => "gba/retroarch-mgba",
                 _ => "gba/mgba",
+            }
+            .to_string(),
+        ),
+        "sega-cd" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sega-cd/retroarch-genesis-plus-gx",
+                _ => "sega-cd/genesis-plus-gx",
+            }
+            .to_string(),
+        ),
+        "sega-32x" => Some(
+            match source_profile {
+                EmulatorProfile::RetroArch => "sega-32x/retroarch-genesis-plus-gx",
+                _ => "sega-32x/genesis-plus-gx",
             }
             .to_string(),
         ),
@@ -2513,6 +4460,23 @@ fn projection_runtime_profile_for_system(
                     "mister" => "dreamcast/mister",
                     "retroarch" => "dreamcast/retroarch-flycast",
                     _ => "dreamcast/flycast",
+                },
+            }
+            .to_string(),
+        ),
+        // RetroSaveManager's pc-engine profiles are identity projections of the raw backup RAM;
+        // RetroDECK and the desktop helpers run Beetle PCE under RetroArch. The scanner names
+        // these saves `tgfx16`, so the arm takes every name of the system, not only the server's.
+        slug if crate::sources::same_system(slug, "pc-engine") => Some(
+            match source_profile {
+                EmulatorProfile::Mister => "pc-engine/mister",
+                EmulatorProfile::RetroArch => "pc-engine/retroarch-beetle-pce",
+                _ => match source_kind {
+                    SourceKind::MisterFpga => "pc-engine/mister",
+                    SourceKind::RetroArch | SourceKind::SteamDeck | SourceKind::Windows => {
+                        "pc-engine/retroarch-beetle-pce"
+                    }
+                    _ => "pc-engine/mednafen",
                 },
             }
             .to_string(),
@@ -2679,9 +4643,52 @@ fn parse_playstation_slot(value: &str) -> Option<String> {
     None
 }
 
+/// A PS1 card the emulator keeps per game (RetroArch's Beetle PSX without
+/// shared cards, the MiSTer) is named after that game and holds only its saves.
+/// The server keeps one line per card slot, so such a card gets its own slot,
+/// "Game: <name>"; sharing "Memory Card 1" made each game's card read as a
+/// deletion of every other game's save. A numbered card (memory_card_1, mcd001)
+/// is a shared card and keeps its number, and so does a PS2 card.
+const PS1_PER_GAME_SLOT_PREFIX: &str = "Game: ";
+
 fn infer_playstation_slot_from_path(path: &Path) -> String {
     let text = path.to_string_lossy().to_ascii_lowercase();
-    parse_playstation_slot(&text).unwrap_or_else(|| "Memory Card 1".to_string())
+    if let Some(slot) = parse_playstation_slot(&text) {
+        return slot;
+    }
+    let is_ps1_card = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| !value.eq_ignore_ascii_case("ps2"))
+        .unwrap_or(false);
+    match path.file_stem().and_then(|value| value.to_str()) {
+        Some(stem) if is_ps1_card && !stem.trim().is_empty() => {
+            format!("{PS1_PER_GAME_SLOT_PREFIX}{}", stem.trim())
+        }
+        _ => "Memory Card 1".to_string(),
+    }
+}
+
+/// The extension a per-game PS1 card has on this device: the server names the
+/// card after its game but knows only the `.mcr` container, while RetroArch
+/// reads `<game>.srm` and the MiSTer `<game>.sav`.
+fn ps1_per_game_card_extension(
+    cloud_save: &CloudSaveSummary,
+    source_profile: &EmulatorProfile,
+) -> Option<String> {
+    let slot = cloud_save.card_slot.as_deref()?.trim();
+    if !slot.starts_with(PS1_PER_GAME_SLOT_PREFIX)
+        || !cloud_save.system_slug.eq_ignore_ascii_case("psx")
+    {
+        return None;
+    }
+    Some(
+        match source_profile {
+            EmulatorProfile::Mister => "sav",
+            _ => "srm",
+        }
+        .to_string(),
+    )
 }
 
 fn parse_dreamcast_slot(value: &str) -> Option<String> {
@@ -2762,7 +4769,79 @@ fn save_selection_key(save_path: &Path) -> String {
     {
         return format!("wii:{}", title_code.to_ascii_lowercase());
     }
-    filename_stem(save_path).to_ascii_lowercase()
+    let stem = filename_stem(save_path).to_ascii_lowercase();
+    // Additive save extensions are NOT alternative formats of the main save —
+    // they carry independent state that must NOT be deduplicated against the
+    // primary battery save. Examples:
+    //   .rtc — GBC real-time clock state (Pokemon Crystal/Gold/Silver,
+    //          Harvest Moon GBC, etc). The .srm is the SRAM; the .rtc is
+    //          the day/night clock. Dropping .rtc loses time-based events
+    //          like Pokemon Crystal evolutions and the in-game day cycle.
+    //   .mpk / .cpk — N64 controller pak / memory pak. Independent of the
+    //          main .eep / .fla / .sra battery save.
+    // Give these their own selection key so select_preferred_save_per_stem
+    // doesn't pick one variant and silently drop the others.
+    if let Some(ext) = save_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        && matches!(ext.as_str(), "rtc" | "mpk" | "cpk")
+    {
+        return format!("{}:{}", stem, ext);
+    }
+    stem
+}
+
+/// Whether this copy may upload, and the reason when it may not.
+///
+/// The restore rule and this one are the same rule: the directory the emulator
+/// actually writes is the one that syncs. Declared wins; two copies with
+/// nothing declared is a conflict the helper refuses to resolve, because a
+/// wrong upload replaces a good record rather than merely landing in a place
+/// the game cannot see.
+fn live_upload_blocked(
+    source: &ResolvedSource,
+    save_path: &Path,
+    selection_key: &str,
+    rom_index: &HashMap<String, RomIndexEntry>,
+) -> Option<String> {
+    let root = source.save_roots.first()?;
+    let classification = classify_supported_save(save_path, None)?;
+    let system_slug = classification.system_slug;
+    let declared = declared_live_subdir(
+        rom_index,
+        &source.save_subdirs,
+        &system_slug,
+        &filename_stem(save_path),
+    );
+    match live_target_for(root, &system_slug, selection_key, declared.as_deref()) {
+        LiveTarget::FallThrough => None,
+        LiveTarget::Path { live, .. } => {
+            if save_path.parent() == Some(live.as_path()) {
+                return None;
+            }
+            Some(format!(
+                "Not uploading {}: it is a stray copy, and {} is the live directory for {} in source '{}'",
+                save_path.display(),
+                live.display(),
+                system_slug,
+                source.name
+            ))
+        }
+        LiveTarget::Ambiguous(directories) => {
+            let named: Vec<String> = directories
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect();
+            Some(format!(
+                "Not uploading {}: it exists in {}, and no live directory is declared; set SAVE_SUBDIR_{} on source '{}'",
+                save_path.display(),
+                named.join(", "),
+                system_slug.to_ascii_uppercase(),
+                source.name
+            ))
+        }
+    }
 }
 
 fn select_preferred_save_per_stem(
@@ -2835,6 +4914,11 @@ fn preferred_save_path(
     };
     let current_extension = save_extension(save_path);
     if system_slug == "n64" && is_native_n64_extension(current_extension.as_deref()) {
+        return save_path.to_path_buf();
+    }
+    // A Sega CD backup RAM is read by its own name (scd_U.brm, cart.brm); the
+    // cartridge .srm rule would write a file Genesis Plus GX never opens.
+    if system_slug == "sega-cd" && current_extension.as_deref() == Some("brm") {
         return save_path.to_path_buf();
     }
     let Some(preferred_extension) =
@@ -2985,7 +5069,7 @@ fn upload_with_n64_mister_cpk_fallback(
     wii_title_id: Option<&str>,
     runtime_target: &RuntimeTarget,
     verbose: bool,
-) -> Result<Option<i64>> {
+) -> Result<Option<UploadedSave>> {
     let upload_result = api.upload_save(
         filename,
         bytes.to_vec(),
@@ -2998,6 +5082,7 @@ fn upload_with_n64_mister_cpk_fallback(
         Some(system_slug),
         wii_title_id,
         Some(runtime_target),
+        None,
         None,
     );
     let upload_response = match upload_result {
@@ -3025,13 +5110,38 @@ fn upload_with_n64_mister_cpk_fallback(
                     wii_title_id,
                     Some(runtime_target),
                     None,
+                    None,
                 )?
             } else {
                 return Err(err);
             }
         }
     };
-    Ok(upload_response.save.and_then(|save| save.version))
+    // A response that names a save is a stored save. The server's success body
+    // carries `id` and `sha256` and, on some paths, no `version` at all; reading
+    // that as "nothing was stored" reported every such upload as accepted and
+    // discarded while the record was on disk.
+    Ok(stored_save(upload_response))
+}
+
+/// The save a successful upload response stored, or `None` when the body names
+/// none. A response that names a save (`version`, `id` or `sha256`) is a stored
+/// save: the server's success body carries `id` and `sha256` and, on some paths,
+/// no `version`. A 2xx with no `save` object stored nothing, and every upload
+/// path has to say so rather than count the request.
+fn stored_save(response: UploadSaveResponse) -> Option<UploadedSave> {
+    response
+        .save
+        .filter(|save| save.version.is_some() || save.id.is_some() || save.sha256.is_some())
+}
+
+/// A 2xx that stored nothing: counted and named, never counted as an upload.
+fn report_accepted_not_stored(report: &mut SyncReport, path: &std::path::Path) {
+    report.accepted_not_stored += 1;
+    eprintln!(
+        "Server accepted {} but returned no save; nothing was stored",
+        path.display()
+    );
 }
 
 fn should_retry_n64_mister_cpk_as_mpk(
@@ -3131,6 +5241,269 @@ fn default_adapter_profile_for_container(container: SaveContainerFormat) -> Save
     }
 }
 
+// --- Folder saves: Dolphin NAND titles and Vita3K savedata folders (folder_saves.rs) ---
+
+/// The slot a folder bundle is stored under: the folder is the save's identity.
+const FOLDER_SAVE_SLOT: &str = "default";
+
+/// Upload, settle or replace one folder save, by the rule a single file follows: a folder that
+/// changed since this device last synced it uploads; otherwise the server's copy replaces it.
+#[allow(clippy::too_many_arguments)]
+fn process_folder_save(
+    api: &ApiClient,
+    save: &FolderSave,
+    prior_local_sha: Option<&str>,
+    fingerprint: &str,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    source_systems: &[String],
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<Option<ProcessedEntry>> {
+    let system_slug = save.kind.system_slug();
+    if !source_allows_system(source_systems, system_slug) {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping {}: {} is disabled for source '{}'",
+                save.path.display(),
+                system_slug,
+                source_name
+            );
+        }
+        return Ok(None);
+    }
+    let folder_bytes: u64 = folder_save_files(&save.path)?
+        .iter()
+        .map(|(_, _, size)| size)
+        .sum();
+    if folder_bytes > FOLDER_SAVE_MAX_BYTES {
+        report.skipped += 1;
+        eprintln!(
+            "Skipping {} folder save {}: {} bytes is over the {} byte bundle limit",
+            system_slug,
+            save.path.display(),
+            folder_bytes,
+            FOLDER_SAVE_MAX_BYTES
+        );
+        return Ok(None);
+    }
+    let (bytes, local_sha) = pack_folder_save(&save.path)?;
+    let state_key = save.path.to_string_lossy().to_string();
+    let rom_key = save.line_key();
+    let filename = save.filename();
+    let device_type = helper_device_type_for_upload(source_kind, source_profile, system_slug);
+    let entry_for = |sha: String, version: Option<i64>| {
+        processed_entry(
+            state_key.clone(),
+            synced_entry(
+                sha,
+                Some(rom_key.clone()),
+                version,
+                Some(system_slug),
+                Some(SaveContainerFormat::Native),
+                Some(SaveAdapterProfile::Identity),
+                Some(source_kind),
+                Some(source_name),
+                Some(FOLDER_SAVE_SLOT),
+            ),
+        )
+    };
+    if verbose {
+        eprintln!(
+            "Detected {} folder save {} ({} bytes packed, line {})",
+            system_slug,
+            save.path.display(),
+            bytes.len(),
+            rom_key
+        );
+    }
+
+    let latest_context = LatestSaveContext {
+        filename: filename.clone(),
+        system_slug: system_slug.to_string(),
+        display_title: save.save_dir.clone(),
+        region_code: None,
+    };
+    let latest = api.latest_save(LatestSaveRequest {
+        rom_sha1: &rom_key,
+        slot_name: FOLDER_SAVE_SLOT,
+        device_type,
+        fingerprint,
+        app_password,
+        runtime_target: None,
+        context: Some(&latest_context),
+    })?;
+
+    let upload = |report: &mut SyncReport| -> Result<Option<ProcessedEntry>> {
+        if options.dry_run {
+            report.uploaded += 1;
+            return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+        }
+        let response = api.upload_folder_save(
+            &filename,
+            bytes.clone(),
+            &rom_key,
+            FOLDER_SAVE_SLOT,
+            device_type,
+            fingerprint,
+            app_password,
+            system_slug,
+            &save.save_dir,
+        )?;
+        let Some(stored) = stored_save(response) else {
+            report_accepted_not_stored(report, &save.path);
+            return Ok(None);
+        };
+        report.uploaded += 1;
+        Ok(Some(entry_for(
+            local_sha.clone(),
+            stored.version.or(latest.version),
+        )))
+    };
+
+    if !latest.exists || options.force_upload {
+        return upload(report);
+    }
+    if latest.sha256.as_deref() == Some(local_sha.as_str()) {
+        report.in_sync += 1;
+        return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+    }
+    // The server holds a different folder for this title. With no record of what this device
+    // last synced (a first sync, or a lost state file) the local folder may hold progress the
+    // server never saw, so it uploads and the server keeps the older one in its history, the
+    // same as a folder edited since the last sync. Only a folder that still matches what this
+    // device last synced is replaced by the server's copy.
+    let local_edited_since_sync = prior_local_sha
+        .map(|prior| prior != local_sha.as_str())
+        .unwrap_or(true);
+    if local_edited_since_sync {
+        return upload(report);
+    }
+    let Some(save_id) = latest.id.as_deref() else {
+        report.skipped += 1;
+        return Ok(None);
+    };
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(Some(entry_for(local_sha.clone(), latest.version)));
+    }
+    let emulator_root = emulator_root_of(save)
+        .with_context(|| format!("no emulator folder above {}", save.path.display()))?;
+    let cloud_bytes = api.download_save(save_id, device_type, fingerprint, app_password, None)?;
+    let files = restore_folder_save(&emulator_root, &save.path, &cloud_bytes)?;
+    report.downloaded += 1;
+    if verbose {
+        eprintln!(
+            "Replaced {} with record {} ({} files)",
+            save.path.display(),
+            save_id,
+            files
+        );
+    }
+    Ok(Some(entry_for(sha256_bytes(&cloud_bytes), latest.version)))
+}
+
+/// The folder a bundle record restores into: `/rsm/folder/saveDir`, present only when
+/// `/rsm/folder/bundle` says the payload is the whole folder, and only when it is the
+/// system's form of folder id.
+fn cloud_folder_save_dir(cloud_save: &CloudSaveSummary, kind: FolderSaveKind) -> Option<String> {
+    let bundle = cloud_json_string(&cloud_save.metadata, "/rsm/folder/bundle")?;
+    if bundle != FOLDER_SAVE_BUNDLE_KIND {
+        return None;
+    }
+    cloud_json_string(&cloud_save.metadata, "/rsm/folder/saveDir")
+        .filter(|save_dir| valid_folder_save_dir(kind, save_dir))
+}
+
+/// What `/rsm/folder/bundle` holds for a zipped save folder.
+const FOLDER_SAVE_BUNDLE_KIND: &str = "folder-zip";
+
+/// Restore a folder bundle the device does not hold yet, into the emulator's folder under the
+/// source's save root. The emulator's folder must exist: a device that does not run the
+/// emulator gets nothing.
+#[allow(clippy::too_many_arguments)]
+fn restore_cloud_folder_save(
+    api: &ApiClient,
+    cloud_save: &CloudSaveSummary,
+    kind: FolderSaveKind,
+    source_name: &str,
+    source_kind: &SourceKind,
+    source_profile: &EmulatorProfile,
+    save_roots: &[PathBuf],
+    fingerprint: &str,
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    sync_entries: &mut HashMap<String, SyncedEntry>,
+    restored_targets: &mut HashSet<String>,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<bool> {
+    let Some(save_dir) = cloud_folder_save_dir(cloud_save, kind) else {
+        return Ok(false);
+    };
+    let root = select_cloud_restore_root(save_roots);
+    let emulator_root = kind.root_under(root);
+    let Some(target) = kind.folder_for(&emulator_root, &save_dir) else {
+        return Ok(false);
+    };
+    let target_key = target.to_string_lossy().to_string();
+    if restored_targets.contains(&target_key) || target.is_dir() {
+        return Ok(true);
+    }
+    if !emulator_root.is_dir() {
+        report.skipped += 1;
+        if verbose {
+            eprintln!(
+                "Skipping cloud {} save '{}': no {} folder at {} for source '{}'",
+                kind.system_slug(),
+                cloud_save.display_name(),
+                kind.system_slug(),
+                emulator_root.display(),
+                source_name
+            );
+        }
+        return Ok(true);
+    }
+    if options.dry_run {
+        report.downloaded += 1;
+        return Ok(true);
+    }
+    let device_type =
+        helper_device_type_for_upload(source_kind, source_profile, kind.system_slug());
+    let bundle = api.download_save(&cloud_save.id, device_type, fingerprint, app_password, None)?;
+    let files = restore_folder_save(&emulator_root, &target, &bundle)?;
+    sync_entries.insert(
+        target_key.clone(),
+        synced_entry(
+            sha256_bytes(&bundle),
+            Some(folder_line_key(kind, &save_dir)),
+            cloud_save.version,
+            Some(kind.system_slug()),
+            Some(SaveContainerFormat::Native),
+            Some(SaveAdapterProfile::Identity),
+            Some(source_kind),
+            Some(source_name),
+            Some(FOLDER_SAVE_SLOT),
+        ),
+    );
+    restored_targets.insert(target_key);
+    report.downloaded += 1;
+    if verbose {
+        eprintln!(
+            "Restored cloud-only {} save '{}' to {} ({} files)",
+            kind.system_slug(),
+            cloud_save.display_name(),
+            target.display(),
+            files
+        );
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn synced_entry(
     sha256: String,
@@ -3159,6 +5532,31 @@ fn synced_entry(
 
 #[cfg(test)]
 mod tests {
+
+    // The server's error text is `… status=<code> <reason> body=…`; the parse
+    // has to take the code and decide on it, not on the reason phrase.
+    #[test]
+    fn permanent_rejection_status_reads_the_status_code() {
+        let refused = anyhow::anyhow!(
+            "POST /saves (multipart upload): HTTP request faalde: status=422 Unprocessable Entity body={{}}"
+        );
+        assert_eq!(permanent_rejection_status(&refused), Some(422));
+        let bad = anyhow::anyhow!("HTTP request faalde: status=400 Bad Request body={{}}");
+        assert_eq!(permanent_rejection_status(&bad), Some(400));
+        for later in [
+            "HTTP request faalde: status=408 Request Timeout body={}",
+            "HTTP request faalde: status=429 Too Many Requests body={}",
+            "HTTP request faalde: status=500 Internal Server Error body={}",
+            "HTTP request faalde: status=503 Service Unavailable body={}",
+            "connection refused",
+        ] {
+            assert_eq!(
+                permanent_rejection_status(&anyhow::anyhow!("{later}")),
+                None,
+                "{later}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -3168,6 +5566,65 @@ mod tests {
         assert!(source_allows_system(&systems, "N64"));
         assert!(!source_allows_system(&systems, "wii"));
         assert!(!source_allows_system(&[], "snes"));
+    }
+
+    #[test]
+    fn save_selection_key_separates_additive_extensions() {
+        // Pokemon Crystal saves both .srm (battery SRAM) and .rtc (real-time
+        // clock state). They are NOT alternative formats of each other —
+        // dropping .rtc loses time-based events (Pokemon evolutions, day/night
+        // cycle). They must get DIFFERENT selection keys so they don't dedup
+        // against each other in select_preferred_save_per_stem.
+        let srm = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).srm",
+        );
+        let rtc = PathBuf::from(
+            "/run/media/x/saves/gbc/Pokemon - Crystal Version (USA, Europe) (Rev 1).rtc",
+        );
+        let srm_key = save_selection_key(&srm);
+        let rtc_key = save_selection_key(&rtc);
+        assert_ne!(
+            srm_key, rtc_key,
+            ".srm and .rtc must have distinct selection keys (issue: Pokemon Crystal clock state was being dropped)"
+        );
+        // Sanity: same stem still produces deterministic per-extension keys.
+        assert_eq!(
+            rtc_key,
+            "pokemon - crystal version (usa, europe) (rev 1):rtc"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_separates_n64_controller_pak_from_battery_save() {
+        // N64 .mpk / .cpk = controller pak (separate save device, used for
+        // games like Mario Kart 64 ghost data, F-Zero X custom courses).
+        // .eep / .fla / .sra = main battery save. Must not dedup.
+        let eep = PathBuf::from("/saves/n64/Mario Kart 64 (USA).eep");
+        let mpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).mpk");
+        let cpk = PathBuf::from("/saves/n64/Mario Kart 64 (USA).cpk");
+        let eep_key = save_selection_key(&eep);
+        let mpk_key = save_selection_key(&mpk);
+        let cpk_key = save_selection_key(&cpk);
+        assert_ne!(eep_key, mpk_key, ".eep and .mpk must have distinct keys");
+        assert_ne!(eep_key, cpk_key, ".eep and .cpk must have distinct keys");
+        assert_ne!(
+            mpk_key, cpk_key,
+            ".mpk and .cpk must have distinct keys (different controller-pak slots)"
+        );
+    }
+
+    #[test]
+    fn save_selection_key_dedups_real_alternative_formats() {
+        // Regression guard: ALTERNATIVE formats of the same save (e.g. a
+        // user with both .sav and .srm versions of the same game) MUST
+        // still collide so dedup picks the preferred one.
+        let sav = PathBuf::from("/saves/snes/Super Mario World.sav");
+        let srm = PathBuf::from("/saves/snes/Super Mario World.srm");
+        assert_eq!(
+            save_selection_key(&sav),
+            save_selection_key(&srm),
+            "true alternative formats (.sav vs .srm of same game) must still dedup"
+        );
     }
 
     #[test]
@@ -3194,6 +5651,78 @@ mod tests {
             std::slice::from_ref(&root),
             true
         ));
+    }
+
+    // GBC-RTC clobber: a profile that targets the primary extension must not
+    // pull a sidecar onto it. An 8-byte clock state written over a 32 KiB
+    // cartridge save destroys the save.
+    #[test]
+    fn a_sidecar_restores_to_its_own_extension() {
+        let save = cloud_save(
+            "Pokemon - Crystal Version (USA, Europe) (Rev 1).rtc",
+            "Pokemon - Crystal Version",
+            "gameboy",
+            "gameboy/retroarch-gambatte",
+            ".srm",
+        );
+        assert_eq!(
+            cloud_target_extension(&save, Some("gameboy/retroarch-gambatte")).as_deref(),
+            Some("rtc"),
+            "the sidecar was mapped onto the profile's primary extension"
+        );
+    }
+
+    #[test]
+    fn a_primary_still_takes_the_profiles_extension() {
+        let save = cloud_save(
+            "Pokemon - Crystal Version (USA, Europe) (Rev 1).srm",
+            "Pokemon - Crystal Version",
+            "gameboy",
+            "gameboy/retroarch-gambatte",
+            ".srm",
+        );
+        assert_eq!(
+            cloud_target_extension(&save, Some("gameboy/retroarch-gambatte")).as_deref(),
+            Some("srm")
+        );
+    }
+
+    #[test]
+    fn existing_local_save_class_gate() {
+        // Controller paks are the format class that classifies on this tree --
+        // an `.rtc` is deliberately never a standalone save -- so they are what
+        // the gate can be proven on. Real files, because a missing path returns
+        // false for the wrong reason and proves nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("saves/n64");
+        fs::create_dir_all(&dir).unwrap();
+        let mpk = dir.join("Mario Kart 64 (USA)_1.mpk");
+        let cpk = dir.join("Mario Kart 64 (USA)_1.cpk");
+        fs::write(&mpk, vec![0xA5u8; 32768]).unwrap();
+        fs::write(&cpk, vec![0xA5u8; 32768]).unwrap();
+
+        // Same class is accepted: a present pak does not make the device fetch
+        // its own copy again. cpk is what the profile writes; mpk is the record.
+        assert!(
+            existing_local_save_is_valid(&cpk, "n64", true),
+            "a present sidecar was not accepted for a sidecar track"
+        );
+        assert!(
+            existing_local_save_is_valid(&mpk, "n64", true),
+            "a present controller pak of the record's own container was not accepted"
+        );
+
+        // A sidecar never satisfies a primary track: before the gate, any file
+        // the classifier accepted counted as "already present", so a pak stood
+        // in for a cartridge save that had been deleted.
+        assert!(
+            !existing_local_save_is_valid(&mpk, "n64", false),
+            "a controller pak satisfied a primary track's presence check"
+        );
+        assert!(
+            !existing_local_save_is_valid(&cpk, "n64", false),
+            "a controller pak satisfied a primary track's presence check"
+        );
     }
 
     fn cloud_save(
@@ -3228,6 +5757,110 @@ mod tests {
             metadata: None,
             rom_sha1: None,
             rom_md5: None,
+        }
+    }
+
+    fn arcade_nvram_save(set_name: &str, filename: &str) -> CloudSaveSummary {
+        let mut save = cloud_save(filename, set_name, "arcade", "original", "");
+        save.download_profiles.clear();
+        save.game = Some(crate::api::CloudSaveGame {
+            name: set_name.to_string(),
+            display_title: set_name.to_string(),
+            system: Some(crate::api::CloudSaveSystem {
+                slug: "arcade".to_string(),
+            }),
+        });
+        save
+    }
+
+    // RetroDECK's MAME core reads a set's NVRAM from <saves>/mame/mame/nvram/<set>/<file>, the
+    // folder MAME names by set and the chip file names by part. The cabinet's records carry the
+    // set as game.name and the chip file as filename (digdug, earom).
+    #[test]
+    fn an_arcade_nvram_record_restores_where_retroarchs_mame_reads_it() {
+        assert!(supports_cloud_restore_system("arcade"));
+        let save = arcade_nvram_save("digdug", "earom");
+        let target = cloud_target_path(
+            &save,
+            &[PathBuf::from("/home/deck/retrodeck/saves")],
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "arcade",
+            None,
+        );
+        assert_eq!(
+            target.to_string_lossy(),
+            "/home/deck/retrodeck/saves/mame/mame/nvram/digdug/earom"
+        );
+    }
+
+    // A set with several NVRAM chips is one record per chip; each goes in the set's own folder
+    // under its own name, with no extension added.
+    #[test]
+    fn each_chip_of_a_multi_file_arcade_set_keeps_its_own_name() {
+        for chip in ["m48t58", "29f016a.27h"] {
+            let save = arcade_nvram_save("ddr2m", chip);
+            let target = cloud_target_path(
+                &save,
+                &[PathBuf::from("/home/deck/retrodeck/saves")],
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                "arcade",
+                None,
+            );
+            assert_eq!(
+                target,
+                PathBuf::from("/home/deck/retrodeck/saves/mame/mame/nvram/ddr2m").join(chip)
+            );
+        }
+    }
+
+    // RetroSaveManager lists pc-engine as projection-capable and refuses a helper upload of it
+    // without a runtimeProfile (400), so every source must name one of its pc-engine profiles.
+    #[test]
+    fn runtime_target_names_a_pc_engine_profile_for_every_source() {
+        let cases = [
+            (
+                SourceKind::MisterFpga,
+                EmulatorProfile::Mister,
+                "mister",
+                "pc-engine/mister",
+            ),
+            (
+                SourceKind::RetroArch,
+                EmulatorProfile::RetroArch,
+                "retroarch",
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                SourceKind::SteamDeck,
+                EmulatorProfile::Generic,
+                "steamdeck",
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                SourceKind::Windows,
+                EmulatorProfile::Generic,
+                "windows",
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                SourceKind::Custom,
+                EmulatorProfile::Generic,
+                "custom",
+                "pc-engine/mednafen",
+            ),
+        ];
+        for (kind, profile, device, want) in cases {
+            // `tgfx16` is the slug the scanner gives a PC Engine save; `pc-engine` is the server's.
+            for slug in ["tgfx16", "pc-engine"] {
+                let target = runtime_target_for_system(&kind, &profile, slug, device);
+                assert_eq!(
+                    target.runtime_profile.as_deref(),
+                    Some(want),
+                    "{device} {slug}"
+                );
+            }
         }
     }
 
@@ -3292,16 +5925,54 @@ mod tests {
     }
 
     #[test]
+    fn classifies_permanent_rejections() {
+        let err = anyhow::Error::msg(
+            "HTTP request faalde: status=422 Unprocessable Entity body={\"reason\":\"unsupported\"}",
+        );
+        assert_eq!(permanent_rejection_status(&err), Some(422));
+    }
+
+    #[test]
+    fn rate_limit_and_timeout_are_not_permanent() {
+        for code in [408, 429] {
+            let err = anyhow::Error::msg(format!("status={code} Too Many Requests"));
+            assert_eq!(permanent_rejection_status(&err), None, "{code} must retry");
+        }
+    }
+
+    #[test]
+    fn server_errors_and_transport_failures_are_not_permanent() {
+        let err = anyhow::Error::msg("status=503 Service Unavailable");
+        assert_eq!(permanent_rejection_status(&err), None);
+        let err = anyhow::Error::msg("connection refused");
+        assert_eq!(permanent_rejection_status(&err), None);
+    }
+
+    #[test]
     fn runtime_target_returns_empty_for_non_projection_systems() {
+        // A system the server publishes no projection for stays empty. DS used
+        // to be in this test, which is how the missing profile became a silent
+        // 400 on every DS save: the assertion encoded the defect.
         let target = runtime_target_for_system(
             &SourceKind::RetroArch,
             &EmulatorProfile::RetroArch,
-            "nds",
+            "neogeo",
             "retroarch",
         );
         assert!(target.runtime_profile.is_none());
         assert!(target.system_profile_key.is_none());
         assert!(target.system_profile_value.is_none());
+
+        let nds = runtime_target_for_system(
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "nds",
+            "retroarch",
+        );
+        assert_eq!(
+            nds.runtime_profile.as_deref(),
+            Some("nds/retroarch-melonds")
+        );
     }
 
     #[test]
@@ -3730,6 +6401,33 @@ mod tests {
     }
 
     #[test]
+    fn a_dreamcast_record_restores_into_retrodecks_shared_vmu_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saves = tmp.path().join("retrodeck").join("saves");
+        let dc = tmp.path().join("retrodeck").join("bios").join("dc");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(dc.join("vmu_save_A1.bin"), vec![0u8; 131_072]).unwrap();
+        let mut save = cloud_save(
+            "vmu_save_A1.bin",
+            "Soulcalibur",
+            "dreamcast",
+            "original",
+            ".bin",
+        );
+        save.card_slot = Some("A1".to_string());
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&saves),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "dreamcast",
+            Some("bin"),
+        );
+        assert_eq!(target, dc.join("vmu_save_A1.bin"));
+    }
+
+    #[test]
     fn cloud_restore_prechecks_retroarch_preferred_extension_before_download() {
         let save = cloud_save(
             "Super Mario Bros. Deluxe.sav",
@@ -3763,6 +6461,287 @@ mod tests {
             existing_target.to_string_lossy(),
             "/userdata/saves/gb/Super Mario Bros. Deluxe.srm"
         );
+    }
+
+    #[test]
+    fn a_pass_names_the_systems_it_never_restores() {
+        let mut report = SyncReport::default();
+        assert_eq!(unrestored_systems_summary(&report), None);
+        report.unrestored_systems.insert("psp".to_string(), 2);
+        report.unrestored_systems.insert("arcade".to_string(), 34);
+        assert_eq!(
+            unrestored_systems_summary(&report).as_deref(),
+            Some("Not restored (this helper never restores these systems): arcade=34 psp=2")
+        );
+    }
+
+    #[test]
+    fn cloud_restore_accepts_every_system_the_server_holds() {
+        // A save another helper uploaded for one of these systems has to come
+        // back down; a system missing here is dropped before any target is chosen.
+        for (slug, filename, folder) in [
+            ("3do", "Star Control II (USA).srm", "3do"),
+            ("atari-jaguar", "Doom (World).srm", "atarijaguar"),
+            ("neogeo-cd", "Samurai Shodown RPG (Japan).srm", "neogeocd"),
+            (
+                "ngp",
+                "Baseball Stars - Pocket Sports Series (Japan, Europe) (En,Ja).flash",
+                "ngp",
+            ),
+            ("pc-engine", "Neutopia (USA).srm", "pcengine"),
+            ("virtualboy", "3-D Tetris (USA).srm", "virtualboy"),
+        ] {
+            assert!(
+                supports_cloud_restore_system(slug),
+                "{slug} is not restored"
+            );
+            let save = cloud_save(filename, "Game", slug, "original", ".srm");
+            let target = cloud_target_path(
+                &save,
+                &[PathBuf::from("/run/media/deck/retrodeck/saves")],
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                slug,
+                Path::new(filename)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+            );
+            assert_eq!(
+                target,
+                PathBuf::from("/run/media/deck/retrodeck/saves")
+                    .join(folder)
+                    .join(filename),
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_restore_uses_an_existing_alias_folder_for_ngp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        fs::create_dir_all(root.join("ngpc")).unwrap();
+        let filename = "Sonic the Hedgehog - Pocket Adventure (World).flash";
+        let save = cloud_save(filename, "Sonic", "ngp", "original", ".flash");
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "ngp",
+            Some("flash"),
+        );
+        assert_eq!(target, root.join("ngpc").join(filename));
+    }
+
+    fn psp_bundle_save(save_dir: &str) -> CloudSaveSummary {
+        let mut save = cloud_save(
+            &format!("{save_dir}.pspsave"),
+            "DISSIDIA FINAL FANTASY",
+            "psp",
+            "original",
+            ".pspsave",
+        );
+        save.metadata = Some(serde_json::json!({
+            "rsm": {"psp": {
+                "saveDir": save_dir,
+                "gameId": "ULUS10437",
+                "bundle": "savedata-zip",
+                "format": 1,
+                "files": ["DISSIDIA.BIN", "ICON0.PNG", "PARAM.SFO"]
+            }}
+        }));
+        save
+    }
+
+    #[test]
+    fn psp_restore_needs_a_savedata_bundle_record() {
+        // PPSSPP reads a game's save only from SAVEDATA/<dir>/, as a folder. A
+        // record holding one loose file restores none of it, whatever ids it names.
+        let loose = cloud_save("DISSIDIA.BIN", "DISSIDIA", "psp", "original", ".bin");
+        assert!(psp_restore_refusal(&loose, "psp").is_some());
+        assert_eq!(psp_restore_refusal(&loose, "snes"), None);
+
+        let mut game_id_only = loose.clone();
+        game_id_only.metadata = Some(serde_json::json!({"rsm": {"psp": {"gameId": "ULUS10437"}}}));
+        game_id_only.inspection =
+            Some(serde_json::json!({"semanticFields": {"gameId": "ULUS10437"}}));
+        assert!(psp_restore_refusal(&game_id_only, "psp").is_some());
+
+        let mut dir_but_not_bundle = loose.clone();
+        dir_but_not_bundle.metadata =
+            Some(serde_json::json!({"rsm": {"psp": {"saveDir": "ULUS10437GameData00"}}}));
+        assert!(psp_restore_refusal(&dir_but_not_bundle, "psp").is_some());
+
+        let mut escaping_dir = psp_bundle_save("ULUS10437GameData00");
+        escaping_dir.metadata = Some(serde_json::json!({
+            "rsm": {"psp": {"saveDir": "../ULUS10437GameData00", "bundle": "savedata-zip"}}
+        }));
+        assert!(psp_restore_refusal(&escaping_dir, "psp").is_some());
+
+        assert_eq!(
+            psp_restore_refusal(&psp_bundle_save("ULUS10437GameData00"), "psp"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_psp_bundle_restores_into_the_retrodeck_ppsspp_folder() {
+        // RetroDECK keeps PPSSPP's SAVEDATA at saves/PSP/PPSSPP-SA and links the
+        // emulator's own directory to it.
+        let save = psp_bundle_save("ULUS10437GameData00");
+        let root = PathBuf::from("/run/media/deck/retrodeck/saves");
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "psp",
+            Some("pspsave"),
+        );
+        assert_eq!(target, root.join("PSP/PPSSPP-SA/ULUS10437GameData00"));
+
+        // A folder that already exists under another spelling is the one used.
+        let tmp = tempfile::tempdir().unwrap();
+        let saves = tmp.path().join("saves");
+        fs::create_dir_all(saves.join("PSP/SAVEDATA")).unwrap();
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&saves),
+            &SourceKind::SteamDeck,
+            &EmulatorProfile::Generic,
+            "psp",
+            Some("pspsave"),
+        );
+        assert_eq!(target, saves.join("PSP/SAVEDATA/ULUS10437GameData00"));
+    }
+
+    fn psp_bundle_bytes(save_dir: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut entries: Vec<(String, Vec<u8>)> = vec![
+            ("DISSIDIA.BIN".to_string(), vec![0x5Au8; 2048]),
+            ("ICON0.PNG".to_string(), b"icon".to_vec()),
+            (
+                "PARAM.SFO".to_string(),
+                crate::scanner::param_sfo_fixture(save_dir),
+            ),
+        ];
+        for (name, bytes) in extra {
+            entries.push(((*name).to_string(), bytes.to_vec()));
+        }
+        crate::scanner::build_stored_zip(&entries).unwrap()
+    }
+
+    #[test]
+    fn a_psp_bundle_restore_writes_every_file_and_replaces_the_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let savedata = tmp.path().join("PSP/PPSSPP-SA");
+        let target = savedata.join("ULUS10437GameData00");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("DISSIDIA.BIN"), b"old").unwrap();
+        fs::write(target.join("OLD-ONLY.DAT"), b"gone after restore").unwrap();
+
+        let written =
+            restore_psp_savedata_bundle(&target, &psp_bundle_bytes("ULUS10437GameData00", &[]))
+                .unwrap();
+        assert_eq!(written, 3);
+        assert_eq!(
+            fs::read(target.join("DISSIDIA.BIN")).unwrap(),
+            vec![0x5Au8; 2048]
+        );
+        assert_eq!(fs::read(target.join("ICON0.PNG")).unwrap(), b"icon");
+        assert!(target.join("PARAM.SFO").is_file());
+        assert!(
+            !target.join("OLD-ONLY.DAT").exists(),
+            "the old folder was kept"
+        );
+        // No temp folder and no copy of the old one is left beside it.
+        let left: Vec<String> = fs::read_dir(&savedata)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["ULUS10437GameData00".to_string()]);
+    }
+
+    #[test]
+    fn a_psp_bundle_restore_refuses_an_entry_that_leaves_the_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let savedata = tmp.path().join("PSP/PPSSPP-SA");
+        fs::create_dir_all(&savedata).unwrap();
+        let target = savedata.join("ULUS10437GameData00");
+
+        let escaping = psp_bundle_bytes("ULUS10437GameData00", &[("../x", b"outside")]);
+        assert!(restore_psp_savedata_bundle(&target, &escaping).is_err());
+        assert!(!savedata.join("x").exists());
+        assert!(!tmp.path().join("PSP/x").exists());
+        assert!(!target.exists(), "a refused bundle wrote its folder");
+        assert_eq!(
+            fs::read_dir(&savedata).unwrap().count(),
+            0,
+            "temp folder left behind"
+        );
+
+        // PARAM.SFO has to name the folder the bundle is restored into.
+        let wrong_dir = psp_bundle_bytes("ULUS10437GameData01", &[]);
+        assert!(restore_psp_savedata_bundle(&target, &wrong_dir).is_err());
+        assert!(!target.exists());
+
+        // The SAVEDATA root is never created by a restore.
+        let missing_root = tmp.path().join("nowhere/SAVEDATA/ULUS10437GameData00");
+        assert!(
+            restore_psp_savedata_bundle(
+                &missing_root,
+                &psp_bundle_bytes("ULUS10437GameData00", &[])
+            )
+            .is_err()
+        );
+        assert!(!tmp.path().join("nowhere").exists());
+    }
+
+    #[test]
+    fn cloud_restore_puts_a_versioned_three_do_save_where_opera_reads_it() {
+        // Opera loads <save dir>/opera/per_game/<game>.<version>.srm first, and
+        // falls back to <save dir>/<game>.srm with no version. A
+        // "<game>.0.srm" written beside the content is read by neither.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("saves");
+        fs::create_dir_all(root.join("3do")).unwrap();
+        let versioned = "20th Century Video Almanac (USA).0.srm";
+        let save = cloud_save(versioned, "Almanac", "3do", "3do/retroarch-opera", ".srm");
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "3do",
+            Some("srm"),
+        );
+        assert_eq!(
+            target,
+            root.join("3do")
+                .join("opera")
+                .join("per_game")
+                .join(versioned)
+        );
+
+        // The unversioned name is the one Opera's fallback reads from the save
+        // directory itself, so it stays there.
+        let plain = "Star Control II (USA).srm";
+        let save = cloud_save(
+            plain,
+            "Star Control II",
+            "3do",
+            "3do/retroarch-opera",
+            ".srm",
+        );
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&root),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "3do",
+            Some("srm"),
+        );
+        assert_eq!(target, root.join("3do").join(plain));
     }
 
     #[test]
@@ -3876,6 +6855,23 @@ mod tests {
     }
 
     #[test]
+    fn a_ps1_card_named_after_its_game_is_its_own_slot() {
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/Tekken 3 (USA).srm")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/PSX/Tekken 3 (USA).sav")),
+            "Game: Tekken 3 (USA)".to_string()
+        );
+        // Numbered cards are shared and keep their number.
+        assert_eq!(
+            infer_playstation_slot_from_path(Path::new("/saves/psx/memory_card_1.mcr")),
+            "Memory Card 1".to_string()
+        );
+    }
+
+    #[test]
     fn resolves_dreamcast_slot_from_path() {
         assert_eq!(
             resolve_slot_name_for_sync(
@@ -3901,5 +6897,234 @@ mod tests {
             dreamcast_line_key("dreamcast", "retroarch", "A2"),
             "dc-line:dreamcast:retroarch:a2"
         );
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    #[test]
+    fn a_lock_names_its_owner() {
+        assert_eq!(super::lock_owner("pid=1234\nstarted_at=x\n"), Some(1234));
+        assert_eq!(super::lock_owner("started_at=x\n"), None);
+        assert_eq!(super::lock_owner("pid=abc\n"), None);
+    }
+
+    #[test]
+    fn of_two_takeovers_of_one_dead_lock_exactly_one_succeeds() {
+        let dir = std::env::temp_dir().join(format!("sgm-lock-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sync.lock");
+        std::fs::write(&path, "pid=4194303\nstarted_at=x\n").unwrap();
+        let first = super::SyncLock::take_over(&path, 4_194_303, "pid=1\n");
+        let second = super::SyncLock::take_over(&path, 4_194_303, "pid=2\n");
+        assert!(first.is_ok(), "the first takeover of a dead lock failed");
+        assert!(
+            second.is_err(),
+            "a second takeover deleted the first one's live lock"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "pid=1\n",
+            "the first sync's lock was replaced"
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_alive_tells_a_running_process_from_a_missing_one() {
+        assert!(
+            super::pid_alive(std::process::id()),
+            "this test's own process reads as dead"
+        );
+        assert!(
+            !super::pid_alive(4_194_303),
+            "a pid naming no process reads as alive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_profile_map {
+    use super::*;
+
+    // Every system the server treats as projection-capable needs a profile on
+    // the wire: the latest check, the upload and the download are all refused
+    // without one ("runtimeProfile is required"), which is how game boy and DS
+    // saves silently never synced. This table is the audit: a system with no
+    // arm, or an arm naming a profile the server does not publish, fails here
+    // rather than at a 400 on a device.
+    #[test]
+    fn every_supported_system_maps_to_a_published_profile() {
+        let cases = [
+            ("psx", EmulatorProfile::RetroArch, "psx/retroarch"),
+            ("ps2", EmulatorProfile::RetroArch, "ps2/pcsx2"),
+            ("n64", EmulatorProfile::Mister, "n64/mister"),
+            ("snes", EmulatorProfile::RetroArch, "snes/retroarch-snes9x"),
+            ("nes", EmulatorProfile::RetroArch, "nes/retroarch-nestopia"),
+            (
+                "gameboy",
+                EmulatorProfile::RetroArch,
+                "gameboy/retroarch-gambatte",
+            ),
+            ("gba", EmulatorProfile::RetroArch, "gba/retroarch-mgba"),
+            ("nds", EmulatorProfile::RetroArch, "nds/retroarch-melonds"),
+            (
+                "master-system",
+                EmulatorProfile::RetroArch,
+                "sms/retroarch-genesis-plus-gx",
+            ),
+            (
+                "genesis",
+                EmulatorProfile::RetroArch,
+                "genesis/retroarch-genesis-plus-gx",
+            ),
+            (
+                "game-gear",
+                EmulatorProfile::RetroArch,
+                "gamegear/retroarch-genesis-plus-gx",
+            ),
+            (
+                "sega-cd",
+                EmulatorProfile::RetroArch,
+                "sega-cd/retroarch-genesis-plus-gx",
+            ),
+            ("saturn", EmulatorProfile::RetroArch, "saturn/mednafen"),
+            (
+                "dreamcast",
+                EmulatorProfile::RetroArch,
+                "dreamcast/retroarch-flycast",
+            ),
+            (
+                "pc-engine",
+                EmulatorProfile::RetroArch,
+                "pc-engine/retroarch-beetle-pce",
+            ),
+            (
+                "atari-jaguar",
+                EmulatorProfile::RetroArch,
+                "atari-jaguar/retroarch-virtual-jaguar",
+            ),
+            ("3do", EmulatorProfile::RetroArch, "3do/retroarch-opera"),
+            // RSM#56 made these projection-capable and publishes one profile each.
+            ("ngp", EmulatorProfile::RetroArch, "ngp/mednafen"),
+            (
+                "virtualboy",
+                EmulatorProfile::RetroArch,
+                "virtualboy/mednafen",
+            ),
+            (
+                "neogeo-cd",
+                EmulatorProfile::RetroArch,
+                "neogeo-cd/retroarch",
+            ),
+        ];
+        for (system, profile, expected) in cases {
+            let got = projection_runtime_profile_for_system(
+                &SourceKind::RetroArch,
+                &profile,
+                system,
+                "retroarch",
+            );
+            assert_eq!(
+                got.as_deref(),
+                Some(expected),
+                "{system} has no profile on the wire"
+            );
+        }
+    }
+
+    // The slug an upload carries is the scanner's, taken from the folder the
+    // device writes. Drive the profile from that, not from the server's slug:
+    // #97's first test named "pc-engine" while the device sent "tgfx16".
+    #[test]
+    fn lynx_wonderswan_sg1000_and_colecovision_uploads_name_a_server_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (dir, name, size, expected) in [
+            (
+                "atarilynx",
+                "Gates of Zendocon (USA).srm",
+                128usize,
+                "atari-lynx/retroarch-handy",
+            ),
+            (
+                "wonderswancolor",
+                "Final Fantasy (Japan).srm",
+                65_536,
+                "wonderswan/retroarch-beetle-wswan",
+            ),
+            (
+                "sg-1000",
+                "Girl's Garden (Japan).sav",
+                8192,
+                "sg-1000/retroarch-genesis-plus-gx",
+            ),
+            (
+                "colecovision",
+                "Boxxle (USA).srm",
+                2048,
+                "colecovision/retroarch-gearcoleco",
+            ),
+        ] {
+            let path = tmp.path().join("saves").join(dir).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes: Vec<u8> = (0..size).map(|i| (i as u8).wrapping_mul(31) | 1).collect();
+            std::fs::write(&path, bytes).unwrap();
+            let slug = crate::scanner::infer_supported_console_slug(&path, None)
+                .unwrap_or_else(|| panic!("{dir}/{name} is not classified"));
+            let got = projection_runtime_profile_for_system(
+                &SourceKind::RetroArch,
+                &EmulatorProfile::RetroArch,
+                &slug,
+                "retroarch",
+            );
+            assert_eq!(got.as_deref(), Some(expected), "{dir}/{name} as {slug}");
+            assert!(
+                crate::sources::parse_systems(None, &SourceKind::RetroArch)
+                    .iter()
+                    .any(|s| crate::sources::same_system(s, &slug)),
+                "{slug} is not synced by default"
+            );
+        }
+    }
+
+    // A PC Engine save found where RetroDECK writes it is classified by the
+    // scanner, and that slug, not the server's "pc-engine", picks the profile.
+    // A Steam Deck or Windows source with a generic profile runs Beetle PCE
+    // under RetroArch; a plain "pc-engine" arm ahead of the grouped one
+    // answered mednafen for the server's slug.
+    #[test]
+    fn a_generic_desktop_pc_engine_save_names_beetle_pce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("saves")
+            .join("pcengine")
+            .join("Ballistix (USA).srm");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes: Vec<u8> = (0..2048usize)
+            .map(|i| (i as u8).wrapping_mul(31) | 1)
+            .collect();
+        std::fs::write(&path, bytes).unwrap();
+        let slug = crate::scanner::infer_supported_console_slug(&path, None).expect("classified");
+        for (kind, device) in [
+            (SourceKind::SteamDeck, "steamdeck"),
+            (SourceKind::Windows, "windows"),
+        ] {
+            for name in [slug.as_str(), "pc-engine"] {
+                assert_eq!(
+                    projection_runtime_profile_for_system(
+                        &kind,
+                        &EmulatorProfile::Generic,
+                        name,
+                        device
+                    )
+                    .as_deref(),
+                    Some("pc-engine/retroarch-beetle-pce"),
+                    "{device} {name}"
+                );
+            }
+        }
     }
 }
