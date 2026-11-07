@@ -1,6 +1,7 @@
 //! Saves an emulator keeps as a folder of files, not one file: Dolphin keeps a Wii title's
 //! save in its NAND at `title/<hi>/<lo>/data/`, and Vita3K keeps a Vita title's under
-//! `ux0/user/00/savedata/<TITLEID>/`. Each folder is synced as one record, packed the way a
+//! `ux0/user/00/savedata/<TITLEID>/`, and a PortMaster port keeps its own under
+//! `ports/<port>/conf/`. Each folder is synced as one record, packed the way a
 //! PPSSPP SAVEDATA folder is (`pack_psp_savedata`), with `folderSaveDir` naming the folder so
 //! any device can put it back in the same place.
 
@@ -20,6 +21,10 @@ pub enum FolderSaveKind {
     WiiNand,
     /// A Vita3K savedata folder: `<root>/<TITLEID>/`. `folderSaveDir` is the title ID.
     Vita3k,
+    /// A PortMaster port's `conf/` folder: `<ports>/<port>/conf/`, where the port's engine
+    /// keeps its save (`conf/love/<Game>/` for LÖVE, `conf/godot/app_userdata/<Game>/` for
+    /// Godot). `folderSaveDir` is the port's name: port.json's `name` without `.zip`.
+    PortConf,
 }
 
 impl FolderSaveKind {
@@ -27,6 +32,7 @@ impl FolderSaveKind {
         match self {
             FolderSaveKind::WiiNand => "wii",
             FolderSaveKind::Vita3k => "psvita",
+            FolderSaveKind::PortConf => "ports",
         }
     }
 
@@ -46,6 +52,13 @@ impl FolderSaveKind {
                     .join("00")
                     .join("savedata"),
             ],
+            // A Ports source's save root is the ports folder itself, PortMaster's folder
+            // above it, or the RetroDECK home above that.
+            FolderSaveKind::PortConf => vec![
+                save_root.to_path_buf(),
+                save_root.join("ports"),
+                save_root.join("PortMaster").join("ports"),
+            ],
         }
     }
 
@@ -60,6 +73,22 @@ impl FolderSaveKind {
             .unwrap_or_else(|| roots[0].clone())
     }
 
+    /// The emulator's folder a record for `save_dir` restores under. For a port, the ports
+    /// folder that holds that port; otherwise [`Self::root_under`].
+    pub fn restore_root_under(self, save_root: &Path, save_dir: &str) -> PathBuf {
+        match self {
+            FolderSaveKind::PortConf => {
+                let roots = self.roots_under(save_root);
+                roots
+                    .iter()
+                    .find(|root| root.join(save_dir).join("port.json").is_file())
+                    .cloned()
+                    .unwrap_or_else(|| roots[0].clone())
+            }
+            _ => self.root_under(save_root),
+        }
+    }
+
     /// The folder a record restores into, under the emulator's folder.
     pub fn folder_for(self, emulator_root: &Path, save_dir: &str) -> Option<PathBuf> {
         if !valid_folder_save_dir(self, save_dir) {
@@ -71,6 +100,7 @@ impl FolderSaveKind {
                 emulator_root.join("title").join(hi).join(lo).join("data")
             }
             FolderSaveKind::Vita3k => emulator_root.join(save_dir),
+            FolderSaveKind::PortConf => emulator_root.join(save_dir).join("conf"),
         })
     }
 
@@ -78,6 +108,7 @@ impl FolderSaveKind {
         match slug {
             "wii" => Some(FolderSaveKind::WiiNand),
             "psvita" => Some(FolderSaveKind::Vita3k),
+            "ports" => Some(FolderSaveKind::PortConf),
             _ => None,
         }
     }
@@ -87,8 +118,70 @@ impl FolderSaveKind {
         match self {
             FolderSaveKind::WiiNand => "wiinand",
             FolderSaveKind::Vita3k => "vitasave",
+            FolderSaveKind::PortConf => "portconf",
         }
     }
+
+    /// A file or folder the emulator writes that is not part of the save. A port writes its
+    /// logs into `conf/`; they change every launch and are never carried.
+    fn leaves_out(self, name: &str, is_dir: bool) -> bool {
+        match self {
+            FolderSaveKind::WiiNand | FolderSaveKind::Vita3k => false,
+            FolderSaveKind::PortConf => {
+                if is_dir {
+                    name == "logs"
+                } else {
+                    name == ".gitkeep" || name == "log.txt" || name.ends_with(".log")
+                }
+            }
+        }
+    }
+
+    /// Whether a restore may write `target` under `emulator_root`. Dolphin's NAND and
+    /// Vita3K's savedata folder must exist; a port must be installed (its folder holds
+    /// port.json), so a record never creates a port that is not on the device.
+    pub fn restore_target_ready(self, emulator_root: &Path, target: &Path) -> bool {
+        match self {
+            FolderSaveKind::WiiNand | FolderSaveKind::Vita3k => emulator_root.is_dir(),
+            FolderSaveKind::PortConf => target
+                .parent()
+                .map(|port| port.join("port.json").is_file())
+                .unwrap_or(false),
+        }
+    }
+
+    /// Whether the device already holds this save, so the upload pass compares it rather
+    /// than a cloud-only restore writing it. A port ships an empty `conf/` (a `.gitkeep`), so
+    /// for a port only a save file counts.
+    pub fn holds_save(self, target: &Path) -> bool {
+        match self {
+            FolderSaveKind::WiiNand | FolderSaveKind::Vita3k => target.is_dir(),
+            FolderSaveKind::PortConf => has_save_file(self, target),
+        }
+    }
+}
+
+/// A port's name as its save is keyed: port.json's `name` without `.zip`, one plain
+/// lowercase folder name.
+fn is_port_name(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+        && !value.contains("..")
+}
+
+/// The name in a port folder's port.json, without `.zip`: `curseofthearrow.zip` keys as
+/// `curseofthearrow`. None when there is no port.json or it names no port.
+fn port_json_name(port_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(port_dir.join("port.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let name = value.get("name")?.as_str()?.trim();
+    let name = name.strip_suffix(".zip").unwrap_or(name);
+    Some(name.to_string())
 }
 
 /// The NAND title groups that hold game saves: discs (00010000), channels and WiiWare
@@ -119,6 +212,7 @@ pub fn valid_folder_save_dir(kind: FolderSaveKind, save_dir: &str) -> bool {
             .map(|(hi, lo)| is_hex8(hi) && is_hex8(lo) && WII_GAME_TITLE_GROUPS.contains(&hi))
             .unwrap_or(false),
         FolderSaveKind::Vita3k => is_vita_title_id(save_dir),
+        FolderSaveKind::PortConf => is_port_name(save_dir),
     }
 }
 
@@ -147,6 +241,25 @@ impl FolderSave {
 
 pub fn folder_line_key(kind: FolderSaveKind, save_dir: &str) -> String {
     format!("{}-folder:{}", kind.system_slug(), save_dir)
+}
+
+/// True when a folder or any folder in it holds a file the kind carries: a port's `conf/`
+/// holding only a `.gitkeep` or logs is not a save.
+fn has_save_file(kind: FolderSaveKind, dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                match entry.file_type() {
+                    Ok(t) if t.is_file() => !kind.leaves_out(&name, false),
+                    Ok(t) if t.is_dir() => {
+                        !kind.leaves_out(&name, true) && has_save_file(kind, &entry.path())
+                    }
+                    _ => false,
+                }
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// True when a folder or any folder in it holds a regular file: a folder an emulator made
@@ -223,12 +336,50 @@ pub fn discover_folder_saves(save_roots: &[PathBuf]) -> Vec<FolderSave> {
     out
 }
 
+/// Every PortMaster port under `save_roots` whose `conf/` holds a save: each folder with a
+/// port.json naming it, whose folder name is that name. A port named otherwise is left out,
+/// since a restore puts the save back by name.
+pub fn discover_port_conf_saves(save_roots: &[PathBuf]) -> Vec<FolderSave> {
+    let kind = FolderSaveKind::PortConf;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for save_root in save_roots {
+        for ports in kind.roots_under(save_root) {
+            for (dir_name, port_dir) in sorted_subdirs(&ports) {
+                let Some(name) = port_json_name(&port_dir) else {
+                    continue;
+                };
+                if name != dir_name || !is_port_name(&name) {
+                    if !name.is_empty() && has_save_file(kind, &port_dir.join("conf")) {
+                        eprintln!(
+                            "Leaving port {} out: port.json names it {:?}, not a plain lowercase name matching its folder",
+                            port_dir.display(),
+                            name
+                        );
+                    }
+                    continue;
+                }
+                let conf = port_dir.join("conf");
+                if has_save_file(kind, &conf) && seen.insert(conf.clone()) {
+                    out.push(FolderSave {
+                        kind,
+                        save_dir: name,
+                        path: conf,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The emulator folder a discovered folder save sits in, so a restore over it writes back
 /// to the same place: the NAND root above `title/<hi>/<lo>/data`, or the Vita3K savedata root.
 pub fn emulator_root_of(save: &FolderSave) -> Option<PathBuf> {
     let levels = match save.kind {
         FolderSaveKind::WiiNand => 4,
         FolderSaveKind::Vita3k => 1,
+        FolderSaveKind::PortConf => 2,
     };
     save.path.ancestors().nth(levels).map(Path::to_path_buf)
 }
@@ -241,7 +392,20 @@ pub const FOLDER_SAVE_MAX_BYTES: u64 = 64 << 20;
 /// folder (`sce_sys/param.sfo`) and its size, sorted by path. Symlinks and other entries
 /// are not save files and are left out.
 pub fn folder_save_files(dir: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
-    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf, u64)>) -> Result<()> {
+    folder_save_files_of(FolderSaveKind::WiiNand, dir)
+}
+
+/// [`folder_save_files`], leaving out what the kind does not carry (a port's logs).
+pub fn folder_save_files_of(
+    kind: FolderSaveKind,
+    dir: &Path,
+) -> Result<Vec<(String, PathBuf, u64)>> {
+    fn walk(
+        save_kind: FolderSaveKind,
+        dir: &Path,
+        prefix: &str,
+        out: &mut Vec<(String, PathBuf, u64)>,
+    ) -> Result<()> {
         for entry in fs::read_dir(dir)
             .with_context(|| format!("cannot read save folder: {}", dir.display()))?
         {
@@ -259,12 +423,15 @@ pub fn folder_save_files(dir: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
                 );
             }
             let relative = format!("{prefix}{name}");
-            let kind = entry
+            let file_type = entry
                 .file_type()
                 .with_context(|| format!("cannot read {}", entry.path().display()))?;
-            if kind.is_dir() {
-                walk(&entry.path(), &format!("{relative}/"), out)?;
-            } else if kind.is_file() {
+            if save_kind.leaves_out(&name, file_type.is_dir()) {
+                continue;
+            }
+            if file_type.is_dir() {
+                walk(save_kind, &entry.path(), &format!("{relative}/"), out)?;
+            } else if file_type.is_file() {
                 let size = entry
                     .metadata()
                     .with_context(|| format!("cannot read {}", entry.path().display()))?
@@ -280,7 +447,7 @@ pub fn folder_save_files(dir: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
         Ok(())
     }
     let mut out = Vec::new();
-    walk(dir, "", &mut out)?;
+    walk(kind, dir, "", &mut out)?;
     out.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(out)
 }
@@ -289,8 +456,13 @@ pub fn folder_save_files(dir: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
 /// sha256: the deterministic stored zip a PSP SAVEDATA folder uses, with each file named by
 /// its relative path, so equal folders always hash equal.
 pub fn pack_folder_save(dir: &Path) -> Result<(Vec<u8>, String)> {
+    pack_folder_save_of(FolderSaveKind::WiiNand, dir)
+}
+
+/// [`pack_folder_save`], leaving out what the kind does not carry (a port's logs).
+pub fn pack_folder_save_of(kind: FolderSaveKind, dir: &Path) -> Result<(Vec<u8>, String)> {
     let mut entries = Vec::new();
-    for (relative, path, _) in folder_save_files(dir)? {
+    for (relative, path, _) in folder_save_files_of(kind, dir)? {
         let bytes =
             fs::read(&path).with_context(|| format!("cannot read file: {}", path.display()))?;
         entries.push((relative, bytes));
@@ -683,6 +855,137 @@ mod tests {
         for bad in ["pcse00746", "PCSE0074", "../PCSE00746"] {
             assert!(
                 FolderSaveKind::Vita3k.folder_for(root, bad).is_none(),
+                "{bad}"
+            );
+        }
+    }
+
+    fn write_port(ports: &Path, dir: &str, zip_name: &str) -> PathBuf {
+        let port = ports.join(dir);
+        write(
+            &port.join("port.json"),
+            format!("{{\"version\": 4, \"name\": \"{zip_name}\"}}").as_bytes(),
+        );
+        port
+    }
+
+    #[test]
+    fn a_portmaster_port_conf_folder_is_one_save_keyed_by_its_port_name_without_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let ports = root.path().join("PortMaster/ports");
+        // LÖVE: conf/love/<Game>/; Godot: conf/godot/app_userdata/<Game>/ with logs.
+        let arrow = write_port(&ports, "curseofthearrow", "curseofthearrow.zip");
+        write(&arrow.join("conf/love/CurseOfTheArrow/.gitkeep"), b"");
+        write(
+            &arrow.join("conf/love/CurseOfTheArrow/save.lua"),
+            b"return {7}",
+        );
+        let tower = write_port(&ports, "atowerintheforest", "atowerintheforest.zip");
+        let game = tower.join("conf/godot/app_userdata/A Tower in the Forest");
+        write(&game.join("save_data.dat"), b"tower progress");
+        write(&game.join("logs/godot.log"), b"launch log");
+        write(&tower.join("log.txt"), b"port log");
+        // An installed port that never wrote a save: only the shipped .gitkeep and a log.
+        let fresh = write_port(&ports, "superhexagon", "superhexagon.zip");
+        write(&fresh.join("conf/SuperHexagon/.gitkeep"), b"");
+        write(&fresh.join("conf/run.log"), b"log");
+        // A folder with no port.json is not a port.
+        write(&ports.join("autoinstall/conf/x.dat"), b"x");
+
+        let found = discover_port_conf_saves(&[root.path().to_path_buf()]);
+        let names: Vec<&str> = found.iter().map(|save| save.save_dir.as_str()).collect();
+        assert_eq!(names, vec!["atowerintheforest", "curseofthearrow"]);
+        assert!(found.iter().all(|save| save.kind.system_slug() == "ports"));
+        assert_eq!(found[1].path, arrow.join("conf"));
+        assert_eq!(found[1].line_key(), "ports-folder:curseofthearrow");
+        assert_eq!(emulator_root_of(&found[1]).unwrap(), ports);
+
+        let files: Vec<String> = folder_save_files_of(FolderSaveKind::PortConf, &found[0].path)
+            .unwrap()
+            .into_iter()
+            .map(|(relative, _, _)| relative)
+            .collect();
+        assert_eq!(
+            files,
+            vec!["godot/app_userdata/A Tower in the Forest/save_data.dat".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_ports_save_root_may_be_the_ports_folder_portmaster_or_the_retrodeck_home() {
+        for layout in ["", "ports", "PortMaster/ports"] {
+            let root = tempfile::tempdir().unwrap();
+            let ports = root.path().join(layout);
+            let arrow = write_port(&ports, "curseofthearrow", "curseofthearrow.zip");
+            write(
+                &arrow.join("conf/love/CurseOfTheArrow/save.lua"),
+                b"return {7}",
+            );
+            let found = discover_port_conf_saves(&[root.path().to_path_buf()]);
+            assert_eq!(found.len(), 1, "{layout}");
+            assert_eq!(found[0].save_dir, "curseofthearrow", "{layout}");
+        }
+    }
+
+    #[test]
+    fn a_port_conf_bundle_restores_only_into_an_installed_port_and_round_trips() {
+        let device_a = tempfile::tempdir().unwrap();
+        let arrow_a = write_port(device_a.path(), "curseofthearrow", "curseofthearrow.zip");
+        write(
+            &arrow_a.join("conf/love/CurseOfTheArrow/save.lua"),
+            b"return {7}",
+        );
+        write(&arrow_a.join("conf/love/CurseOfTheArrow/run.log"), b"log");
+        let (bundle, sha) =
+            pack_folder_save_of(FolderSaveKind::PortConf, &arrow_a.join("conf")).unwrap();
+
+        let device_b = tempfile::tempdir().unwrap();
+        let ports_b = device_b.path().join("PortMaster/ports");
+        let kind = FolderSaveKind::PortConf;
+        let root = kind.restore_root_under(device_b.path(), "curseofthearrow");
+        let target = kind.folder_for(&root, "curseofthearrow").unwrap();
+        assert!(
+            !kind.restore_target_ready(&root, &target),
+            "port not installed"
+        );
+
+        let arrow_b = write_port(&ports_b, "curseofthearrow", "curseofthearrow.zip");
+        write(&arrow_b.join("conf/love/CurseOfTheArrow/.gitkeep"), b"");
+        let root = kind.restore_root_under(device_b.path(), "curseofthearrow");
+        assert_eq!(root, ports_b);
+        let target = kind.folder_for(&root, "curseofthearrow").unwrap();
+        assert_eq!(target, arrow_b.join("conf"));
+        assert!(
+            !kind.holds_save(&target),
+            "a shipped .gitkeep is not a save"
+        );
+        assert!(kind.restore_target_ready(&root, &target));
+        assert_eq!(restore_folder_save(&root, &target, &bundle).unwrap(), 1);
+        assert_eq!(
+            fs::read(target.join("love/CurseOfTheArrow/save.lua")).unwrap(),
+            b"return {7}"
+        );
+        assert!(kind.holds_save(&target));
+        assert_eq!(pack_folder_save_of(kind, &target).unwrap().1, sha);
+    }
+
+    #[test]
+    fn only_plain_lowercase_port_names_name_a_port_restore_target() {
+        let root = Path::new("/ports");
+        assert_eq!(
+            FolderSaveKind::PortConf.folder_for(root, "curseofthearrow"),
+            Some(PathBuf::from("/ports/curseofthearrow/conf"))
+        );
+        for bad in [
+            "../etc",
+            "curse/arrow",
+            "CurseOfTheArrow",
+            ".hidden",
+            "",
+            "a..b",
+        ] {
+            assert!(
+                FolderSaveKind::PortConf.folder_for(root, bad).is_none(),
                 "{bad}"
             );
         }

@@ -11,9 +11,9 @@ use crate::api::{
 use crate::backend_config::sync_config_with_backend;
 use crate::config::AppConfig;
 use crate::folder_saves::{
-    FOLDER_SAVE_MAX_BYTES, FolderSave, FolderSaveKind, discover_folder_saves, emulator_root_of,
-    folder_line_key, folder_save_files, pack_folder_save, restore_folder_save,
-    valid_folder_save_dir,
+    FOLDER_SAVE_MAX_BYTES, FolderSave, FolderSaveKind, discover_folder_saves,
+    discover_port_conf_saves, emulator_root_of, folder_line_key, folder_save_files_of,
+    pack_folder_save_of, restore_folder_save, valid_folder_save_dir,
 };
 use crate::ports::{PortSaveMatch, discover_port_save_matches};
 use crate::scanner::{
@@ -339,6 +339,51 @@ pub fn run_sync(
                     }
                 }
             }
+            // With FOLDER_SAVE_BUNDLES on, each PortMaster port's conf/ folder is one save.
+            if config.folder_save_bundles {
+                let conf_saves = discover_port_conf_saves(&source.save_roots);
+                if verbose {
+                    eprintln!(
+                        "Source '{}' ({}) discovered {} PortMaster conf folder(s)",
+                        source.name,
+                        source.kind.as_str(),
+                        conf_saves.len()
+                    );
+                }
+                report.scanned += conf_saves.len();
+                for conf_save in &conf_saves {
+                    let state_key = conf_save.path.to_string_lossy().to_string();
+                    let result = process_folder_save(
+                        &api,
+                        conf_save,
+                        sync_state
+                            .entries
+                            .get(&state_key)
+                            .map(|entry| entry.sha256.as_str()),
+                        &fingerprint,
+                        &source.name,
+                        &source.kind,
+                        &source.profile,
+                        &source.systems,
+                        app_password,
+                        options,
+                        &mut report,
+                        verbose,
+                    );
+                    match result {
+                        Ok(Some(processed)) => {
+                            sync_state
+                                .entries
+                                .insert(processed.state_key, processed.entry);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            report.errors += 1;
+                            eprintln!("Sync error for {}: {}", conf_save.path.display(), err);
+                        }
+                    }
+                }
+            }
         } else {
             // With PSP_SAVEDATA_BUNDLES on, a PPSSPP SAVEDATA folder is one save and its files
             // are not discovered on their own.
@@ -609,11 +654,12 @@ pub fn run_sync(
                 {
                     return None;
                 }
-                // A SAVEDATA folder is a bundle, not a file: the cloud-only pass restores it.
+                // A SAVEDATA folder or a port's conf/ folder is a bundle, not a file: the
+                // cloud-only pass restores it.
                 if entry
                     .rom_sha1
                     .as_deref()
-                    .map(|key| key.starts_with("psp-savedir:"))
+                    .map(|key| key.starts_with("psp-savedir:") || key.starts_with("ports-folder:"))
                     .unwrap_or(false)
                 {
                     return None;
@@ -5032,7 +5078,7 @@ fn process_folder_save(
         }
         return Ok(None);
     }
-    let folder_bytes: u64 = folder_save_files(&save.path)?
+    let folder_bytes: u64 = folder_save_files_of(save.kind, &save.path)?
         .iter()
         .map(|(_, _, size)| size)
         .sum();
@@ -5047,7 +5093,7 @@ fn process_folder_save(
         );
         return Ok(None);
     }
-    let (bytes, local_sha) = pack_folder_save(&save.path)?;
+    let (bytes, local_sha) = pack_folder_save_of(save.kind, &save.path)?;
     let state_key = save.path.to_string_lossy().to_string();
     let rom_key = save.line_key();
     let filename = save.filename();
@@ -5202,15 +5248,15 @@ fn restore_cloud_folder_save(
         return Ok(false);
     };
     let root = select_cloud_restore_root(save_roots);
-    let emulator_root = kind.root_under(root);
+    let emulator_root = kind.restore_root_under(root, &save_dir);
     let Some(target) = kind.folder_for(&emulator_root, &save_dir) else {
         return Ok(false);
     };
     let target_key = target.to_string_lossy().to_string();
-    if restored_targets.contains(&target_key) || target.is_dir() {
+    if restored_targets.contains(&target_key) || kind.holds_save(&target) {
         return Ok(true);
     }
-    if !emulator_root.is_dir() {
+    if !kind.restore_target_ready(&emulator_root, &target) {
         report.skipped += 1;
         if verbose {
             eprintln!(
