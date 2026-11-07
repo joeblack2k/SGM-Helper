@@ -39,6 +39,7 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "saturn",
     "dreamcast",
     "neogeo",
+    "pc-engine",
     "wii",
     "psx",
     "ps2",
@@ -47,14 +48,29 @@ const ALL_SYNC_SYSTEMS: &[&str] = &[
     "ps3",
     "ps4",
     "ps5",
+    "3ds",
+    "neogeo-cd",
+    "ngp",
+    "virtualboy",
+    "atari-lynx",
+    "wonderswan",
+    "sg-1000",
+    "colecovision",
 ];
 
+/// A MiSTer source's default systems: the ones MiSTer has cores for. From
+/// joeblack2k 867d314b: "MiSTer defaults now exclude non-MiSTer systems such
+/// as Wii and PS2". Those stay out unless SYSTEMS names them; PC Engine is in
+/// because MiSTer has a TurboGrafx-16 core.
 const MISTER_SYNC_SYSTEMS: &[&str] = &[
     "nes",
     "snes",
     "gameboy",
     "gba",
     "n64",
+    "neogeo-cd",
+    "ngp",
+    "virtualboy",
     "genesis",
     "master-system",
     "game-gear",
@@ -62,7 +78,12 @@ const MISTER_SYNC_SYSTEMS: &[&str] = &[
     "sega-32x",
     "saturn",
     "neogeo",
+    "pc-engine",
     "psx",
+    "atari-lynx",
+    "wonderswan",
+    "sg-1000",
+    "colecovision",
 ];
 
 const PORT_SYNC_SYSTEMS: &[&str] = &["ports"];
@@ -171,7 +192,7 @@ fn system_list_from(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
-fn parse_systems(value: Option<&String>, kind: &SourceKind) -> Vec<String> {
+pub(crate) fn parse_systems(value: Option<&String>, kind: &SourceKind) -> Vec<String> {
     let Some(raw) = value.map(|value| value.trim()) else {
         return default_systems_for_kind(kind);
     };
@@ -219,12 +240,20 @@ fn normalize_system_slug(value: &str) -> Option<String> {
         "nds" | "nintendods" | "ds" => "nds",
         "genesis" | "megadrive" | "md" => "genesis",
         "mastersystem" | "sms" => "master-system",
+        "pcengine" | "pce" | "tgfx16" | "tg16" | "turbografx" | "turbografx16" => "pc-engine",
         "gamegear" | "gg" => "game-gear",
         "segacd" | "megacd" | "megadrivecd" => "sega-cd",
         "sega32x" | "32x" | "megadrive32x" => "sega-32x",
         "saturn" | "segasaturn" => "saturn",
         "dreamcast" | "dc" => "dreamcast",
         "neogeo" | "mvs" | "aes" => "neogeo",
+        "neogeocd" | "neocd" => "neogeo-cd",
+        "ngp" | "ngpc" | "neogeopocket" | "neogeopocketcolor" => "ngp",
+        "virtualboy" | "vb" => "virtualboy",
+        "atarilynx" | "lynx" => "atari-lynx",
+        "wonderswan" | "wonderswancolor" | "ws" | "wsc" | "wswan" => "wonderswan",
+        "sg1000" | "segasg1000" | "sg" => "sg-1000",
+        "colecovision" | "coleco" => "colecovision",
         "wii" | "nintendowii" | "dolphin" => "wii",
         "psx" | "ps1" | "playstation" | "playstation1" => "psx",
         "ps2" | "playstation2" => "ps2",
@@ -234,10 +263,13 @@ fn normalize_system_slug(value: &str) -> Option<String> {
         "ps4" | "playstation4" => "ps4",
         "ps5" | "playstation5" => "ps5",
         "ports" | "port" | "nativeports" | "nativeport" | "decompports" | "decompport" => "ports",
+        // Arcade NVRAM is opt-in per source (SYSTEMS names it); it isn't in any default list.
+        "arcade" | "mame" => "arcade",
         _ => {
             let candidate = token.split_whitespace().collect::<Vec<_>>().join("-");
             if ALL_SYNC_SYSTEMS.contains(&candidate.as_str())
                 || MISTER_SYNC_SYSTEMS.contains(&candidate.as_str())
+                || crate::scanner::SCANNER_SYSTEM_SLUGS.contains(&candidate.as_str())
                 || PORT_SYNC_SYSTEMS.contains(&candidate.as_str())
             {
                 return Some(candidate);
@@ -258,6 +290,13 @@ pub struct Source {
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
     pub systems: Vec<String>,
+    /// Per-system live-save subdirectory, relative to the source's save root.
+    /// A device that sorts saves by core writes them somewhere other than the
+    /// system directory, and only the operator knows which directory that is.
+    /// The helper reads this key and never writes it: a suggestion in a log is
+    /// evidence, a value the client writes for itself is a guess that outlives
+    /// the evidence.
+    pub save_subdirs: BTreeMap<String, PathBuf>,
     pub create_missing_system_dirs: bool,
     pub managed: bool,
     pub origin: String,
@@ -274,6 +313,13 @@ pub struct ResolvedSource {
     pub rom_roots: Vec<PathBuf>,
     pub recursive: bool,
     pub systems: Vec<String>,
+    /// Per-system live-save subdirectory, relative to the source's save root.
+    /// A device that sorts saves by core writes them somewhere other than the
+    /// system directory, and only the operator knows which directory that is.
+    /// The helper reads this key and never writes it: a suggestion in a log is
+    /// evidence, a value the client writes for itself is a guess that outlives
+    /// the evidence.
+    pub save_subdirs: BTreeMap<String, PathBuf>,
     pub create_missing_system_dirs: bool,
     pub managed: bool,
     pub origin: String,
@@ -371,6 +417,7 @@ impl Source {
             rom_roots,
             recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: false,
             origin: "manual".to_string(),
@@ -398,6 +445,7 @@ impl Source {
             rom_roots: vec![rom_path],
             recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: true,
             origin,
@@ -411,23 +459,43 @@ impl Source {
     }
 
     pub fn resolve(&self, binary_dir: &Path) -> ResolvedSource {
+        let save_roots: Vec<PathBuf> = self
+            .save_roots
+            .iter()
+            .map(|path| resolve_path(binary_dir, path))
+            .collect();
+        // A stored config can carry a ROM path that is the source's own save
+        // root -- an auto-created default used to write one. Indexing saves as
+        // ROMs is never right, and the config is not the operator's to edit by
+        // hand, so the root is dropped with a line instead.
+        let rom_roots: Vec<PathBuf> = self
+            .rom_roots
+            .iter()
+            .map(|path| resolve_path(binary_dir, path))
+            .filter(|root| {
+                let key = directory_key(root);
+                if save_roots.iter().any(|save| directory_key(save) == key) {
+                    eprintln!(
+                        "Ignoring ROM root {} in source '{}': it is the source's own save root",
+                        root.display(),
+                        self.name
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         ResolvedSource {
             id: self.id.clone(),
             name: self.name.clone(),
             kind: self.kind.clone(),
             profile: self.profile.clone(),
-            save_roots: self
-                .save_roots
-                .iter()
-                .map(|path| resolve_path(binary_dir, path))
-                .collect(),
-            rom_roots: self
-                .rom_roots
-                .iter()
-                .map(|path| resolve_path(binary_dir, path))
-                .collect(),
+            save_roots,
+            rom_roots,
             recursive: self.recursive,
             systems: self.systems.clone(),
+            save_subdirs: self.save_subdirs.clone(),
             create_missing_system_dirs: self.create_missing_system_dirs,
             managed: self.managed,
             origin: self.origin.clone(),
@@ -547,6 +615,7 @@ pub fn migrate_legacy_sources_if_needed(config: &AppConfig, verbose: bool) -> Re
             rom_roots: vec![rom_path],
             recursive: item.recursive,
             systems,
+            save_subdirs: BTreeMap::new(),
             create_missing_system_dirs: false,
             managed: false,
             origin: "legacy-migrated".to_string(),
@@ -657,6 +726,31 @@ pub fn prepare_sources_for_sync(
     resolved_sources_or_default(&store, config, default_kind)
 }
 
+/// A comparison key for a directory path.
+///
+/// A stored config can spell the same directory two ways -- `…\.\saves` and
+/// `…\saves` both came from this helper -- and `PathBuf` equality does not see
+/// through the difference. Curdir components are dropped, trailing separators
+/// with them, and case is folded on Windows, where the filesystem does.
+fn directory_key(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_string_lossy().to_string()),
+        }
+    }
+    let joined = parts.join("/");
+    if cfg!(windows) {
+        joined.to_ascii_lowercase()
+    } else {
+        joined
+    }
+}
+
 pub fn resolved_sources_or_default(
     store: &SourceStore,
     config: &AppConfig,
@@ -706,11 +800,15 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
             vec![root.clone()],
             true,
         ),
+        // No ROM root: the save root is the only directory a default knows
+        // about, and using it for both indexed save files as ROMs and logged a
+        // missing ROM root on every pass. A ROM lookup without an index falls
+        // back to the server, which is what it does for an unknown stem anyway.
         SourceKind::Windows => Source::new(
             "default-windows".to_string(),
             SourceKind::Windows,
             vec![root.clone()],
-            vec![root.clone()],
+            Vec::new(),
             true,
         ),
         SourceKind::SteamDeck => {
@@ -727,7 +825,7 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
                     "default-steamdeck".to_string(),
                     SourceKind::SteamDeck,
                     vec![root.clone()],
-                    vec![root],
+                    Vec::new(),
                     true,
                 )
             }
@@ -743,7 +841,7 @@ pub fn default_source(config: &AppConfig, kind: SourceKind) -> Result<Source> {
             "default-custom".to_string(),
             SourceKind::Custom,
             vec![root.clone()],
-            vec![root],
+            Vec::new(),
             true,
         ),
     };
@@ -1172,6 +1270,65 @@ pub fn resolve_path(binary_dir: &Path, value: &Path) -> PathBuf {
     }
 }
 
+/// Names one system goes by: the server's slug first, then the names a
+/// scanner or a device folder uses for it. The PC Engine scanner files a save
+/// as `tgfx16`, MiSTer's core name, while the server and its policy write
+/// `SAVE_SUBDIR_PC-ENGINE`, so without this a declared live directory for
+/// either name is never consulted for the other.
+const SAVE_SUBDIR_ALIASES: &[&[&str]] = &[
+    &[
+        "pc-engine",
+        "tgfx16",
+        "pcengine",
+        "pce",
+        "tg16",
+        "turbografx",
+    ],
+    &["genesis", "megadrive", "md"],
+    &["game-gear", "gamegear", "gg"],
+    &["master-system", "mastersystem", "sms"],
+    &["sega-cd", "segacd", "megacd"],
+    &["sega-32x", "sega32x", "32x"],
+    &["gameboy", "gb"],
+    &["atari-lynx", "atarilynx", "lynx"],
+    &["wonderswan", "wonderswancolor", "ws", "wsc"],
+    &["sg-1000", "sg1000"],
+    &["colecovision", "coleco"],
+];
+
+/// The declared `SAVE_SUBDIR_*` directory for `system_slug`, looked up by
+/// any of the system's names. The name asked for wins if the operator wrote
+/// it; otherwise the first written name in the group's order, so the
+/// server's slug wins over a folder name when both are set. The stored map
+/// keeps only what was written: the config rewrite re-emits it verbatim, and
+/// renaming either key would break configs written with the other.
+pub fn declared_save_subdir<'a>(
+    save_subdirs: &'a BTreeMap<String, PathBuf>,
+    system_slug: &str,
+) -> Option<&'a PathBuf> {
+    let slug = system_slug.to_ascii_lowercase();
+    if let Some(found) = save_subdirs.get(&slug) {
+        return Some(found);
+    }
+    let group = SAVE_SUBDIR_ALIASES
+        .iter()
+        .find(|group| group.contains(&slug.as_str()))?;
+    group.iter().find_map(|name| save_subdirs.get(*name))
+}
+
+/// Whether two names refer to one system, by the same alias groups as
+/// `declared_save_subdir`.
+pub fn same_system(left: &str, right: &str) -> bool {
+    let left = left.trim().to_ascii_lowercase();
+    let right = right.trim().to_ascii_lowercase();
+    if left == right {
+        return true;
+    }
+    SAVE_SUBDIR_ALIASES
+        .iter()
+        .any(|group| group.contains(&left.as_str()) && group.contains(&right.as_str()))
+}
+
 fn source_from_section(section: &SourceSection) -> Option<Source> {
     let kind = section
         .values
@@ -1224,6 +1381,21 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         }
     });
 
+    // An operator declares where a device actually writes each system's saves;
+    // the helper only ever reads it. Keys are matched by prefix so a system the
+    // client does not know yet can still be declared.
+    let mut save_subdirs = BTreeMap::new();
+    for (key, value) in &section.values {
+        let Some(system) = key.strip_prefix("SAVE_SUBDIR_") else {
+            continue;
+        };
+        let system = system.trim().to_ascii_lowercase();
+        let directory = value.trim();
+        if !system.is_empty() && !directory.is_empty() {
+            save_subdirs.insert(system, PathBuf::from(directory));
+        }
+    }
+
     Some(Source {
         id: section.id.clone(),
         name: label,
@@ -1233,6 +1405,7 @@ fn source_from_section(section: &SourceSection) -> Option<Source> {
         rom_roots: vec![rom_path],
         recursive,
         systems,
+        save_subdirs,
         create_missing_system_dirs,
         managed,
         origin,
@@ -1353,6 +1526,16 @@ fn render_config_with_sources(base: &str, sources: &[Source]) -> String {
             source.systems.join(",")
         };
         lines.push(format!("SYSTEMS=\"{}\"", escape_ini(&rendered_systems)));
+        // Re-emitted verbatim: save_source_store strips and re-renders every
+        // [source.*] section, so a key the struct does not carry is destroyed
+        // on the next config write.
+        for (system, directory) in &source.save_subdirs {
+            lines.push(format!(
+                "SAVE_SUBDIR_{}=\"{}\"",
+                system.to_ascii_uppercase(),
+                escape_ini(&directory.to_string_lossy())
+            ));
+        }
         lines.push(format!(
             "CREATE_MISSING_SYSTEM_DIRS=\"{}\"",
             source.create_missing_system_dirs
@@ -1432,7 +1615,183 @@ fn backup_corrupt(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    // A SYSTEMS entry this helper doesn't know is dropped without a word, so a source that names
+    // arcade must get it, and the defaults must not gain it on their own.
+    #[test]
+    fn a_source_that_names_arcade_syncs_it_and_the_defaults_do_not() {
+        let raw = "snes,arcade".to_string();
+        let systems = parse_systems(Some(&raw), &SourceKind::RetroArch);
+        assert!(systems.iter().any(|s| s == "arcade"), "{systems:?}");
+        let defaults = parse_systems(None, &SourceKind::RetroArch);
+        assert!(!defaults.iter().any(|s| s == "arcade"), "{defaults:?}");
+    }
     use super::*;
+
+    #[test]
+    fn a_mister_source_keeps_pc_engine() {
+        // MiSTer has a TurboGrafx-16 core; its default systems and a SYSTEMS
+        // line naming pc-engine both keep it.
+        assert!(
+            default_systems_for_kind(&SourceKind::MisterFpga).contains(&"pc-engine".to_string())
+        );
+        assert_eq!(
+            parse_systems(Some(&"pc-engine".to_string()), &SourceKind::MisterFpga),
+            vec!["pc-engine".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_systems_line_naming_pc_engine_keeps_it() {
+        // SYSTEMS from the server's policy names pc-engine. It wasn't in the
+        // helper's known list, so it was dropped and the source synced no PC
+        // Engine at all.
+        assert_eq!(
+            parse_systems(Some(&"nes,pc-engine".to_string()), &SourceKind::RetroArch),
+            vec!["nes".to_string(), "pc-engine".to_string()]
+        );
+        assert_eq!(
+            normalize_system_slug("tgfx16").as_deref(),
+            Some("pc-engine")
+        );
+    }
+
+    #[test]
+    fn a_source_listing_pc_engine_admits_a_save_the_scanner_calls_tgfx16() {
+        assert!(same_system("pc-engine", "tgfx16"));
+        assert!(same_system("genesis", "megadrive"));
+        // Distinct systems stay distinct.
+        assert!(!same_system("genesis", "sega-32x"));
+        assert!(!same_system("gameboy", "gba"));
+        assert!(!same_system("master-system", "game-gear"));
+    }
+
+    #[test]
+    fn a_pc_engine_live_directory_answers_the_scanner_slug() {
+        // The server's policy writes SAVE_SUBDIR_PC-ENGINE; the PC Engine
+        // scanner files those saves as `tgfx16`. A save in both pcengine/ and
+        // pcenginecd/ was refused as having no declared live directory.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            "[source.retrodeck]\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"/tmp/saves\"\nSAVE_SUBDIR_PC-ENGINE=\"{content}\"\n",
+        )
+        .unwrap();
+        let store = load_source_store(&config_path).unwrap();
+        let subdirs = &store.sources[0].save_subdirs;
+        assert_eq!(
+            declared_save_subdir(subdirs, "tgfx16"),
+            Some(&PathBuf::from("{content}")),
+            "SAVE_SUBDIR_PC-ENGINE must answer the scanner's tgfx16"
+        );
+        assert_eq!(
+            declared_save_subdir(subdirs, "pc-engine"),
+            Some(&PathBuf::from("{content}"))
+        );
+
+        // The rewrite keeps only what was written: no alias keys appear.
+        save_source_store(&config_path, &store).unwrap();
+        let rewritten = std::fs::read_to_string(&config_path).unwrap();
+        assert!(rewritten.contains("SAVE_SUBDIR_PC-ENGINE="));
+        assert!(!rewritten.contains("SAVE_SUBDIR_TGFX16"), "{rewritten}");
+    }
+
+    #[test]
+    fn the_name_asked_for_wins_and_the_server_slug_wins_over_a_folder_name() {
+        let mut subdirs = BTreeMap::new();
+        subdirs.insert("tgfx16".to_string(), PathBuf::from("TGFX16"));
+        subdirs.insert("pc-engine".to_string(), PathBuf::from("pcengine"));
+        assert_eq!(
+            declared_save_subdir(&subdirs, "tgfx16"),
+            Some(&PathBuf::from("TGFX16"))
+        );
+        assert_eq!(
+            declared_save_subdir(&subdirs, "pc-engine"),
+            Some(&PathBuf::from("pcengine"))
+        );
+        // Neither written as `pce`: the server slug comes first in the group.
+        assert_eq!(
+            declared_save_subdir(&subdirs, "pce"),
+            Some(&PathBuf::from("pcengine"))
+        );
+        // A system with no alias group still resolves by its own name only.
+        assert_eq!(declared_save_subdir(&subdirs, "n64"), None);
+    }
+
+    #[test]
+    fn every_scanner_slug_has_a_documented_save_subdir_key() {
+        // A slug the scanner can produce that no SAVE_SUBDIR key reaches would
+        // make an operator's declared live directory silently unused, which is
+        // how PC Engine broke. Each slug must be its own key or in an alias
+        // group whose first name is the server's slug.
+        let scanner_slugs = crate::scanner::SCANNER_SYSTEM_SLUGS;
+        // Names that aren't the server's: each must alias one that is.
+        let server_only: &[&str] = &["tgfx16"];
+        for slug in scanner_slugs
+            .iter()
+            .copied()
+            .chain(server_only.iter().copied())
+        {
+            let grouped = SAVE_SUBDIR_ALIASES
+                .iter()
+                .find(|group| group.contains(&slug));
+            if server_only.contains(&slug) {
+                let group = grouped.unwrap_or_else(|| panic!("{slug} needs an alias group"));
+                assert_ne!(
+                    group[0], slug,
+                    "{slug} is not the server's name; it must alias one"
+                );
+            }
+            if let Some(group) = grouped {
+                assert!(
+                    !group[0].is_empty() && group.iter().filter(|name| **name == slug).count() == 1,
+                    "{slug} appears once in its group"
+                );
+            }
+        }
+        // No name is in two groups: a lookup must have one answer.
+        let mut seen = std::collections::BTreeSet::new();
+        for group in SAVE_SUBDIR_ALIASES {
+            for name in group.iter() {
+                assert!(seen.insert(*name), "{name} is in two alias groups");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mister_source_defaults_to_ngp_virtualboy_and_neogeo_cd() {
+        // MiSTer has cores for all three and the scanner classifies their saves.
+        let defaults = parse_systems(None, &SourceKind::MisterFpga);
+        for slug in ["neogeo-cd", "ngp", "virtualboy"] {
+            assert!(
+                defaults.iter().any(|s| s == slug),
+                "{slug} missing from {defaults:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_systems_line_naming_ngp_virtualboy_and_neogeo_cd_keeps_them() {
+        // The server's policy names these three; they weren't known systems,
+        // so a SYSTEMS line naming them was dropped and nothing for them synced.
+        assert_eq!(
+            parse_systems(
+                Some(&"ngp,virtualboy,neogeo-cd".to_string()),
+                &SourceKind::RetroArch
+            ),
+            vec![
+                "neogeo-cd".to_string(),
+                "ngp".to_string(),
+                "virtualboy".to_string()
+            ]
+        );
+        assert_eq!(
+            normalize_system_slug("neogeocd").as_deref(),
+            Some("neogeo-cd")
+        );
+        assert_eq!(normalize_system_slug("vb").as_deref(), Some("virtualboy"));
+    }
 
     #[test]
     fn helper_device_type_matches_backend_identity_names() {
@@ -1459,6 +1818,7 @@ mod tests {
 
     fn test_config(tmp: &tempfile::TempDir, root: PathBuf) -> AppConfig {
         AppConfig {
+            secure: false,
             url: "127.0.0.1".to_string(),
             port: 3001,
             email: String::new(),
@@ -1472,6 +1832,8 @@ mod tests {
             route_prefix: String::new(),
             binary_dir: tmp.path().to_path_buf(),
             config_path: tmp.path().join("config.ini"),
+            psp_savedata_bundles: false,
+            folder_save_bundles: false,
         }
     }
 
@@ -1538,6 +1900,47 @@ SAVE_PATH="/media/fat/saves"
         assert!(source.systems.contains(&"psx".to_string()));
         assert!(!source.systems.contains(&"wii".to_string()));
         assert!(!source.create_missing_system_dirs);
+    }
+
+    // An existing config can carry a ROM path that is the source's own save
+    // root; the derivation no longer writes one, and this is the half that
+    // heals the ones already on disk.
+    // The same directory spelled two ways -- `./saves` and `saves` -- is the
+    // shape the arcade's stored config carries, and PathBuf equality does not
+    // see through it.
+    #[test]
+    fn a_rom_root_spelled_differently_from_the_save_root_is_dropped() {
+        let source = Source::new(
+            "windows".to_string(),
+            SourceKind::Windows,
+            vec![PathBuf::from("./saves")],
+            vec![PathBuf::from("saves")],
+            true,
+        );
+        let resolved = source.resolve(Path::new("/tmp"));
+        assert!(
+            resolved.rom_roots.is_empty(),
+            "a differently spelled save root survived as a ROM root: {:?}",
+            resolved.rom_roots
+        );
+    }
+
+    #[test]
+    fn a_rom_root_that_is_the_save_root_is_dropped() {
+        let source = Source::new(
+            "windows".to_string(),
+            SourceKind::Windows,
+            vec![PathBuf::from("./saves")],
+            vec![PathBuf::from("./saves")],
+            true,
+        );
+        let resolved = source.resolve(Path::new("/tmp"));
+        assert_eq!(resolved.save_roots.len(), 1);
+        assert!(
+            resolved.rom_roots.is_empty(),
+            "the save root was kept as a ROM root: {:?}",
+            resolved.rom_roots
+        );
     }
 
     #[test]
