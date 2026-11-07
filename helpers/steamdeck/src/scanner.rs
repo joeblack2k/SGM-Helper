@@ -1294,6 +1294,10 @@ pub fn classify_supported_save(
             "saturnjp",
             "dreamcast",
             "sega",
+            // Flycast's shared cards (RetroDECK bios/dc/vmu_save_A1.bin) name no Sega console in
+            // their path. Only the card name lets them in: dc_boot.bin and dc_flash.bin beside them
+            // are BIOS files, never saves.
+            "vmu_save_",
         ],
     ) {
         let slug = infer_sega_slug(&save_lower);
@@ -3143,6 +3147,23 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, save_bytes(len)).unwrap();
         path
+    }
+
+    #[test]
+    fn flycast_bios_files_beside_the_shared_cards_are_not_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dc = tmp.path().join("retrodeck").join("bios").join("dc");
+        fs::create_dir_all(&dc).unwrap();
+        // VMU-sized and holding a real save's structure: only the name keeps it out.
+        let card = build_dreamcast_vmu_with_single_save();
+        for name in ["dc_boot.bin", "dc_flash.bin", "dc_nvmem.bin"] {
+            let path = dc.join(name);
+            fs::write(&path, &card).unwrap();
+            assert!(
+                classify_supported_save(&path, None).is_none(),
+                "{name} classified as a save"
+            );
+        }
     }
 
     #[test]

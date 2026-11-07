@@ -278,6 +278,14 @@ pub fn run_sync(
 
     for source in sources {
         let save_files = discover_save_files(&source.save_roots, source.recursive)?;
+        let mut save_files = save_files;
+        // Flycast with per-content VMUs off keeps every game's saves in the shared cards
+        // <system>/dc/vmu_save_<slot>.bin beside the saves root, never under it.
+        for card in shared_dreamcast_vmus(&source.save_roots, &source.profile) {
+            if !save_files.contains(&card) {
+                save_files.push(card);
+            }
+        }
         if verbose {
             eprintln!(
                 "Source '{}' ({}) discovered {} save file(s)",
@@ -746,6 +754,34 @@ fn restore_single_cloud_save(
         .or(runtime_target.runtime_profile.as_deref());
     let target_extension = ps1_per_game_card_extension(cloud_save, source_profile)
         .or_else(|| cloud_target_extension(cloud_save, runtime_profile));
+    // A shared Flycast card (bios/dc or system/dc vmu_save_<slot>.bin) holds every game's saves:
+    // it takes the record unless it already holds the record's bytes, whatever the per-file
+    // checks below would say about it.
+    if is_dreamcast_system(&system_slug)
+        && names_shared_dreamcast_card(cloud_save)
+        && let Some(card) = shared_dreamcast_vmu_for_slot(
+            save_roots,
+            &effective_profile,
+            cloud_save.card_slot.as_deref().unwrap_or("A1"),
+        )
+    {
+        return restore_shared_dreamcast_card(
+            api,
+            cloud_save,
+            &card,
+            source_name,
+            source_kind,
+            device_type,
+            &runtime_target,
+            fingerprint,
+            app_password,
+            options,
+            sync_entries,
+            restored_targets,
+            report,
+            verbose,
+        );
+    }
     let Some(provisional_path) = cloud_target_path_with_known(
         cloud_save,
         save_roots,
@@ -1097,6 +1133,16 @@ fn cloud_target_path_with_known(
     known_saves: &HashMap<String, SyncedEntry>,
     save_subdirs: &BTreeMap<String, PathBuf>,
 ) -> Option<PathBuf> {
+    if is_dreamcast_system(system_slug)
+        && names_shared_dreamcast_card(cloud_save)
+        && let Some(card) = shared_dreamcast_vmu_for_slot(
+            save_roots,
+            source_profile,
+            cloud_save.card_slot.as_deref().unwrap_or("A1"),
+        )
+    {
+        return Some(card);
+    }
     let root = select_cloud_restore_root(save_roots);
     let filename = cloud_restore_filename(cloud_save, target_extension);
     let selection_key = save_selection_key(Path::new(filename.trim()));
@@ -1151,6 +1197,17 @@ fn cloud_target_path_inner(
     known_saves: &HashMap<String, SyncedEntry>,
 ) -> PathBuf {
     let root = select_cloud_restore_root(save_roots);
+    // Before every other branch: a shared Flycast card is the target whatever the per-file rules say.
+    if is_dreamcast_system(system_slug)
+        && names_shared_dreamcast_card(cloud_save)
+        && let Some(card) = shared_dreamcast_vmu_for_slot(
+            save_roots,
+            source_profile,
+            cloud_save.card_slot.as_deref().unwrap_or("A1"),
+        )
+    {
+        return card;
+    }
     if system_slug == "wii"
         && let Some(title_code) = cloud_wii_title_code(cloud_save)
     {
@@ -1594,6 +1651,193 @@ fn same_sha256(left: &str, right: &str) -> bool {
     );
     let shorter = left.len().min(right.len());
     shorter >= 16 && left[..shorter] == right[..shorter]
+}
+
+/// RetroArch's Flycast with per-content VMUs off writes one shared card per slot at
+/// `<root>/../bios/dc/vmu_save_<slot>.bin` (RetroDECK) or `<root>/../system/dc/` (RetroArch),
+/// beside the saves root.
+/// Returns the cards that exist for a RetroArch-profile source.
+fn shared_dreamcast_vmus(save_roots: &[PathBuf], profile: &EmulatorProfile) -> Vec<PathBuf> {
+    if !matches!(profile, EmulatorProfile::RetroArch) {
+        return Vec::new();
+    }
+    let mut cards = Vec::new();
+    for root in save_roots {
+        let Some(parent) = root.parent() else {
+            continue;
+        };
+        // RetroDECK names RetroArch's system folder bios/; a plain RetroArch install keeps system/.
+        for dir in [
+            parent.join("bios").join("dc"),
+            parent.join("system").join("dc"),
+        ] {
+            for bank in ['A', 'B', 'C', 'D'] {
+                for slot in ['1', '2', '3', '4'] {
+                    let card = dir.join(format!("vmu_save_{bank}{slot}.bin"));
+                    if card.is_file() {
+                        cards.push(card);
+                    }
+                }
+            }
+        }
+    }
+    cards
+}
+
+/// A record restores into a shared Flycast card only when it was uploaded from one: its filename is
+/// the card's own (`vmu_save_<slot>.bin`). A record from a per-game VMU (`<Game>.A1.bin`), which is
+/// every Dreamcast record made before shared cards synced, holds one game's card and would wipe the
+/// other games on a shared card, so it keeps the per-game path.
+fn names_shared_dreamcast_card(cloud_save: &CloudSaveSummary) -> bool {
+    std::path::Path::new(&cloud_save.filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase().starts_with("vmu_save_"))
+        .unwrap_or(false)
+}
+
+/// The shared card a Dreamcast record for `slot` restores to: `<dir>/vmu_save_<slot>.bin` in the
+/// source's shared-card folder (bios/dc or system/dc beside the saves root), whether or not the card
+/// exists yet, so a device with no card for that slot gets one there. None when the source has no
+/// shared-card folder, so a device that keeps per-game cards is not moved onto a shared one.
+fn shared_dreamcast_vmu_for_slot(
+    save_roots: &[PathBuf],
+    profile: &EmulatorProfile,
+    slot: &str,
+) -> Option<PathBuf> {
+    if !matches!(profile, EmulatorProfile::RetroArch) {
+        return None;
+    }
+    let slot = parse_dreamcast_slot(slot).unwrap_or_else(|| "A1".to_string());
+    save_roots.iter().find_map(|root| {
+        let parent = root.parent()?;
+        [
+            parent.join("bios").join("dc"),
+            parent.join("system").join("dc"),
+        ]
+        .into_iter()
+        .find(|dir| dir.is_dir())
+        .map(|dir| dir.join(format!("vmu_save_{slot}.bin")))
+    })
+}
+
+/// A shared Dreamcast card holds every game's saves, so it is already the record only when its
+/// bytes are the record's; a valid card with other bytes is still overwritten.
+fn shared_dreamcast_card_holds(path: &Path, cloud_sha256: Option<&str>) -> bool {
+    let Some(cloud) = cloud_sha256.map(str::trim).filter(|sha| !sha.is_empty()) else {
+        return false;
+    };
+    crate::scanner::sha256_file(path)
+        .map(|local| same_sha256(&local, cloud))
+        .unwrap_or(false)
+}
+
+/// Whether a shared card may take a cloud record: it is absent, holds no save, or is byte for byte
+/// what this device last synced.
+fn shared_dreamcast_card_replaceable(card: &Path, synced: Option<&SyncedEntry>) -> bool {
+    if !card.is_file() {
+        return true;
+    }
+    if crate::scanner::dreamcast_skip_reason(card, None).as_deref()
+        == Some("skip_empty_dreamcast_vmu")
+    {
+        return true;
+    }
+    let Some(synced) = synced else {
+        return false;
+    };
+    crate::scanner::sha256_file(card)
+        .map(|local| same_sha256(&local, &synced.sha256))
+        .unwrap_or(false)
+}
+
+/// Restores a Dreamcast record into a shared Flycast card: written unless the card already holds
+/// the record's bytes. The card is the record's whole payload, so no container adapter applies.
+#[allow(clippy::too_many_arguments)]
+fn restore_shared_dreamcast_card(
+    api: &ApiClient,
+    cloud_save: &CloudSaveSummary,
+    card: &Path,
+    source_name: &str,
+    source_kind: &SourceKind,
+    device_type: &str,
+    runtime_target: &RuntimeTarget,
+    fingerprint: &str,
+    app_password: Option<&str>,
+    options: &SyncOptions,
+    sync_entries: &mut HashMap<String, SyncedEntry>,
+    restored_targets: &mut HashSet<String>,
+    report: &mut SyncReport,
+    verbose: bool,
+) -> Result<()> {
+    if shared_dreamcast_card_holds(card, cloud_save.sha256.as_deref()) {
+        return Ok(());
+    }
+    let card_key = card.to_string_lossy().to_string();
+    // A shared card holds every game's saves. It is replaced only when it is absent, blank, or still
+    // the bytes this device last synced; a card with saves the server has not seen (no sync record,
+    // or changed since) is left for the upload and conflict path, so none of them is lost.
+    if !shared_dreamcast_card_replaceable(card, sync_entries.get(&card_key)) {
+        if verbose {
+            eprintln!(
+                "Not restoring {} over {}: the card holds saves this device has not synced",
+                cloud_save.filename,
+                card.display()
+            );
+        }
+        report.skipped += 1;
+        return Ok(());
+    }
+    if restored_targets.contains(&card_key) {
+        return Ok(());
+    }
+    if options.dry_run {
+        report.would_download += 1;
+        return Ok(());
+    }
+    let bytes = api.download_save(
+        &cloud_save.id,
+        device_type,
+        fingerprint,
+        app_password,
+        Some(runtime_target),
+    )?;
+    if let Some(parent) = card.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("kan map niet maken: {}", parent.display()))?;
+    }
+    fs::write(card, &bytes)
+        .with_context(|| format!("kan cloud save niet herstellen: {}", card.display()))?;
+    let slot = cloud_save
+        .card_slot
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("A1")
+        .to_string();
+    let entry = synced_entry(
+        sha256_bytes(&bytes),
+        cloud_save.rom_sha1.clone(),
+        cloud_save.version,
+        Some("dreamcast"),
+        Some(SaveContainerFormat::Native),
+        Some(default_adapter_profile_for_container(
+            SaveContainerFormat::Native,
+        )),
+        Some(source_kind),
+        Some(source_name),
+        Some(&slot),
+    );
+    sync_entries.insert(card_key.clone(), entry);
+    restored_targets.insert(card_key);
+    report.downloaded += 1;
+    if verbose {
+        eprintln!(
+            "Restored cloud dreamcast save '{}' into shared card {}",
+            cloud_save.display_name(),
+            card.display()
+        );
+    }
+    Ok(())
 }
 
 fn select_cloud_restore_root(save_roots: &[PathBuf]) -> &PathBuf {
@@ -4635,6 +4879,33 @@ mod tests {
             final_path.to_string_lossy(),
             "/media/fat/saves/SNES/Super Mario Kart (USA).sav"
         );
+    }
+
+    #[test]
+    fn a_dreamcast_record_restores_into_retrodecks_shared_vmu_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        let saves = tmp.path().join("retrodeck").join("saves");
+        let dc = tmp.path().join("retrodeck").join("bios").join("dc");
+        std::fs::create_dir_all(&saves).unwrap();
+        std::fs::create_dir_all(&dc).unwrap();
+        std::fs::write(dc.join("vmu_save_A1.bin"), vec![0u8; 131_072]).unwrap();
+        let mut save = cloud_save(
+            "vmu_save_A1.bin",
+            "Soulcalibur",
+            "dreamcast",
+            "original",
+            ".bin",
+        );
+        save.card_slot = Some("A1".to_string());
+        let target = cloud_target_path(
+            &save,
+            std::slice::from_ref(&saves),
+            &SourceKind::RetroArch,
+            &EmulatorProfile::RetroArch,
+            "dreamcast",
+            Some("bin"),
+        );
+        assert_eq!(target, dc.join("vmu_save_A1.bin"));
     }
 
     #[test]
