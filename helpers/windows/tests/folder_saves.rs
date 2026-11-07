@@ -395,3 +395,32 @@ fn a_folder_over_the_server_s_size_limit_is_skipped_not_uploaded() {
     assert_eq!(any.calls(), 0, "an oversized folder was uploaded: {stderr}");
     assert!(stderr.contains("bundle limit"), "no skip line: {stderr}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_a_save_folder_is_left_out_of_the_bundle_by_name() {
+    let server = MockServer::start();
+    mock_auth(&server);
+    empty_server(&server);
+    let vita = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("filename=\"PCSE00746.vitasave\"");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-vita","sha256":"s","version":1}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let save = saves.join("psvita/vita3k").join(VITA_TITLE);
+    fs::create_dir_all(&save).unwrap();
+    fs::write(save.join("SAVEDATA.BIN"), vec![0x33u8; 4096]).unwrap();
+    std::os::unix::fs::symlink("SAVEDATA.BIN", save.join("linked.bin")).unwrap();
+    let config = write_config(tmp.path(), &server, &saves, Some("true"));
+    let stderr = sync(&config);
+    assert_eq!(vita.calls(), 1, "{stderr}");
+    assert!(
+        stderr.contains("Leaving") && stderr.contains("linked.bin"),
+        "the skipped symlink was not named: {stderr}"
+    );
+}

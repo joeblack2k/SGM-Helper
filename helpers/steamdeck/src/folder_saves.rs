@@ -270,6 +270,11 @@ pub fn folder_save_files(dir: &Path) -> Result<Vec<(String, PathBuf, u64)>> {
                     .with_context(|| format!("cannot read {}", entry.path().display()))?
                     .len();
                 out.push((relative, entry.path(), size));
+            } else {
+                eprintln!(
+                    "Leaving {} out of the folder bundle: it is not a regular file or folder",
+                    entry.path().display()
+                );
             }
         }
         Ok(())
