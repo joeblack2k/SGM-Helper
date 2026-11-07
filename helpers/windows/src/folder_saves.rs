@@ -376,6 +376,23 @@ pub fn restore_folder_save(
         return Err(err);
     }
     let aside = parent.join(format!("{leaf}.rsm-old"));
+    // A crash between the two renames below leaves the old folder at the aside path and no
+    // folder at the target: that aside is then the only copy of the save. It goes back, and this
+    // restore stops, so the next pass judges the recovered folder like any local one.
+    if fs::symlink_metadata(target_dir).is_err() && fs::symlink_metadata(&aside).is_ok() {
+        let _ = fs::remove_dir_all(&staging);
+        fs::rename(&aside, target_dir).with_context(|| {
+            format!(
+                "cannot rename {} back to {}",
+                aside.display(),
+                target_dir.display()
+            )
+        })?;
+        anyhow::bail!(
+            "recovered {} from an interrupted restore; not replacing it this pass",
+            target_dir.display()
+        );
+    }
     remove_path_if_present(&aside)?;
     let had_old = match fs::symlink_metadata(target_dir) {
         Ok(_) => {
@@ -524,6 +541,29 @@ mod tests {
             .into_iter()
             .map(|(relative, path, _)| (relative, fs::read(path).unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn an_interrupted_restore_puts_the_aside_folder_back_and_writes_nothing() {
+        let device = tempfile::tempdir().unwrap();
+        let vita = FolderSaveKind::Vita3k.root_under(device.path());
+        let target = FolderSaveKind::Vita3k
+            .folder_for(&vita, "PCSE00746")
+            .unwrap();
+        // A crash left only the aside: the device's own save, and no folder at the target.
+        let aside = vita.join("PCSE00746.rsm-old");
+        write(&aside.join("SAVEDATA.BIN"), b"the only copy");
+        let other = tempfile::tempdir().unwrap();
+        let cloud = other.path().join("PCSE00746");
+        write(&cloud.join("SAVEDATA.BIN"), b"cloud");
+        let (bundle, _) = pack_folder_save(&cloud).unwrap();
+
+        assert!(restore_folder_save(&vita, &target, &bundle).is_err());
+        assert_eq!(
+            fs::read(target.join("SAVEDATA.BIN")).unwrap(),
+            b"the only copy"
+        );
+        assert!(!aside.exists());
     }
 
     #[test]

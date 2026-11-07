@@ -371,6 +371,68 @@ fn a_vita_save_with_sce_sys_uploads_its_subfolder_files() {
     );
 }
 
+/// A device turning folder bundles on for the first time has no folder-keyed state, though it
+/// may hold progress for a title the server already has from another device. Its folder must
+/// upload, not be replaced by the server's copy.
+#[test]
+fn on_a_first_sync_a_local_folder_that_differs_from_the_server_uploads_and_is_kept() {
+    let server = MockServer::start();
+    mock_auth(&server);
+    server.mock(|when, then| {
+        when.method(GET).path("/save/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"exists":true,"sha256":"another-device","version":3,"id":"save-other"}"#);
+    });
+    server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"saves":[],"total":0}"#);
+    });
+    let download = server.mock(|when, then| {
+        when.method(GET).path("/saves/download");
+        then.status(200).body(b"not this device's save");
+    });
+    let upload = server.mock(|when, then| {
+        when.method(POST)
+            .path("/saves")
+            .body_includes("filename=\"PCSE00746.vitasave\"");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"save":{"id":"save-mine","sha256":"s","version":4}}"#);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let saves = tmp.path().join("saves");
+    let save = saves.join("psvita/vita3k").join(VITA_TITLE);
+    fs::create_dir_all(save.join("sce_sys")).unwrap();
+    fs::write(save.join("SAVEDATA.BIN"), b"this device's progress").unwrap();
+    fs::write(save.join("sce_sys/param.sfo"), b"\0PSF mine").unwrap();
+    let before = sgm_windows_helper::folder_saves::folder_save_files(&save)
+        .unwrap()
+        .into_iter()
+        .map(|(relative, path, _)| (relative, fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    let config = write_config(tmp.path(), &server, &saves, Some("true"));
+    let stderr = sync(&config);
+    assert_eq!(
+        upload.calls(),
+        1,
+        "the device's folder was not uploaded: {stderr}"
+    );
+    assert_eq!(
+        download.calls(),
+        0,
+        "the server's copy was downloaded over it: {stderr}"
+    );
+    let after = sgm_windows_helper::folder_saves::folder_save_files(&save)
+        .unwrap()
+        .into_iter()
+        .map(|(relative, path, _)| (relative, fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(after, before, "the device's folder changed: {stderr}");
+}
+
 #[test]
 fn a_folder_over_the_server_s_size_limit_is_skipped_not_uploaded() {
     let server = MockServer::start();

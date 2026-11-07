@@ -4706,9 +4706,14 @@ fn process_folder_save(
         report.in_sync += 1;
         return Ok(Some(entry_for(local_sha.clone(), latest.version)));
     }
+    // The server holds a different folder for this title. With no record of what this device
+    // last synced (a first sync, or a lost state file) the local folder may hold progress the
+    // server never saw, so it uploads and the server keeps the older one in its history, the
+    // same as a folder edited since the last sync. Only a folder that still matches what this
+    // device last synced is replaced by the server's copy.
     let local_edited_since_sync = prior_local_sha
         .map(|prior| prior != local_sha.as_str())
-        .unwrap_or(false);
+        .unwrap_or(true);
     if local_edited_since_sync {
         return upload(report);
     }
