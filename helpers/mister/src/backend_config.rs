@@ -1007,6 +1007,7 @@ mod tests {
             rom_roots: vec![PathBuf::from("/media/fat/games")],
             recursive: true,
             systems: vec!["snes".to_string(), "n64".to_string()],
+            save_subdirs: Default::default(),
             create_missing_system_dirs: false,
             managed: false,
             origin: "manual".to_string(),
@@ -1181,6 +1182,7 @@ mod tests {
 
     fn test_config(config_path: &Path, root: &Path) -> AppConfig {
         AppConfig {
+            secure: false,
             url: "192.168.2.10".to_string(),
             port: 80,
             email: String::new(),

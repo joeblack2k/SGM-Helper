@@ -73,6 +73,11 @@ pub struct LatestSaveResponse {
     pub sha256: Option<String>,
     pub version: Option<i64>,
     pub id: Option<String>,
+    /// The card the server holds the logical save on, when it reports one.
+    /// A server re-home leaves this different from the card being offered
+    /// while the bytes are unchanged, which local state cannot show.
+    #[serde(default, rename = "cardSlot")]
+    pub card_slot: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +248,21 @@ pub struct ConflictCheckResponse {
     pub cloud_version: Option<i64>,
     #[serde(rename = "cloudSaveId")]
     pub cloud_save_id: Option<String>,
+}
+
+/// A one-shot conflict decision, from the same `/conflicts/check` answer.  Kept
+/// apart from `ConflictCheckResponse` so code that builds one of those is untouched.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConflictDecision {
+    #[serde(rename = "conflictId", default)]
+    pub conflict_id: Option<String>,
+    /// "keep_local" or "keep_server"; absent on a server without decisions.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(rename = "localSha256", default)]
+    pub local_sha256: Option<String>,
+    #[serde(rename = "cloudSha256", default)]
+    pub cloud_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -604,6 +624,7 @@ impl ApiClient {
         wii_title_id: Option<&str>,
         runtime_target: Option<&RuntimeTarget>,
         port_metadata: Option<&PortUploadMetadata>,
+        psp_save_dir: Option<&str>,
     ) -> Result<UploadSaveResponse> {
         let url = self.url("/saves");
         let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(filename.to_string());
@@ -637,6 +658,13 @@ impl ApiClient {
         }
         if let Some(runtime_target) = runtime_target {
             form = runtime_target.apply_multipart_form(form);
+        }
+        // A PPSSPP SAVEDATA bundle names the folder it restores into; the
+        // server keeps it with the record so any device can put it back.
+        if let Some(psp_save_dir) = psp_save_dir
+            && !psp_save_dir.trim().is_empty()
+        {
+            form = form.text("pspSaveDir", psp_save_dir.trim().to_string());
         }
         if let Some(port) = port_metadata {
             form = form
@@ -793,6 +821,62 @@ impl ApiClient {
             .send()
             .context("request naar /conflicts/check faalde")?;
         parse_json_response(response)
+    }
+
+    pub fn conflict_decision(
+        &self,
+        rom_sha1: &str,
+        slot_name: &str,
+        device_type: &str,
+        fingerprint: &str,
+        app_password: Option<&str>,
+        runtime_target: Option<&RuntimeTarget>,
+    ) -> Result<ConflictDecision> {
+        let url = self.url("/conflicts/check");
+        let mut request = self.client.get(url).query(&[
+            ("romSha1", rom_sha1),
+            ("slotName", slot_name),
+            ("device_type", device_type),
+            ("fingerprint", fingerprint),
+        ]);
+        if let Some(runtime_target) = runtime_target {
+            request = runtime_target.apply_query(request);
+        }
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let response = request
+            .send()
+            .context("request naar /conflicts/check faalde")?;
+        parse_json_response(response)
+    }
+
+    /// Reports that a conflict decision was acted on for this pair of hashes.
+    /// The server clears the conflict, or answers 409 when the pair is stale.
+    pub fn conflict_applied(
+        &self,
+        conflict_id: &str,
+        local_sha256: &str,
+        cloud_sha256: &str,
+        app_password: Option<&str>,
+    ) -> Result<()> {
+        let url = self.url(&format!("/conflicts/{conflict_id}/applied"));
+        let mut request =
+            self.client.post(url).header("X-CSRF-Protection", "1").json(
+                &serde_json::json!({"localSha256": local_sha256, "cloudSha256": cloud_sha256}),
+            );
+        if let Some(app_password) = app_password
+            && !app_password.trim().is_empty()
+        {
+            request = request.header("X-RSM-App-Password", app_password.trim().to_string());
+        }
+        let response = request
+            .send()
+            .context("request naar /conflicts/applied faalde")?;
+        let _: serde_json::Value = parse_json_response(response)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

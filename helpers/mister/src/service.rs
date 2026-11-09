@@ -17,7 +17,7 @@ use crate::api::ApiClient;
 use crate::config::AppConfig;
 use crate::sources::{SourceKind, load_source_store, resolved_sources_or_default};
 use crate::state::{AuthState, now_rfc3339};
-use crate::syncer::{SyncOptions, SyncReport, run_sync};
+use crate::syncer::{SyncOptions, SyncReport, dry_run_marker, run_sync};
 
 #[derive(Debug, Clone)]
 pub struct ServiceRunOptions {
@@ -199,14 +199,21 @@ pub fn run_service(
                 Ok(report) => {
                     if !quiet {
                         println!(
-                            "Service sync complete: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} errors={}",
+                            "Service sync complete{}: scanned={} uploaded={} downloaded={} in_sync={} conflicts={} skipped={} rejected_n64_controller_pak={} accepted_not_stored={} rejected_permanent={} refused_size_mismatch={} errors={} would_upload={} would_download={}",
+                            dry_run_marker(&report),
                             report.scanned,
                             report.uploaded,
                             report.downloaded,
                             report.in_sync,
                             report.conflicts,
                             report.skipped,
-                            report.errors
+                            report.rejected_n64_controller_pak,
+                            report.accepted_not_stored,
+                            report.rejected_permanent,
+                            report.refused_size_mismatch,
+                            report.errors,
+                            report.would_upload,
+                            report.would_download
                         );
                     }
                     if report.errors == 0 {
@@ -1098,6 +1105,7 @@ mod tests {
         )
         .unwrap();
         let config = AppConfig {
+            secure: false,
             url: "127.0.0.1".to_string(),
             port: 80,
             email: "helper@example.com".to_string(),
