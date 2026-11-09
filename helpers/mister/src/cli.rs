@@ -22,6 +22,9 @@ pub struct Cli {
     pub port: Option<u16>,
 
     #[arg(long, global = true)]
+    pub secure: Option<bool>,
+
+    #[arg(long, global = true)]
     pub email: Option<String>,
 
     #[arg(long = "app-password", global = true)]
