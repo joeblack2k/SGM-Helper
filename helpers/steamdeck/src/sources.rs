@@ -366,6 +366,22 @@ struct LegacySource {
     created_at: Option<String>,
 }
 
+/// Whether this message has not been printed yet in this process.
+///
+/// A source is resolved again on every service heartbeat, so a line emitted at
+/// resolve time repeats every thirty seconds unless it is said once.
+fn announce_once(key: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    match seen.lock() {
+        Ok(mut guard) => guard.insert(key.to_string()),
+        // A poisoned lock must not swallow the line: saying it twice is the
+        // failure being fixed, losing it entirely is worse.
+        Err(_) => true,
+    }
+}
+
 impl Source {
     pub fn new(
         name: String,
@@ -444,11 +460,15 @@ impl Source {
             .filter(|root| {
                 let key = directory_key(root);
                 if save_roots.iter().any(|save| directory_key(save) == key) {
-                    eprintln!(
-                        "Ignoring ROM root {} in source '{}': it is the source's own save root",
-                        root.display(),
-                        self.name
-                    );
+                    // Resolving happens again on every service heartbeat: one line per
+                    // source and root, or it repeats every thirty seconds.
+                    if announce_once(&format!("rom-root:{}:{}", self.name, root.display())) {
+                        eprintln!(
+                            "Ignoring ROM root {} in source '{}': it is the source's own save root",
+                            root.display(),
+                            self.name
+                        );
+                    }
                     false
                 } else {
                     true

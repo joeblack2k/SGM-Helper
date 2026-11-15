@@ -1996,6 +1996,82 @@ fn a_ps1_card_is_not_refused_by_a_source_whose_rom_root_is_its_save_root() {
     );
 }
 
+// The service resolves its sources on every heartbeat. The dropped-root line is
+// a fact about the configuration, so it is said once per process, not once per
+// heartbeat, where it buried every other line of a device's log.
+#[test]
+fn the_service_names_a_dropped_rom_root_once_not_every_heartbeat() {
+    let server = MockServer::start();
+    let _token = server.mock(|when, then| {
+        when.method(POST).path("/auth/token/app-password");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"token":"tok_once","expiresInDays":7}"#);
+    });
+    let _me = server.mock(|when, then| {
+        when.method(GET).path("/auth/me");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"user":{"email":"once@example.com"}}"#);
+    });
+    let _list = server.mock(|when, then| {
+        when.method(GET).path("/saves");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"success":true,"total":0,"limit":100,"offset":0,"saves":[]}"#);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state_dir = tmp.path().join("state");
+    fs::create_dir_all(root.join("saves")).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let config = tmp.path().join("config-once.ini");
+    fs::write(
+        &config,
+        format!(
+            "URL=\"127.0.0.1\"\nPORT=\"{}\"\nROOT=\"{}\"\nSTATE_DIR=\"{}\"\nWATCH=\"false\"\nWATCH_INTERVAL=\"1\"\n\n[source.arcade]\nLABEL=\"Arcade\"\nKIND=\"retroarch\"\nPROFILE=\"retroarch\"\nSAVE_PATH=\"{}/saves\"\nROM_PATH=\"{}/saves\"\nRECURSIVE=\"true\"\nSYSTEMS=\"genesis\"\n",
+            server.port(),
+            root.display(),
+            state_dir.display(),
+            root.display(),
+            root.display()
+        ),
+    )
+    .unwrap();
+    wb_helper()
+        .arg("--config")
+        .arg(&config)
+        .arg("login")
+        .arg("--email")
+        .arg("once@example.com")
+        .arg("--app-password")
+        .arg("pw")
+        .assert()
+        .success();
+
+    // A one-second heartbeat, run for several heartbeats, then stopped.
+    let bin = assert_cmd::cargo::cargo_bin("sgm-mister-helper");
+    let mut child = std::process::Command::new(bin)
+        .arg("--config")
+        .arg(&config)
+        .args(["service", "run", "--heartbeat-interval", "1", "--reconcile-interval", "3600"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(4500));
+    child.kill().unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        stderr.matches("Ignoring ROM root").count(),
+        1,
+        "the dropped-root line was not said exactly once over several heartbeats:\n{stderr}"
+    );
+}
+
 // The ROM root is dropped before anything reports on it, so a root that is the
 // source's own save directory is never also announced as missing.
 #[test]
