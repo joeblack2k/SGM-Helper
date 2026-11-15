@@ -1543,6 +1543,7 @@ dependencies = [
  "hex",
  "hostname",
  "httpmock",
+ "libc",
  "md5",
  "predicates",
  "reqwest",
@@ -1553,6 +1554,7 @@ dependencies = [
  "tempfile",
  "time",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1567,6 +1569,7 @@ dependencies = [
  "hex",
  "hostname",
  "httpmock",
+ "libc",
  "md5",
  "predicates",
  "reqwest",
@@ -1577,6 +1580,7 @@ dependencies = [
  "tempfile",
  "time",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1591,6 +1595,7 @@ dependencies = [
  "hex",
  "hostname",
  "httpmock",
+ "libc",
  "md5",
  "predicates",
  "reqwest",
@@ -1601,6 +1606,7 @@ dependencies = [
  "tempfile",
  "time",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

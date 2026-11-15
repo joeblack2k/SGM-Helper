@@ -150,9 +150,13 @@ fn watch_smoke_persists_state_and_exits_with_max_cycles() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     let state_dir = tmp.path().join("state");
-    fs::create_dir_all(root.join("Nintendo")).unwrap();
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
-    fs::write(root.join("Nintendo/metroid.sav"), vec![0x00u8; 32768]).unwrap();
+    fs::write(
+        root.join("Nintendo/Game Boy/metroid.sav"),
+        vec![0x00u8; 32768],
+    )
+    .unwrap();
 
     let config = write_config(&tmp, &server, &root, &state_dir);
 
@@ -288,9 +292,9 @@ fn sync_restores_missing_file_from_cloud_using_saved_adapter_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     let state_dir = tmp.path().join("state");
-    fs::create_dir_all(root.join("Nintendo")).unwrap();
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
-    let missing_save_path = root.join("Nintendo/metroid.sav");
+    let missing_save_path = root.join("Nintendo/Game Boy/metroid.sav");
     assert!(!missing_save_path.exists());
 
     let sync_state = format!(
@@ -385,9 +389,9 @@ fn sync_uses_latest_track_context_without_duplicate_upload() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("root");
     let state_dir = tmp.path().join("state");
-    fs::create_dir_all(root.join("Nintendo")).unwrap();
+    fs::create_dir_all(root.join("Nintendo/Game Boy")).unwrap();
     fs::create_dir_all(&state_dir).unwrap();
-    fs::write(root.join("Nintendo/Pokemon.srm"), payload).unwrap();
+    fs::write(root.join("Nintendo/Game Boy/Pokemon.srm"), payload).unwrap();
     let config = write_retroarch_config(&tmp, &server, &root, &state_dir, "gameboy");
 
     Command::cargo_bin("sgm-steamdeck-helper")

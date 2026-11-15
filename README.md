@@ -129,6 +129,7 @@ WATCH_INTERVAL="30"
 FORCE_UPLOAD="false"
 DRY_RUN="false"
 ROUTE_PREFIX=""
+PSP_SAVEDATA_BUNDLES="false"
 ```
 
 ### Global Keys Explained
@@ -144,6 +145,10 @@ ROUTE_PREFIX=""
 - `FORCE_UPLOAD`: force upload preference.
 - `DRY_RUN`: dry-run preference.
 - `ROUTE_PREFIX`: optional API prefix, for example `v1`.
+- `PSP_SAVEDATA_BUNDLES` (Steam Deck and Windows helpers, default `false`): sync each PPSSPP
+  `PSP/SAVEDATA/<dir>/` folder (RetroDECK: `saves/PSP/PPSSPP-SA/<dir>/`) as one bundle, so
+  another device can restore the whole folder. Off, the folder does not sync and PSP records
+  are not restored. Needs a server that stores `pspSaveDir` bundles.
 
 ### Platform Default `ROOT`
 

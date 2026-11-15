@@ -32,6 +32,10 @@ pub struct AppConfig {
     pub watch: bool,
     pub watch_interval: u64,
     pub force_upload: bool,
+    /// Sync each PPSSPP `SAVEDATA/<dir>/` folder as one bundle instead of its
+    /// data file alone. Off by default until the server stores bundles.
+    #[serde(default)]
+    pub psp_savedata_bundles: bool,
     pub dry_run: bool,
     pub route_prefix: String,
     pub binary_dir: PathBuf,
@@ -52,7 +56,10 @@ impl LoadedConfig {
         let binary_dir = default_binary_dir()?;
         let config_path = config_path_override.unwrap_or_else(|| binary_dir.join("config.ini"));
         let ini_values = parse_ini_file_if_exists(&config_path)?;
-        let env_values = collect_env_values();
+        let mut env_values = collect_env_values();
+        if let Some(value) = read_env_aliases("PSP_SAVEDATA_BUNDLES") {
+            env_values.insert("PSP_SAVEDATA_BUNDLES".to_string(), value);
+        }
 
         let config = AppConfig::from_sources(
             overrides,
@@ -156,6 +163,8 @@ impl AppConfig {
             "FORCE_UPLOAD",
             false,
         )?;
+        let psp_savedata_bundles =
+            choose_bool(None, env_values, ini_values, "PSP_SAVEDATA_BUNDLES", false)?;
         let dry_run = choose_bool(overrides.dry_run, env_values, ini_values, "DRY_RUN", false)?;
         let route_prefix = normalize_route_prefix(&choose_string(
             overrides.route_prefix.clone(),
@@ -179,6 +188,7 @@ impl AppConfig {
             watch,
             watch_interval,
             force_upload,
+            psp_savedata_bundles,
             dry_run,
             route_prefix,
             binary_dir,
@@ -545,5 +555,25 @@ SAVE_PATH="/home/snes9x/save"
         assert!(cfg.force_upload);
         assert!(!cfg.dry_run);
         assert_eq!(cfg.watch_interval, 45);
+    }
+
+    #[test]
+    fn psp_savedata_bundles_is_off_unless_set() {
+        let cfg = test_sources(ConfigOverrides::default(), &[], &[]).unwrap();
+        assert!(!cfg.psp_savedata_bundles);
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[],
+            &[("PSP_SAVEDATA_BUNDLES", "true")],
+        )
+        .unwrap();
+        assert!(cfg.psp_savedata_bundles);
+        let cfg = test_sources(
+            ConfigOverrides::default(),
+            &[("PSP_SAVEDATA_BUNDLES", "0")],
+            &[("PSP_SAVEDATA_BUNDLES", "true")],
+        )
+        .unwrap();
+        assert!(!cfg.psp_savedata_bundles);
     }
 }

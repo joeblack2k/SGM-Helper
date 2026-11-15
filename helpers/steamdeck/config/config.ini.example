@@ -9,6 +9,7 @@ WATCH_INTERVAL="30"
 FORCE_UPLOAD="false"
 DRY_RUN="false"
 ROUTE_PREFIX=""
+PSP_SAVEDATA_BUNDLES="false"
 
 [source.steamdeck_emudeck]
 LABEL="SteamDeck EmuDeck"
